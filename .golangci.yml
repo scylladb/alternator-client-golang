@@ -1,0 +1,65 @@
+version: 2
+
+issues:
+#  new: false
+#  new-from-rev: origin/master
+#  exclude-dirs:
+#    - semver
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - gocritic
+    - goheader
+    - govet
+    - ineffassign
+    - misspell
+    - predeclared
+    - revive
+    - staticcheck
+    - thelper
+    - tparallel
+    - unused
+    - forbidigo
+    - nolintlint
+
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - shadow
+        - fieldalignment
+
+    nolintlint:
+      allow-no-explanation: [ golines ]
+      require-explanation: true
+      require-specific: true
+
+formatters:
+  default: none
+  enable:
+    - gofumpt
+    - goimports
+    - golines
+
+  settings:
+    gofumpt:
+      extra-rules: true
+
+    goimports:
+      local-prefixes:
+        - github.com/scylladb/alternator-client-golang
+        - github.com/scylladb/alternator-client-golang/shared
+        - github.com/scylladb/alternator-client-golang/sdkv1
+        - github.com/scylladb/alternator-client-golang/sdkv2
+    golines:
+      max-len: 120
+
+run:
+  deadline: 10m
+  modules-download-mode: readonly
+  tests: true
+  build-tags:
+    - integration
+  go: 1.24.0

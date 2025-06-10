@@ -1,0 +1,31 @@
+name: Add New Issues to Drivers-Team Project
+
+on:
+  issues:
+    types: [opened,transferred]
+
+  workflow_dispatch:
+    inputs:
+      issue-id:
+        type: number
+        required: true
+        description: Issue ID
+
+jobs:
+  add-issue-to-drivers-team:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.issue-id == '' }}
+    uses: scylladb/scylla-drivers/.github/workflows/add-issue-to-driver-team-project.yml@master
+    with:
+      issue-id: ${{ github.event.issue.number }}
+    secrets:
+      token: ${{ secrets.GIT_PROJECT_TOKEN }}
+
+  add-custom-issue-to-drivers-team:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.issue-id != '' }}
+    uses: scylladb/scylla-drivers/.github/workflows/add-issue-to-driver-team-project.yml@master
+    with:
+      issue-id: ${{ inputs.issue-id }}
+    secrets:
+      token: ${{ secrets.GIT_PROJECT_TOKEN }}

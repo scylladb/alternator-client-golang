@@ -1,0 +1,44 @@
+name: 'Run tests'
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: ./
+
+jobs:
+  test:
+    name: GoLang tests for V1
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install GoLang
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+          go-version-file: "go.work"
+
+      - name: Run build
+        run: |
+          make build
+
+      - name: Run linters
+        run: |
+          make check
+
+      - name: Run unit tests
+        run: |
+          make test-unit
+
+      - name: Run integration tests
+        run: |
+          make test-integration

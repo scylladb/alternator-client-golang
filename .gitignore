@@ -1,0 +1,4 @@
+.idea/
+bin/
+test/scylla/db.crt
+test/scylla/db.key
