@@ -81,8 +81,10 @@ To check if cluster support datacenter/rack feature supported you can call `Chec
 import (
 	"fmt"
 
-    "github.com/aws/aws-sdk-go/aws"
-    "github.com/aws/aws-sdk-go/service/dynamodb"
+    "github.com/aws/aws-sdk-go-v2/aws"
+    "github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+    "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+    "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
     helper "github.com/scylladb/alternator-client-golang/sdkv2"
 )
