@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
 // Config a common configuration for Alternator helper
@@ -16,10 +18,10 @@ type Config struct {
 	Port int
 	// Scheme a scheme for alternator nodes: http or https
 	Scheme string
-	// Rack a rack of the Alternator nodes to target
-	Rack string
 	// Datacenter a rack of the Alternator nodes to target
 	Datacenter string
+	// RoutingScope is a scope of alternator nodes to target
+	RoutingScope rt.Scope
 	// AWSRegion a region that will be handed over to AWS SDK to forge requests
 	AWSRegion string
 	// AccessKeyID from AWS credentials
@@ -63,6 +65,7 @@ func NewDefaultConfig() *Config {
 		Port:                      defaultPort,
 		Scheme:                    defaultScheme,
 		AWSRegion:                 defaultAWSRegion,
+		RoutingScope:              rt.NewClusterScope(),
 		NodesListUpdatePeriod:     5 * time.Minute,
 		IdleNodesListUpdatePeriod: 2 * time.Hour,
 		TLSSessionCache:           defaultTLSSessionCache,
@@ -89,14 +92,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNIgnoreServerCertificateError(c.IgnoreServerCertificateError),
 		WithALNMaxIdleHTTPConnections(c.MaxIdleHTTPConnections),
 		WithALNIdleHTTPConnectionTimeout(c.IdleHTTPConnectionTimeout),
-	}
-
-	if c.Rack != "" {
-		out = append(out, WithALNRack(c.Rack))
-	}
-
-	if c.Datacenter != "" {
-		out = append(out, WithALNDatacenter(c.Datacenter))
+		WithALNRoutingScope(c.RoutingScope),
 	}
 
 	if c.IdleNodesListUpdatePeriod != 0 {
@@ -139,7 +135,10 @@ func WithPort(port int) Option {
 // WithRack makes DynamoDB client target only nodes from particular rack
 func WithRack(rack string) Option {
 	return func(config *Config) {
-		config.Rack = rack
+		if config.Datacenter == "" {
+			panic("datacenter is required")
+		}
+		config.RoutingScope = rt.NewRackScope(config.Datacenter, rack, nil)
 	}
 }
 
@@ -147,6 +146,17 @@ func WithRack(rack string) Option {
 func WithDatacenter(dc string) Option {
 	return func(config *Config) {
 		config.Datacenter = dc
+		config.RoutingScope = rt.NewDCScope(dc, nil)
+	}
+}
+
+// WithRoutingScope makes Alternator client target only nodes that matches the scope
+func WithRoutingScope(routingScope rt.Scope) Option {
+	if routingScope == nil {
+		panic("routingScope can't be nil")
+	}
+	return func(config *Config) {
+		config.RoutingScope = routingScope
 	}
 }
 
@@ -207,7 +217,7 @@ func WithIgnoreServerCertificateError(value bool) Option {
 // WithOptimizeHeaders makes DynamoDB client remove headers not used by Alternator reducing outgoing traffic
 func WithOptimizeHeaders(enabled bool) Option {
 	var OptimizeHeaders func(config Config) []string
-	if enabled == true {
+	if enabled {
 		OptimizeHeaders = func(config Config) []string {
 			allowedHeaders := []string{"Host", "X-Amz-Target", "Content-Length", "Accept-Encoding"}
 			if config.AccessKeyID != "" {

@@ -9,8 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
 const (
@@ -36,8 +39,7 @@ type AlternatorLiveNodes struct {
 type ALNConfig struct {
 	Scheme       string
 	Port         int
-	Rack         string
-	Datacenter   string
+	RoutingScope rt.Scope
 	UpdatePeriod time.Duration
 	// Now often read /localnodes when no requests are going through
 	IdleUpdatePeriod time.Duration
@@ -58,8 +60,7 @@ func NewDefaultALNConfig() ALNConfig {
 	return ALNConfig{
 		Scheme:                    defaultScheme,
 		Port:                      defaultPort,
-		Rack:                      "",
-		Datacenter:                "",
+		RoutingScope:              rt.NewClusterScope(),
 		UpdatePeriod:              defaultUpdatePeriod,
 		IdleUpdatePeriod:          time.Minute, // Don't update by default
 		TLSSessionCache:           defaultTLSSessionCache,
@@ -90,17 +91,13 @@ func WithALNPort(port int) ALNOption {
 	}
 }
 
-// WithALNRack makes Alternator client target only nodes from particular rack
-func WithALNRack(rack string) ALNOption {
-	return func(config *ALNConfig) {
-		config.Rack = rack
+// WithALNRoutingScope makes Alternator client target only nodes that matches the scope
+func WithALNRoutingScope(routingScope rt.Scope) ALNOption {
+	if routingScope == nil {
+		panic("routingScope can't be nil")
 	}
-}
-
-// WithALNDatacenter makes Alternator client target only nodes from particular datacenter
-func WithALNDatacenter(datacenter string) ALNOption {
 	return func(config *ALNConfig) {
-		config.Datacenter = datacenter
+		config.RoutingScope = routingScope
 	}
 }
 
@@ -201,7 +198,7 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	for i, node := range initialNodes {
 		parsed, err := url.Parse(fmt.Sprintf("%s://%s:%d", cfg.Scheme, node, cfg.Port))
 		if err != nil {
-			return nil, fmt.Errorf("invalid node URI: %v", err)
+			return nil, fmt.Errorf("invalid node URI: %w", err)
 		}
 		nodes[i] = *parsed
 	}
@@ -300,11 +297,19 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
-	newNodes, err := aln.getNodes(aln.nextAsLocalNodesURL())
-	if err == nil && len(newNodes) > 0 {
-		aln.liveNodes.Store(&newNodes)
+	scope := aln.cfg.RoutingScope
+	for scope != nil {
+		newNodes, err := aln.getNodes(aln.nextAsURLWithPath("/localnodes", scope.GetLocalNodesQuery()))
+		if err != nil {
+			return err
+		}
+		if len(newNodes) != 0 {
+			aln.liveNodes.Store(&newNodes)
+			break
+		}
+		scope = scope.Fallback()
 	}
-	return err
+	return nil
 }
 
 func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
@@ -337,32 +342,39 @@ func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
 	return uris, nil
 }
 
-func (aln *AlternatorLiveNodes) nextAsLocalNodesURL() *url.URL {
-	query := ""
-	if aln.cfg.Rack != "" {
-		query += "rack=" + aln.cfg.Rack
-	}
-	if aln.cfg.Datacenter != "" {
-		if query != "" {
-			query += "&"
-		}
-		query += "dc=" + aln.cfg.Datacenter
-	}
-	return aln.nextAsURLWithPath("/localnodes", query)
-}
-
 // CheckIfRackAndDatacenterSetCorrectly verifies that the rack and datacenter
 // settings are correctly configured and recognized by the Alternator cluster.
-func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() error {
-	if aln.cfg.Rack == "" && aln.cfg.Datacenter == "" {
+func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err error) {
+	var errs []error
+	defer func() {
+		if err == nil && len(errs) > 0 {
+			for _, err := range errs {
+				fmt.Fprintln(os.Stderr, err.Error())
+			}
+		}
+	}()
+	scope := aln.cfg.RoutingScope
+	for scope != nil {
+		if _, ok := scope.(rt.ClusterScope); ok {
+			// Cluster scope does not require validation
+			return nil
+		}
+		newNodes, err := aln.getNodes(aln.nextAsURLWithPath("/localnodes", scope.GetLocalNodesQuery()))
+		if err != nil {
+			return fmt.Errorf("failed to read list of nodes: %w", err)
+		}
+		if len(newNodes) == 0 {
+			errs = append(
+				errs,
+				fmt.Errorf("scope %s have no nodes, datacenter or rack might be incorrect", scope.String()),
+			)
+			scope = scope.Fallback()
+			continue
+		}
 		return nil
 	}
-	newNodes, err := aln.getNodes(aln.nextAsLocalNodesURL())
-	if err != nil {
-		return fmt.Errorf("failed to read list of nodes: %v", err)
-	}
-	if len(newNodes) == 0 {
-		return errors.New("node returned empty list, datacenter or rack might be incorrect")
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
