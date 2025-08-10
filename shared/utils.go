@@ -45,6 +45,8 @@ func PatchBasicHTTPTransport(config ALNConfig, transport *http.Transport) {
 	}
 
 	if config.ClientCertificateSource != nil {
-		transport.TLSClientConfig.GetClientCertificate = config.ClientCertificateSource.GetClientCertificate
+		transport.TLSClientConfig.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return config.ClientCertificateSource.GetClientCertificate(info, config.Logger)
+		}
 	}
 }
