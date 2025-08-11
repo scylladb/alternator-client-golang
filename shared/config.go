@@ -133,6 +133,7 @@ func WithPort(port int) Option {
 }
 
 // WithRack makes DynamoDB client target only nodes from particular rack
+// Deprecated: use WithRoutingScope(rt.Rackcope("dc1", "rack1", nil)) instead
 func WithRack(rack string) Option {
 	return func(config *Config) {
 		if config.Datacenter == "" {
@@ -143,6 +144,7 @@ func WithRack(rack string) Option {
 }
 
 // WithDatacenter makes DynamoDB client target only nodes from particular datacenter
+// Deprecated: use WithRoutingScope(rt.DCScope("dc1", nil)) instead
 func WithDatacenter(dc string) Option {
 	return func(config *Config) {
 		config.Datacenter = dc
