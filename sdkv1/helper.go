@@ -58,6 +58,9 @@ var (
 	// WithDatacenter makes DynamoDB client target only nodes from particular datacenter
 	WithDatacenter = shared.WithDatacenter
 
+	// WithRoutingScope makes DynamoDB client target only nodes from particular scope (dc, rack, cluster)
+	WithRoutingScope = shared.WithRoutingScope
+
 	// WithAWSRegion inject region into DynamoDB client, this region does not play any role
 	// One way you can use it - to have this region in the logs, CloudWatch.
 	WithAWSRegion = shared.WithAWSRegion

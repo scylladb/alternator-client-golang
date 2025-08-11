@@ -6,6 +6,7 @@ package sdkv1_test
 import (
 	"crypto/tls"
 	"errors"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 
 	helper "github.com/scylladb/alternator-client-golang/sdkv1"
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
 var (
@@ -24,6 +26,42 @@ var (
 )
 
 var notFoundErr = new(*dynamodb.ResourceNotFoundException)
+
+func TestRoutingFallback(t *testing.T) {
+	h, err := helper.NewHelper(
+		knownNodes,
+		helper.WithPort(httpPort),
+		helper.WithRoutingScope(rt.NewDCScope("wrongDC", rt.NewDCScope("datacenter1", nil))),
+	)
+	if err != nil {
+		t.Fatalf("failed to create alternator helper: %v", err)
+	}
+	defer h.Stop()
+
+	if err := h.CheckIfRackAndDatacenterSetCorrectly(); err != nil {
+		t.Fatalf("CheckIfRackAndDatacenterSetCorrectly() unexpectedly returned an error: %v", err)
+	}
+	err = h.UpdateLiveNodes()
+	if err != nil {
+		t.Fatalf("UpdateLiveNodes() unexpectedly returned an error: %v", err)
+	}
+	meetNodes := map[url.URL]struct{}{}
+	var nodesListWasUpdated bool
+	for {
+		node := h.NextNode()
+		if _, ok := meetNodes[node]; ok {
+			break
+		}
+		meetNodes[node] = struct{}{}
+		if !slices.Contains(knownNodes, node.Host) {
+			// New node was learned
+			nodesListWasUpdated = true
+		}
+	}
+	if !nodesListWasUpdated {
+		t.Fatalf("UpdateLiveNodes() did not update node list")
+	}
+}
 
 func TestCheckIfRackAndDatacenterSetCorrectly_WrongDC(t *testing.T) {
 	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("wrongDC"))
