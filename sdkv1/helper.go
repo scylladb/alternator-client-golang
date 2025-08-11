@@ -53,9 +53,11 @@ var (
 	WithPort = shared.WithPort
 
 	// WithRack makes DynamoDB client target only nodes from particular rack
+	// Deprecated: use WithRoutingScope(rt.Rackcope("dc1", "rack1", nil)) instead
 	WithRack = shared.WithRack
 
 	// WithDatacenter makes DynamoDB client target only nodes from particular datacenter
+	// Deprecated: use WithRoutingScope(rt.DCScope("dc1", nil)) instead
 	WithDatacenter = shared.WithDatacenter
 
 	// WithRoutingScope makes DynamoDB client target only nodes from particular scope (dc, rack, cluster)
