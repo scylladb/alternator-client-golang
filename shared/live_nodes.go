@@ -9,10 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"sync/atomic"
 	"time"
 
+	"github.com/scylladb/alternator-client-golang/shared/logx"
+	"github.com/scylladb/alternator-client-golang/shared/logxzap"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
@@ -47,6 +48,7 @@ type ALNConfig struct {
 	IgnoreServerCertificateError bool
 	ClientCertificateSource      CertSource
 	// A key writer for pre master key: https://wiki.wireshark.org/TLS#using-the-pre-master-secret
+	Logger       logx.Logger
 	KeyLogWriter io.Writer
 	// TLS session cache
 	TLSSessionCache        tls.ClientSessionCache
@@ -66,6 +68,7 @@ func NewDefaultALNConfig() ALNConfig {
 		TLSSessionCache:           defaultTLSSessionCache,
 		MaxIdleHTTPConnections:    100,
 		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
+		Logger:                    logxzap.DefaultLogger(),
 	}
 }
 
@@ -119,6 +122,13 @@ func WithALNIdleUpdatePeriod(period time.Duration) ALNOption {
 func WithALNIgnoreServerCertificateError(value bool) ALNOption {
 	return func(config *ALNConfig) {
 		config.IgnoreServerCertificateError = value
+	}
+}
+
+// WithLogger sets logger
+func WithLogger(logger logx.Logger) ALNOption {
+	return func(config *ALNConfig) {
+		config.Logger = logger
 	}
 }
 
@@ -335,6 +345,7 @@ func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
 	for _, node := range nodes {
 		nodeURL, err := url.Parse(fmt.Sprintf("%s://%s:%d", aln.cfg.Scheme, node, aln.cfg.Port))
 		if err != nil {
+			aln.cfg.Logger.Error(fmt.Errorf("failed to parse node list entry: %w", err).Error())
 			continue
 		}
 		uris = append(uris, *nodeURL)
@@ -349,7 +360,7 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 	defer func() {
 		if err == nil && len(errs) > 0 {
 			for _, err := range errs {
-				fmt.Fprintln(os.Stderr, err.Error())
+				aln.cfg.Logger.Error(err.Error())
 			}
 		}
 	}()

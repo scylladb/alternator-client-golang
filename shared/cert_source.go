@@ -6,11 +6,13 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/scylladb/alternator-client-golang/shared/logx"
 )
 
 // CertSource an interface that provides http clients with certificate
 type CertSource interface {
-	GetClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	GetClientCertificate(*tls.CertificateRequestInfo, logx.Logger) (*tls.Certificate, error)
 }
 
 // CertFileSource serves certificate and key from a files
@@ -31,7 +33,10 @@ func NewFileCertificate(certPath, keyPath string) *CertFileSource {
 }
 
 // GetClientCertificate implementation of tls.Config.GetClientCertificate that serves certificate from a file
-func (c *CertFileSource) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+func (c *CertFileSource) GetClientCertificate(
+	_ *tls.CertificateRequestInfo,
+	log logx.Logger,
+) (*tls.Certificate, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -39,7 +44,7 @@ func (c *CertFileSource) GetClientCertificate(_ *tls.CertificateRequestInfo) (*t
 	if err != nil {
 		err = fmt.Errorf("failed to stat certificate file %s: %w", c.certPath, err)
 		if c.cert != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %s", err.Error())
+			log.Error(err.Error())
 			return c.cert, nil
 		}
 		return nil, err
@@ -53,7 +58,7 @@ func (c *CertFileSource) GetClientCertificate(_ *tls.CertificateRequestInfo) (*t
 	if err != nil {
 		err = fmt.Errorf("failed to load certificate file %s: %w", c.certPath, err)
 		if c.cert != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %s", err.Error())
+			log.Error(err.Error())
 			return c.cert, nil
 		}
 		return nil, err
@@ -77,6 +82,9 @@ func NewCertificate(cert tls.Certificate) *CertificateSource {
 }
 
 // GetClientCertificate implementation of tls.Config.GetClientCertificate that serves provided certificate
-func (c *CertificateSource) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+func (c *CertificateSource) GetClientCertificate(
+	_ *tls.CertificateRequestInfo,
+	_ logx.Logger,
+) (*tls.Certificate, error) {
 	return c.cert, nil
 }

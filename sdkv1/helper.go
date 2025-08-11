@@ -65,6 +65,9 @@ var (
 	// One way you can use it - to have this region in the logs, CloudWatch.
 	WithAWSRegion = shared.WithAWSRegion
 
+	// WithLogger sets logger
+	WithLogger = shared.WithLogger
+
 	// WithNodesListUpdatePeriod configures how often update list of nodes, while requests are running
 	WithNodesListUpdatePeriod = shared.WithNodesListUpdatePeriod
 
