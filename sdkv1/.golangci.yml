@@ -25,6 +25,9 @@ linters:
         - shadow
         - fieldalignment
 
+    staticcheck:
+      checks: ["all", "-SA1019"]
+
     nolintlint:
       allow-no-explanation: [ golines ]
       require-explanation: true
