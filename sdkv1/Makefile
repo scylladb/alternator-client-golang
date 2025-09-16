@@ -32,12 +32,12 @@ fix: fix-golangci
 .PHONY: check-golangci
 check-golangci: .prepare-golangci
 	@echo "======== [${MODULE}] Linting with golangci"
-	@golangci-lint run --config ../.golangci.yml ./...
+	@golangci-lint run --config .golangci.yml ./...
 
 .PHONY: fix-golangci
 fix-golangci: .prepare-golangci
 	@echo "======== [${MODULE}] Fixing code with golangci"
-	@golangci-lint run --config ../.golangci.yml --fix ./...
+	@golangci-lint run --config .golangci.yml --fix ./...
 
 .PHONY: test
 test: build check test-unit test-integration
