@@ -23,7 +23,7 @@ jobs:
       - name: Install GoLang
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           go-version-file: "go.work"
 
       - name: Run build
