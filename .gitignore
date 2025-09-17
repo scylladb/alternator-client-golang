@@ -3,3 +3,7 @@ bin/
 test/scylla/db.crt
 test/scylla/db.key
 vendor/
+
+# Claude / AI assistant metadata
+CLAUDE.md
+.claude/
