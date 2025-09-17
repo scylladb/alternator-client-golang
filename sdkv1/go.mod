@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/aws/aws-sdk-go v1.55.8
-	github.com/scylladb/alternator-client-golang/shared v0.0.0-20250916125851-cc515eb951ad
+	github.com/scylladb/alternator-client-golang/shared v0.0.0-20250917113941-58fba399b192
 )
 
 require (
