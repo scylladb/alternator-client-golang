@@ -12,3 +12,5 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 )
+
+replace github.com/scylladb/alternator-client-golang/shared => ../shared
