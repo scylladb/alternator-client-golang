@@ -125,8 +125,8 @@ func WithALNIgnoreServerCertificateError(value bool) ALNOption {
 	}
 }
 
-// WithLogger sets logger
-func WithLogger(logger logx.Logger) ALNOption {
+// WithALNLogger sets logger
+func WithALNLogger(logger logx.Logger) ALNOption {
 	return func(config *ALNConfig) {
 		config.Logger = logger
 	}

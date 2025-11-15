@@ -119,6 +119,18 @@ var (
 	WithIdleHTTPConnectionTimeout = shared.WithIdleHTTPConnectionTimeout
 )
 
+// AlternatorNodesSource an interface for nodes list provider
+type AlternatorNodesSource interface {
+	NextNode() url.URL
+	UpdateLiveNodes() error
+	CheckIfRackAndDatacenterSetCorrectly() error
+	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
+	Start()
+	Stop()
+}
+
+var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
+
 // Helper manages the integration between the AWS SDK and ScyllaDB's Alternator.
 // It handles dynamic node discovery, rack/datacenter-aware routing, and creates
 // AWS-compatible configurations to transparently distribute requests.
@@ -132,7 +144,7 @@ var (
 // It internally relies on the shared.AlternatorLiveNodes component for tracking
 // and routing to healthy nodes.
 type Helper struct {
-	nodes *shared.AlternatorLiveNodes
+	nodes AlternatorNodesSource
 	cfg   shared.Config
 }
 

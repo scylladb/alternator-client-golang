@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/scylladb/alternator-client-golang/shared/logx"
+	"github.com/scylladb/alternator-client-golang/shared/logxzap"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
@@ -38,6 +40,7 @@ type Config struct {
 	OptimizeHeaders func(Config) []string
 	// Update node list when no requests are running
 	IdleNodesListUpdatePeriod time.Duration
+	Logger                    logx.Logger
 	// A key writer for pre master key: https://wiki.wireshark.org/TLS#using-the-pre-master-secret
 	KeyLogWriter io.Writer
 	// TLS session cache
@@ -71,6 +74,7 @@ func NewDefaultConfig() *Config {
 		TLSSessionCache:           defaultTLSSessionCache,
 		MaxIdleHTTPConnections:    100,
 		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
+		Logger:                    logxzap.DefaultLogger(),
 	}
 }
 
@@ -93,6 +97,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNMaxIdleHTTPConnections(c.MaxIdleHTTPConnections),
 		WithALNIdleHTTPConnectionTimeout(c.IdleHTTPConnectionTimeout),
 		WithALNRoutingScope(c.RoutingScope),
+		WithALNLogger(c.Logger),
 	}
 
 	if c.IdleNodesListUpdatePeriod != 0 {
@@ -244,6 +249,13 @@ func WithCustomOptimizeHeaders(fn func(config Config) []string) Option {
 func WithIdleNodesListUpdatePeriod(period time.Duration) Option {
 	return func(config *Config) {
 		config.IdleNodesListUpdatePeriod = period
+	}
+}
+
+// WithLogger sets a logger
+func WithLogger(logger logx.Logger) Option {
+	return func(config *Config) {
+		config.Logger = logger
 	}
 }
 

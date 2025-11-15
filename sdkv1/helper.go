@@ -68,7 +68,7 @@ var (
 	WithAWSRegion = shared.WithAWSRegion
 
 	// WithLogger sets logger
-	WithLogger = shared.WithLogger
+	WithLogger = shared.WithALNLogger
 
 	// WithNodesListUpdatePeriod configures how often update list of nodes, while requests are running
 	WithNodesListUpdatePeriod = shared.WithNodesListUpdatePeriod
