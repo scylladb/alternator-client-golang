@@ -320,7 +320,9 @@ func PatchHTTPClient(config Config, client interface{}) error {
 
 	httpTransport, ok := httpClient.Transport.(*http.Transport)
 	if !ok {
-		alnConfig.Logger.Error("configuration requires a http transport to be patched, but it is impossible since it is not an instance of http.Transport")
+		alnConfig.Logger.Error(
+			"configuration requires a http transport to be patched, but it is impossible since it is not an instance of http.Transport",
+		)
 		return nil
 	}
 

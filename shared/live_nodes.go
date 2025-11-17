@@ -306,6 +306,19 @@ func (aln *AlternatorLiveNodes) nextNode() url.URL {
 	return nodes[aln.nextLiveNodeIdx.Add(1)%uint64(len(nodes))]
 }
 
+// GetNodes returns a copy of the complete list of live Alternator nodes.
+// If no live nodes are available, it returns the initial nodes list.
+func (aln *AlternatorLiveNodes) GetNodes() []url.URL {
+	nodes := *aln.liveNodes.Load()
+	if len(nodes) == 0 {
+		nodes = aln.initialNodes
+	}
+	// Return a copy to prevent external modifications
+	result := make([]url.URL, len(nodes))
+	copy(result, nodes)
+	return result
+}
+
 func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 	base := aln.nextNode()
 	newURL := base

@@ -115,6 +115,19 @@ var (
 	WithHTTPTransport = shared.WithHTTPTransport
 )
 
+// AlternatorNodesSource an interface for nodes list provider
+type AlternatorNodesSource interface {
+	NextNode() url.URL
+	GetNodes() []url.URL
+	UpdateLiveNodes() error
+	CheckIfRackAndDatacenterSetCorrectly() error
+	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
+	Start()
+	Stop()
+}
+
+var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
+
 // Helper manages the integration between the AWS SDK and ScyllaDB's Alternator.
 // It handles dynamic node discovery, rack/datacenter-aware routing, and creates
 // AWS-compatible configurations to transparently distribute requests.
@@ -128,7 +141,7 @@ var (
 // It internally relies on the shared.AlternatorLiveNodes component for tracking
 // and routing to healthy nodes.
 type Helper struct {
-	nodes *shared.AlternatorLiveNodes
+	nodes AlternatorNodesSource
 	cfg   shared.Config
 }
 
@@ -154,6 +167,12 @@ func NewHelper(initialNodes []string, options ...Option) (*Helper, error) {
 // NextNode returns the next available Alternator node URL
 func (lb *Helper) NextNode() url.URL {
 	return lb.nodes.NextNode()
+}
+
+// GetNodes returns a copy of the complete list of live Alternator nodes.
+// If no live nodes are available, it returns the initial nodes list.
+func (lb *Helper) GetNodes() []url.URL {
+	return lb.nodes.GetNodes()
 }
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.

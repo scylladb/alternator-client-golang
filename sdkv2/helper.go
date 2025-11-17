@@ -126,6 +126,7 @@ var (
 // AlternatorNodesSource an interface for nodes list provider
 type AlternatorNodesSource interface {
 	NextNode() url.URL
+	GetNodes() []url.URL
 	UpdateLiveNodes() error
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
