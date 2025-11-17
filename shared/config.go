@@ -49,6 +49,8 @@ type Config struct {
 	MaxIdleHTTPConnections int
 	// Time to keep idle http connection alive
 	IdleHTTPConnectionTimeout time.Duration
+	// A custom http transport
+	HTTPTransport http.RoundTripper
 }
 
 // Option a configuration option
@@ -114,6 +116,10 @@ func (c *Config) ToALNOptions() []ALNOption {
 
 	if c.TLSSessionCache != nil {
 		out = append(out, WithALNTLSSessionCache(c.TLSSessionCache))
+	}
+
+	if c.HTTPTransport != nil {
+		out = append(out, WithALNHTTPTransport(c.HTTPTransport))
 	}
 	return out
 }
@@ -292,6 +298,14 @@ func WithIdleHTTPConnectionTimeout(value time.Duration) Option {
 	}
 }
 
+// WithHTTPTransport sets custom transport for http client
+// For testing purposes only, don't use it on production
+func WithHTTPTransport(transport http.RoundTripper) Option {
+	return func(config *Config) {
+		config.HTTPTransport = transport
+	}
+}
+
 // PatchHTTPClient takes `http.Client` instance and patches it according to `Config`
 func PatchHTTPClient(config Config, client interface{}) error {
 	httpClient, ok := client.(*http.Client)
@@ -306,8 +320,10 @@ func PatchHTTPClient(config Config, client interface{}) error {
 
 	httpTransport, ok := httpClient.Transport.(*http.Transport)
 	if !ok {
-		return errors.New("failed to patch http transport for ignore server certificate")
+		alnConfig.Logger.Error("configuration requires a http transport to be patched, but it is impossible since it is not an instance of http.Transport")
+		return nil
 	}
+
 	PatchBasicHTTPTransport(alnConfig, httpTransport)
 
 	if config.OptimizeHeaders != nil {

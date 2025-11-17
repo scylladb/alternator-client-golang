@@ -109,6 +109,10 @@ var (
 
 	// WithIdleHTTPConnectionTimeout controls timeout for idle http connections held by http.Transport
 	WithIdleHTTPConnectionTimeout = shared.WithIdleHTTPConnectionTimeout
+
+	// WithHTTPTransport sets custom transport for http client
+	// For testing purposes only, don't use it on production
+	WithHTTPTransport = shared.WithHTTPTransport
 )
 
 // Helper manages the integration between the AWS SDK and ScyllaDB's Alternator.

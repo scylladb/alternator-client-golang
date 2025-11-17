@@ -46,15 +46,18 @@ type ALNConfig struct {
 	IdleUpdatePeriod time.Duration
 	// Makes it ignore server certificate errors
 	IgnoreServerCertificateError bool
-	ClientCertificateSource      CertSource
+	// ClientCertificateSource a certificate store to supplies client certificate to the http client
+	ClientCertificateSource CertSource
+	Logger                  logx.Logger
 	// A key writer for pre master key: https://wiki.wireshark.org/TLS#using-the-pre-master-secret
-	Logger       logx.Logger
 	KeyLogWriter io.Writer
 	// TLS session cache
 	TLSSessionCache        tls.ClientSessionCache
 	MaxIdleHTTPConnections int
 	// Time to keep idle http connection alive
 	IdleHTTPConnectionTimeout time.Duration
+	// A custom http transport
+	HTTPTransport http.RoundTripper
 }
 
 // NewDefaultALNConfig creates new default ALNConfig
@@ -184,6 +187,14 @@ func WithALNMaxIdleHTTPConnections(value int) ALNOption {
 func WithALNIdleHTTPConnectionTimeout(value time.Duration) ALNOption {
 	return func(config *ALNConfig) {
 		config.IdleHTTPConnectionTimeout = value
+	}
+}
+
+// WithALNHTTPTransport sets custom transport for http client
+// For testing purposes only, don't use it on production
+func WithALNHTTPTransport(transport http.RoundTripper) ALNOption {
+	return func(config *ALNConfig) {
+		config.HTTPTransport = transport
 	}
 }
 
