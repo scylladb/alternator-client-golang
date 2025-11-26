@@ -7,13 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/logx"
 	"github.com/scylladb/alternator-client-golang/shared/logxzap"
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
@@ -34,6 +38,7 @@ type AlternatorLiveNodes struct {
 	stopFn             context.CancelFunc
 	httpClient         *http.Client
 	updateSignal       chan struct{}
+	nodeHealthStore    *nodeshealth.NodeHealthStore
 }
 
 // ALNConfig a config for `AlternatorLiveNodes`
@@ -60,6 +65,8 @@ type ALNConfig struct {
 	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
 	// Timeout for HTTP requests
 	HTTPClientTimeout time.Duration
+	// NodeHealthStoreConfig holds the entire health store configuration shared with AlternatorLiveNodes.
+	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
 }
 
 // NewDefaultALNConfig creates new default ALNConfig
@@ -75,6 +82,7 @@ func NewDefaultALNConfig() ALNConfig {
 		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
 		HTTPClientTimeout:         http.DefaultClient.Timeout,
 		Logger:                    logxzap.DefaultLogger(),
+		NodeHealthStoreConfig:     nodeshealth.DefaultNodeHealthStoreConfig(),
 	}
 }
 
@@ -208,6 +216,13 @@ func WithALNHTTPClientTimeout(value time.Duration) ALNOption {
 	}
 }
 
+// WithALNNodeHealthStoreConfig overrides the default node health store configuration.
+func WithALNNodeHealthStoreConfig(storeCfg nodeshealth.NodeHealthStoreConfig) ALNOption {
+	return func(config *ALNConfig) {
+		config.NodeHealthStoreConfig = storeCfg
+	}
+}
+
 // NewAlternatorLiveNodes creates a new `AlternatorLiveNodes` instance configured with the provided initial Alternator nodes,
 //
 //	in a form of ip or dns name (without port) and optional functional configuration options (e.g., AWS region, credentials, TLS).
@@ -235,16 +250,37 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 		nodes[i] = *parsed
 	}
 
+	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
+		cfg.NodeHealthStoreConfig,
+		func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
+			resp, err := httpClient.Get(u.String())
+			if err != nil {
+				cfg.Logger.Error("failed to check node health status", logx.A("node", u.String()), logx.A("error", err))
+				return false
+			}
+			if resp.StatusCode != http.StatusOK {
+				cfg.Logger.Error("failed to check node health status, node reported an error",
+					logx.A("node", u.String()),
+					logx.A("statusCode", resp.StatusCode),
+				)
+				return false
+			}
+			return true
+		},
+		nodes)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	out := &AlternatorLiveNodes{
-		initialNodes: nodes,
-		cfg:          cfg,
-		ctx:          ctx,
-		stopFn:       cancel,
-		httpClient:   httpClient,
-		updateSignal: make(chan struct{}, 1),
+		initialNodes:    nodes,
+		cfg:             cfg,
+		ctx:             ctx,
+		stopFn:          cancel,
+		httpClient:      httpClient,
+		nodeHealthStore: nodeHealthStore,
+		updateSignal:    make(chan struct{}, 1),
 	}
-
 	out.liveNodes.Store(&nodes)
 	return out, nil
 }
@@ -293,6 +329,7 @@ func (aln *AlternatorLiveNodes) startIdleUpdater() {
 // It is not required to start if automatically on first API call
 func (aln *AlternatorLiveNodes) Start() {
 	aln.startIdleUpdater()
+	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 }
 
 // Stop stops background routines used for periodic node discovery and updates.
@@ -341,19 +378,44 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 }
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
-func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
+func (aln *AlternatorLiveNodes) getLiveNodesNodes() ([]url.URL, error) {
 	scope := aln.cfg.RoutingScope
 	for scope != nil {
 		newNodes, err := aln.getNodes(aln.nextAsURLWithPath("/localnodes", scope.GetLocalNodesQuery()))
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if len(newNodes) != 0 {
-			aln.liveNodes.Store(&newNodes)
-			break
+			return newNodes, nil
 		}
 		scope = scope.Fallback()
 	}
+	return nil, nil
+}
+
+// UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
+func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
+	newNodes, err := aln.getLiveNodesNodes()
+	if err != nil {
+		return err
+	}
+	if len(newNodes) == 0 {
+		return nil
+	}
+	currentNodes := *aln.liveNodes.Load()
+
+	for _, node := range newNodes {
+		if !slices.Contains(currentNodes, node) {
+			aln.nodeHealthStore.AddNode(node)
+		}
+	}
+
+	for _, node := range currentNodes {
+		if !slices.Contains(newNodes, node) {
+			aln.nodeHealthStore.RemoveNode(node)
+		}
+	}
+	aln.liveNodes.Store(&newNodes)
 	return nil
 }
 
@@ -444,4 +506,44 @@ func (aln *AlternatorLiveNodes) CheckIfRackDatacenterFeatureIsSupported() (bool,
 	}
 
 	return len(hostsWithFakeRack) != len(hostsWithoutRack), nil
+}
+
+func (aln *AlternatorLiveNodes) normalizeNode(node url.URL) url.URL {
+	if node.Port() != "" {
+		return node
+	}
+	host := node.Hostname()
+	if host == "" {
+		host = node.Host
+	}
+	if host == "" {
+		return node
+	}
+	port := aln.cfg.Port
+	if port == 0 {
+		port = defaultPort
+	}
+	node.Host = net.JoinHostPort(host, strconv.Itoa(port))
+	return node
+}
+
+// ReportNodeError reports an error that occurred when communicating with a specific node.
+// It increases the node error score by the mapped error weight.
+func (aln *AlternatorLiveNodes) ReportNodeError(node url.URL, err error) {
+	aln.nodeHealthStore.ReportNodeError(aln.normalizeNode(node), err)
+}
+
+// GetActiveNodes returns nodes that are currently considered healthy.
+func (aln *AlternatorLiveNodes) GetActiveNodes() []url.URL {
+	return aln.nodeHealthStore.GetActiveNodes()
+}
+
+// GetQuarantinedNodes returns nodes currently marked as unhealthy.
+func (aln *AlternatorLiveNodes) GetQuarantinedNodes() []url.URL {
+	return aln.nodeHealthStore.GetQuarantinedNodes()
+}
+
+// TryReleaseQuarantinedNodes executes the configured callback for every quarantined node.
+func (aln *AlternatorLiveNodes) TryReleaseQuarantinedNodes() []url.URL {
+	return aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 }

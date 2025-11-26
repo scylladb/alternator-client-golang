@@ -42,6 +42,8 @@ import (
 	"github.com/scylladb/alternator-client-golang/shared"
 
 	smithyendpoints "github.com/aws/smithy-go/endpoints"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Option is option for the `NewHelper`
@@ -102,6 +104,9 @@ var (
 	// in a form of custom implementation of `CertSource` interface
 	WithClientCertificateSource = shared.WithClientCertificateSource
 
+	// WithNodeHealthStoreConfig overrides the entire node health tracking configuration.
+	WithNodeHealthStoreConfig = shared.WithNodeHealthStoreConfig
+
 	// WithIgnoreServerCertificateError makes both http clients ignore tls error when value is true
 	WithIgnoreServerCertificateError = shared.WithIgnoreServerCertificateError
 
@@ -139,9 +144,12 @@ var (
 type AlternatorNodesSource interface {
 	NextNode() url.URL
 	GetNodes() []url.URL
+	GetActiveNodes() []url.URL
+	GetQuarantinedNodes() []url.URL
 	UpdateLiveNodes() error
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
+	ReportNodeError(nodeURL url.URL, err error)
 	Start()
 	Stop()
 }
@@ -271,7 +279,46 @@ func (lb *Helper) NewDynamoDB() (*dynamodb.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dynamodb.NewFromConfig(cfg, dynamodb.WithEndpointResolverV2(lb.endpointResolverV2())), nil
+
+	return dynamodb.NewFromConfig(
+		cfg,
+		dynamodb.WithEndpointResolverV2(lb.endpointResolverV2()),
+		dynamodb.WithAPIOptions(lb.executionPlanAPIOption()),
+	), nil
+}
+
+type roundTripper struct {
+	originalTransport http.RoundTripper
+	lb                *Helper
+}
+
+func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL == nil {
+		req.URL = &url.URL{}
+	}
+	if req.URL.Host == "" {
+		if node, ok := executionPlanNodeFromContext(req.Context()); ok {
+			req.URL.Scheme = node.Scheme
+			req.URL.Host = node.Host
+		} else {
+			return nil, fmt.Errorf("round-tripper: target node has not been assigned to the request, it is a bug, please report")
+		}
+	}
+	resp, err := rt.originalTransport.RoundTrip(req)
+	if err != nil && req.URL != nil {
+		rt.lb.nodes.ReportNodeError(url.URL{
+			Host:   req.URL.Host,
+			Scheme: req.URL.Scheme,
+		}, err)
+	}
+	return resp, err
+}
+
+func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTripper {
+	return &roundTripper{
+		originalTransport: original,
+		lb:                lb,
+	}
 }
 
 // EndpointResolverV2 implementation for `dynamodb.EndpointResolverV2` that makes it return alternator nodes
@@ -281,10 +328,90 @@ type EndpointResolverV2 struct {
 
 // ResolveEndpoint returns alternator endpoint wrapped in `smithyendpoints.Endpoint`
 func (r *EndpointResolverV2) ResolveEndpoint(
-	_ context.Context,
+	ctx context.Context,
 	_ dynamodb.EndpointParameters,
 ) (smithyendpoints.Endpoint, error) {
-	return smithyendpoints.Endpoint{
-		URI: r.lb.NextNode(),
-	}, nil
+	if node, ok := executionPlanNodeFromContext(ctx); ok {
+		return smithyendpoints.Endpoint{URI: node}, nil
+	}
+	return smithyendpoints.Endpoint{}, fmt.Errorf(
+		"endpoint-resolver: target node has not been assigned to the request, it is a bug, please report",
+	)
+}
+
+const (
+	// A context key to store/retrieve execution plan
+	executionPlanKey = "alternatorExecutionPlan"
+	// A context key to store/retrieve a node assigned to the request
+	requestNodeKey = "alternatorRequestNode"
+)
+
+func getExecutionPlanFromContext(ctx context.Context) *shared.LazyExecutionPlan {
+	val, _ := middleware.GetStackValue(ctx, executionPlanKey).(*shared.LazyExecutionPlan)
+	return val
+}
+
+func executionPlanNodeFromContext(ctx context.Context) (url.URL, bool) {
+	val, ok := middleware.GetStackValue(ctx, requestNodeKey).(url.URL)
+	if !ok || val.Host == "" {
+		return url.URL{}, false
+	}
+	return val, true
+}
+
+func setExecutionPlan(ctx context.Context, nodes AlternatorNodesSource) context.Context {
+	return middleware.WithStackValue(ctx, executionPlanKey, shared.NewLazyExecutionPlan(nodes))
+}
+
+func (lb *Helper) executionPlanAPIOption() func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		if err := stack.Initialize.Add(
+			middleware.InitializeMiddlewareFunc(
+				executionPlanKey,
+				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					return next.HandleInitialize(setExecutionPlan(ctx, lb.nodes), in)
+				},
+			),
+			middleware.Before,
+		); err != nil {
+			return err
+		}
+
+		mw := middleware.FinalizeMiddlewareFunc(
+			executionPlanKey+"Finalize",
+			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+				plan := getExecutionPlanFromContext(ctx)
+				if plan == nil {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf(
+						"execution plan not found, it is a bug, please report",
+					)
+				}
+				node := plan.Next()
+				if node.Host == "" {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf(
+						"execution plan has no more nodes",
+					)
+				}
+
+				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
+
+				req, ok := in.Request.(*smithyhttp.Request)
+				if !ok {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf(
+						"unexpected request type %T",
+						in.Request,
+					)
+				}
+				req.URL.Scheme = node.Scheme
+				req.URL.Host = node.Host
+
+				return next.HandleFinalize(ctx, in)
+			},
+		)
+
+		if err := stack.Finalize.Insert(mw, "Retry", middleware.After); err != nil {
+			return stack.Finalize.Add(mw, middleware.Before)
+		}
+		return nil
+	}
 }

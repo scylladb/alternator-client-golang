@@ -91,6 +91,9 @@ var (
 	// in a form of custom implementation of `CertSource` interface
 	WithClientCertificateSource = shared.WithClientCertificateSource
 
+	// WithNodeHealthStoreConfig overrides the entire node health tracking configuration.
+	WithNodeHealthStoreConfig = shared.WithNodeHealthStoreConfig
+
 	// WithIgnoreServerCertificateError makes both http clients ignore tls error when value is true
 	WithIgnoreServerCertificateError = shared.WithIgnoreServerCertificateError
 
@@ -134,6 +137,7 @@ type AlternatorNodesSource interface {
 	UpdateLiveNodes() error
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
+	ReportNodeError(nodeURL url.URL, err error)
 	Start()
 	Stop()
 }
@@ -289,7 +293,14 @@ type roundTripper struct {
 func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	node := rt.lb.NextNode()
 	req.URL = &node
-	return rt.originalTransport.RoundTrip(req)
+	resp, err := rt.originalTransport.RoundTrip(req)
+	if err != nil && req.URL != nil {
+		rt.lb.nodes.ReportNodeError(url.URL{
+			Host:   req.URL.Host,
+			Scheme: req.URL.Scheme,
+		}, err)
+	}
+	return resp, err
 }
 
 func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTripper {

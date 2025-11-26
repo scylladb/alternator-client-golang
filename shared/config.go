@@ -11,6 +11,7 @@ import (
 
 	"github.com/scylladb/alternator-client-golang/shared/logx"
 	"github.com/scylladb/alternator-client-golang/shared/logxzap"
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
@@ -55,6 +56,8 @@ type Config struct {
 	HTTPClientTimeout time.Duration
 	// AWSConfigOptions holds []func(*aws.Config) where the aws.Config type differs for each SDK version (v1 vs v2)
 	AWSConfigOptions []any
+
+	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
 }
 
 // Option a configuration option
@@ -83,6 +86,7 @@ func NewDefaultConfig() *Config {
 		HTTPClientTimeout:         http.DefaultClient.Timeout,
 		Logger:                    logxzap.DefaultLogger(),
 		AWSConfigOptions:          []any{},
+		NodeHealthStoreConfig:     nodeshealth.DefaultNodeHealthStoreConfig(),
 	}
 }
 
@@ -107,6 +111,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNHTTPClientTimeout(c.HTTPClientTimeout),
 		WithALNRoutingScope(c.RoutingScope),
 		WithALNLogger(c.Logger),
+		WithALNNodeHealthStoreConfig(c.NodeHealthStoreConfig),
 	}
 
 	if c.IdleNodesListUpdatePeriod != 0 {
@@ -128,6 +133,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 	if c.HTTPTransportWrapper != nil {
 		out = append(out, WithALNHTTPTransportWrapper(c.HTTPTransportWrapper))
 	}
+
 	return out
 }
 
@@ -224,6 +230,13 @@ func WithClientCertificate(certificate tls.Certificate) Option {
 func WithClientCertificateSource(source CertSource) Option {
 	return func(config *Config) {
 		config.ClientCertificateSource = source
+	}
+}
+
+// WithNodeHealthStoreConfig overrides the entire node health store configuration.
+func WithNodeHealthStoreConfig(storeCfg nodeshealth.NodeHealthStoreConfig) Option {
+	return func(config *Config) {
+		config.NodeHealthStoreConfig = storeCfg
 	}
 }
 
