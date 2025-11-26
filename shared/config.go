@@ -3,7 +3,6 @@ package shared
 
 import (
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,8 +48,8 @@ type Config struct {
 	MaxIdleHTTPConnections int
 	// Time to keep idle http connection alive
 	IdleHTTPConnectionTimeout time.Duration
-	// A custom http transport
-	HTTPTransport http.RoundTripper
+	// A hook to control http transports
+	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
 }
 
 // Option a configuration option
@@ -118,8 +117,8 @@ func (c *Config) ToALNOptions() []ALNOption {
 		out = append(out, WithALNTLSSessionCache(c.TLSSessionCache))
 	}
 
-	if c.HTTPTransport != nil {
-		out = append(out, WithALNHTTPTransport(c.HTTPTransport))
+	if c.HTTPTransportWrapper != nil {
+		out = append(out, WithALNHTTPTransportWrapper(c.HTTPTransportWrapper))
 	}
 	return out
 }
@@ -298,38 +297,25 @@ func WithIdleHTTPConnectionTimeout(value time.Duration) Option {
 	}
 }
 
-// WithHTTPTransport sets custom transport for http client
+// WithHTTPTransportWrapper provides ability to control http transport
 // For testing purposes only, don't use it on production
-func WithHTTPTransport(transport http.RoundTripper) Option {
+func WithHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripper) Option {
 	return func(config *Config) {
-		config.HTTPTransport = transport
+		config.HTTPTransportWrapper = wrapper
 	}
 }
 
-// PatchHTTPClient takes `http.Client` instance and patches it according to `Config`
-func PatchHTTPClient(config Config, client interface{}) error {
-	httpClient, ok := client.(*http.Client)
-	if !ok {
-		return errors.New("config is not a http client")
-	}
+// NewHTTPTransport takes `http.Transport` instance and patches it according to `Config`
+func NewHTTPTransport(config Config) http.RoundTripper {
 	alnConfig := config.ToALNConfig()
 
-	if httpClient.Transport == nil {
-		httpClient.Transport = DefaultHTTPTransport()
+	transport := PatchHTTPTransport(alnConfig, DefaultHTTPTransport())
+	if alnConfig.HTTPTransportWrapper != nil {
+		transport = alnConfig.HTTPTransportWrapper(transport)
 	}
-
-	httpTransport, ok := httpClient.Transport.(*http.Transport)
-	if !ok {
-		alnConfig.Logger.Error(
-			"configuration requires a http transport to be patched, but it is impossible since it is not an instance of http.Transport",
-		)
-		return nil
-	}
-
-	PatchBasicHTTPTransport(alnConfig, httpTransport)
 
 	if config.OptimizeHeaders != nil {
-		httpClient.Transport = NewHeaderWhiteListingTransport(httpTransport, config.OptimizeHeaders(config)...)
+		transport = NewHeaderWhiteListingTransport(transport, config.OptimizeHeaders(config)...)
 	}
-	return nil
+	return transport
 }

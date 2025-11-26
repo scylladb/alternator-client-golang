@@ -13,15 +13,18 @@ func DefaultHTTPTransport() *http.Transport {
 	return transport
 }
 
-// NewHTTPTransport creates new http transport based on `ALNConfig`
-func NewHTTPTransport(config ALNConfig) *http.Transport {
+// NewALNHTTPTransport creates new http transport based on `ALNConfig`
+func NewALNHTTPTransport(config ALNConfig) http.RoundTripper {
 	transport := DefaultHTTPTransport()
-	PatchBasicHTTPTransport(config, transport)
+	PatchHTTPTransport(config, transport)
+	if config.HTTPTransportWrapper != nil {
+		return config.HTTPTransportWrapper(transport)
+	}
 	return transport
 }
 
-// PatchBasicHTTPTransport patches `http.Transport` based on provided `ALNConfig`
-func PatchBasicHTTPTransport(config ALNConfig, transport *http.Transport) {
+// PatchHTTPTransport patches `http.Transport` based on provided `ALNConfig`
+func PatchHTTPTransport(config ALNConfig, transport *http.Transport) http.RoundTripper {
 	transport.IdleConnTimeout = config.IdleHTTPConnectionTimeout
 	transport.MaxIdleConns = config.MaxIdleHTTPConnections
 
@@ -49,4 +52,5 @@ func PatchBasicHTTPTransport(config ALNConfig, transport *http.Transport) {
 			return config.ClientCertificateSource.GetClientCertificate(info, config.Logger)
 		}
 	}
+	return transport
 }

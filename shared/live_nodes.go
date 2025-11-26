@@ -56,8 +56,8 @@ type ALNConfig struct {
 	MaxIdleHTTPConnections int
 	// Time to keep idle http connection alive
 	IdleHTTPConnectionTimeout time.Duration
-	// A custom http transport
-	HTTPTransport http.RoundTripper
+	// A hook to control http transports
+	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
 }
 
 // NewDefaultALNConfig creates new default ALNConfig
@@ -190,11 +190,11 @@ func WithALNIdleHTTPConnectionTimeout(value time.Duration) ALNOption {
 	}
 }
 
-// WithALNHTTPTransport sets custom transport for http client
+// WithALNHTTPTransportWrapper provides a hook to control http transports
 // For testing purposes only, don't use it on production
-func WithALNHTTPTransport(transport http.RoundTripper) ALNOption {
+func WithALNHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripper) ALNOption {
 	return func(config *ALNConfig) {
-		config.HTTPTransport = transport
+		config.HTTPTransportWrapper = wrapper
 	}
 }
 
@@ -212,7 +212,7 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	}
 
 	httpClient := &http.Client{
-		Transport: NewHTTPTransport(cfg),
+		Transport: NewALNHTTPTransport(cfg),
 	}
 
 	nodes := make([]url.URL, len(initialNodes))
