@@ -8,3 +8,5 @@ require (
 )
 
 require go.uber.org/multierr v1.11.0 // indirect
+
+require github.com/klauspost/compress v1.18.1 // indirect

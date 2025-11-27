@@ -3,6 +3,7 @@ package sdkv2
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/klauspost/compress/gzip"
 
 	"github.com/scylladb/alternator-client-golang/shared/tests/mocks"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
@@ -204,5 +206,139 @@ func TestOptions(t *testing.T) {
 				})
 			}
 		})
+	})
+
+	t.Run("WithGzipRequestCompression", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name            string
+			optimizeHeaders bool
+		}{
+			{
+				name:            "BasicCompression",
+				optimizeHeaders: false,
+			},
+			{
+				name:            "CompressionWithOptimizedHeaders",
+				optimizeHeaders: true,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				var (
+					alternatorRequests atomic.Int32
+					dynamodbRequests   atomic.Int32
+					capturedHeaders    atomic.Pointer[http.Header]
+					capturedBody       atomic.Pointer[[]byte]
+				)
+
+				nodes := []string{"node1.local"}
+
+				mockTransport := &mocks.MockRoundTripper{
+					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+						alternatorRequests.Add(1)
+						return resp.AlternatorNodesResponse(nodes, req)
+					},
+					NodeHealthRequest: resp.HealthCheckResponse,
+					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+						dynamodbRequests.Add(1)
+
+						// Capture headers
+						headers := req.Header.Clone()
+						capturedHeaders.Store(&headers)
+
+						// Verify Content-Encoding header is set
+						if req.Header.Get("Content-Encoding") != "gzip" {
+							t.Errorf("Expected Content-Encoding: gzip, got %q", req.Header.Get("Content-Encoding"))
+						}
+
+						// Decompress and capture body
+						gzipReader, err := gzip.NewReader(req.Body)
+						if err != nil {
+							return nil, err
+						}
+						defer func() { _ = gzipReader.Close() }()
+
+						body, err := io.ReadAll(gzipReader)
+						if err != nil {
+							return nil, err
+						}
+						capturedBody.Store(&body)
+
+						return resp.DynamoDBListTablesResponse([]string{"test-table"}, req)
+					},
+				}
+
+				opts := []Option{
+					WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+					WithCredentials("test-key", "test-secret"),
+					WithRequestCompression(NewGzipConfig().GzipRequestCompressor()),
+				}
+
+				if tc.optimizeHeaders {
+					opts = append(opts, WithOptimizeHeaders(true))
+				}
+
+				h, err := NewHelper([]string{"node1.local"}, opts...)
+				if err != nil {
+					t.Fatalf("NewHelper returned error: %v", err)
+				}
+				defer h.Stop()
+
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes returned error: %v", err)
+				}
+
+				client, err := h.NewDynamoDB()
+				if err != nil {
+					t.Fatalf("NewDynamoDB returned error: %v", err)
+				}
+
+				_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
+					Limit: aws.Int32(10),
+				})
+				if err != nil {
+					t.Fatalf("ListTables returned error: %v", err)
+				}
+
+				if dynamodbRequests.Load() != 1 {
+					t.Errorf("Expected 1 DynamoDB request, got %d", dynamodbRequests.Load())
+				}
+
+				// Verify body was decompressed correctly
+				body := capturedBody.Load()
+				if body == nil {
+					t.Fatal("Expected body to be captured")
+				}
+				if len(*body) == 0 {
+					t.Error("Expected non-empty decompressed body")
+				}
+
+				// Verify essential headers are present
+				headers := capturedHeaders.Load()
+				if headers == nil {
+					t.Fatal("Expected headers to be captured")
+				}
+				if headers.Get("Content-Encoding") != "gzip" {
+					t.Error("Expected Content-Encoding: gzip header")
+				}
+				if headers.Get("X-Amz-Target") == "" {
+					t.Error("Expected X-Amz-Target header to be present")
+				}
+
+				if tc.optimizeHeaders {
+					if headers.Get("User-Agent") != "" {
+						t.Error("User-Agent header should be removed with header optimization")
+					}
+					if headers.Get("SignedHeaders") != "" {
+						t.Error("SignedHeaders header should be removed with header optimization")
+					}
+				}
+			})
+		}
 	})
 }

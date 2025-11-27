@@ -2,12 +2,15 @@
 package shared
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"reflect"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 
 	"github.com/scylladb/alternator-client-golang/shared/logx"
 	"github.com/scylladb/alternator-client-golang/shared/logxzap"
@@ -55,7 +58,14 @@ type Config struct {
 	HTTPClientTimeout time.Duration
 	// AWSConfigOptions holds []func(*aws.Config) where the aws.Config type differs for each SDK version (v1 vs v2)
 	AWSConfigOptions []any
+	// RequestCompression configures compression for request bodies
+	RequestCompression RequestCompressionFunc
 }
+
+// RequestCompressionFunc is a function that compresses request bodies.
+// It takes the original request body and returns the compressed body, the Content-Encoding header value, and the length of the compressed body.
+// If compression fails or is not applicable, it should return the original body and an empty string.
+type RequestCompressionFunc func(rawBody io.ReadCloser) (body io.ReadCloser, contentEncoding string, length int64, err error)
 
 // Option a configuration option
 type Option func(config *Config)
@@ -239,7 +249,7 @@ func WithOptimizeHeaders(enabled bool) Option {
 	var OptimizeHeaders func(config Config) []string
 	if enabled {
 		OptimizeHeaders = func(config Config) []string {
-			allowedHeaders := []string{"Host", "X-Amz-Target", "Content-Length", "Accept-Encoding"}
+			allowedHeaders := []string{"Host", "X-Amz-Target", "Content-Length", "Accept-Encoding", "Content-Encoding"}
 			if config.AccessKeyID != "" {
 				allowedHeaders = append(allowedHeaders, "Authorization", "X-Amz-Date")
 			}
@@ -305,6 +315,67 @@ func WithIdleHTTPConnectionTimeout(value time.Duration) Option {
 	}
 }
 
+// GzipConfig handles gzip compression of request bodies with configurable settings.
+type GzipConfig struct {
+	level int
+}
+
+// NewGzipConfig creates a new GzipConfig with default settings.
+// Default compression level is gzip.DefaultCompression (-1).
+func NewGzipConfig() *GzipConfig {
+	return &GzipConfig{
+		level: gzip.DefaultCompression,
+	}
+}
+
+// WithLevel sets the gzip compression level.
+// Level can be:
+//   - gzip.HuffmanOnly (-2): Huffman compression only
+//   - gzip.DefaultCompression (-1): default compression level (recommended)
+//   - gzip.NoCompression (0): no compression (store only)
+//   - gzip.BestSpeed (1): fastest compression
+//   - gzip.BestCompression (9): best compression ratio
+//
+// Returns the compressor for method chaining.
+func (c *GzipConfig) WithLevel(level int) *GzipConfig {
+	if level < -2 || level > 9 {
+		panic("invalid gzip compression level: must be between -2 and 9")
+	}
+	c.level = level
+	return c
+}
+
+// GzipRequestCompressor creates a gzip compression function based on GzipConfig.
+func (c *GzipConfig) GzipRequestCompressor() RequestCompressionFunc {
+	return func(rawBody io.ReadCloser) (io.ReadCloser, string, int64, error) {
+		defer func() { _ = rawBody.Close() }()
+		var buf bytes.Buffer
+		gzipWriter, err := gzip.NewWriterLevel(&buf, c.level)
+		if err != nil {
+			return nil, "", -1, err
+		}
+		defer func() { _ = gzipWriter.Close() }()
+		_, err = io.Copy(gzipWriter, rawBody)
+		if err != nil {
+			return nil, "", -1, err
+		}
+		return io.NopCloser(&buf), "gzip", int64(buf.Len()), nil
+	}
+}
+
+// GzipCompressionFunc creates a gzip compression function with the specified compression level.
+// Level can be:
+//   - gzip.HuffmanOnly (-2): Huffman compression only
+//   - gzip.DefaultCompression (-1): default compression level (recommended)
+//   - gzip.NoCompression (0): no compression (store only)
+
+// WithRequestCompression enables request body compression with a custom compression function.
+func WithRequestCompression(compressionFunc RequestCompressionFunc) Option {
+	return func(config *Config) {
+		config.RequestCompression = compressionFunc
+	}
+}
+
 // WithHTTPTransportWrapper provides ability to control http transport
 // For testing purposes only, don't use it on production
 func WithHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripper) Option {
@@ -332,6 +403,14 @@ func NewHTTPTransport(config Config) http.RoundTripper {
 	if config.OptimizeHeaders != nil {
 		transport = NewHeaderWhiteListingTransport(transport, config.OptimizeHeaders(config)...)
 	}
+
+	if config.RequestCompression != nil {
+		transport = NewCompressionTransport(
+			transport,
+			config.RequestCompression,
+		)
+	}
+
 	return transport
 }
 

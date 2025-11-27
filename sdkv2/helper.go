@@ -135,6 +135,13 @@ var (
 	// For testing purposes only, don't use it on production
 	WithHTTPTransportWrapper = shared.WithHTTPTransportWrapper
 
+	// WithRequestCompression enables request body compression with the specified algorithm.
+	// Currently supported algorithms: "gzip"
+	WithRequestCompression = shared.WithRequestCompression
+
+	// NewGzipConfig creates a new GzipConfig for configuring gzip request compression
+	NewGzipConfig = shared.NewGzipConfig
+
 	// WithHTTPClientTimeout controls timeout for HTTP requests
 	WithHTTPClientTimeout = shared.WithHTTPClientTimeout
 )
