@@ -102,6 +102,37 @@ func main() {
 }
 ```
 
+### Customizing AWS SDK config
+
+Use `WithAWSConfigOptions` to tweak the generated `aws.Config` before building the DynamoDB client (e.g., adjust retryers or log mode). For AWS SDK v2:
+```go
+h, _ := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithAWSConfigOptions(func(cfg *aws.Config) {
+        cfg.RetryMaxAttempts = 5
+    }),
+)
+```
+For AWS SDK v1, call the same option but the callback receives `*aws.Config` from SDK v1.
+
+### HTTP timeouts and retries
+
+Use `WithHTTPClientTimeout` to set `http.Client.Timeout` for both Alternator data plane calls and the background live-nodes refreshes. The default mirrors Go’s `http.DefaultClient.Timeout` (zero, meaning no deadline). AWS SDK retries remain in effect, so each HTTP attempt can use the full timeout, and backoff occurs between attempts; total wall time can be up to `maxAttempts * timeout + sum_of_backoffs_between_attempts`. The timeout applies to each individual HTTP attempt, not to the entire sequence of retries. To further bound the end-to-end duration, you can also set a context deadline at the call site.
+
+To bound a single DynamoDB query end-to-end, combine a finite HTTP timeout with a context deadline. For AWS SDK v2:
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+h, _ := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithHTTPClientTimeout(2*time.Second),
+)
+ddb, _ := h.NewDynamoDB()
+_, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String("tbl"), Key: key})
+```
+SDK v1 users can apply the same pattern with the `*WithContext` methods (e.g., `GetItemWithContext`). 
+
 ## Distinctive features
 
 ### Headers optimization
@@ -141,4 +172,4 @@ Then you need to configure your traffic analyzer to read pre master key secrets 
 
 ## Examples
 
-You can find examples in [asdkv1/helper_test.go](asdkv1/helper_test.go) and [asdkv2/helper_test.go](asdkv2/helper_test.go)
+You can find examples in [sdkv1/helper_test.go](sdkv1/helper_test.go) and [sdkv2/helper_test.go](sdkv2/helper_test.go)

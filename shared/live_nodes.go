@@ -58,6 +58,8 @@ type ALNConfig struct {
 	IdleHTTPConnectionTimeout time.Duration
 	// A hook to control http transports
 	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
+	// Timeout for HTTP requests
+	HTTPClientTimeout time.Duration
 }
 
 // NewDefaultALNConfig creates new default ALNConfig
@@ -71,6 +73,7 @@ func NewDefaultALNConfig() ALNConfig {
 		TLSSessionCache:           defaultTLSSessionCache,
 		MaxIdleHTTPConnections:    100,
 		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
+		HTTPClientTimeout:         http.DefaultClient.Timeout,
 		Logger:                    logxzap.DefaultLogger(),
 	}
 }
@@ -198,6 +201,13 @@ func WithALNHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripp
 	}
 }
 
+// WithALNHTTPClientTimeout sets timeout for HTTP requests
+func WithALNHTTPClientTimeout(value time.Duration) ALNOption {
+	return func(config *ALNConfig) {
+		config.HTTPClientTimeout = value
+	}
+}
+
 // NewAlternatorLiveNodes creates a new `AlternatorLiveNodes` instance configured with the provided initial Alternator nodes,
 //
 //	in a form of ip or dns name (without port) and optional functional configuration options (e.g., AWS region, credentials, TLS).
@@ -213,6 +223,7 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 
 	httpClient := &http.Client{
 		Transport: NewALNHTTPTransport(cfg),
+		Timeout:   cfg.HTTPClientTimeout,
 	}
 
 	nodes := make([]url.URL, len(initialNodes))
