@@ -118,9 +118,9 @@ var (
 	// WithIdleHTTPConnectionTimeout controls timeout for idle http connections held by http.Transport
 	WithIdleHTTPConnectionTimeout = shared.WithIdleHTTPConnectionTimeout
 
-	// WithHTTPTransport sets custom transport for http client
+	// WithHTTPTransportWrapper provides ability to control http transport
 	// For testing purposes only, don't use it on production
-	WithHTTPTransport = shared.WithHTTPTransport
+	WithHTTPTransportWrapper = shared.WithHTTPTransportWrapper
 )
 
 // AlternatorNodesSource an interface for nodes list provider
@@ -182,21 +182,15 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 		),
 	}
 
-	cfg.HTTPClient = &http.Client{
-		Transport: shared.DefaultHTTPTransport(),
-	}
-
-	err := shared.PatchHTTPClient(lb.cfg, cfg.HTTPClient)
-	if err != nil {
-		return aws.Config{}, err
-	}
-
 	if lb.cfg.AccessKeyID != "" && lb.cfg.SecretAccessKey != "" {
 		// The third credential below, the session token, is only used for
 		// temporary credentials, and is not supported by Alternator anyway.
 		cfg.Credentials = credentials.NewStaticCredentialsProvider(lb.cfg.AccessKeyID, lb.cfg.SecretAccessKey, "")
 	}
 
+	cfg.HTTPClient = &http.Client{
+		Transport: shared.NewHTTPTransport(lb.cfg),
+	}
 	return cfg, nil
 }
 
