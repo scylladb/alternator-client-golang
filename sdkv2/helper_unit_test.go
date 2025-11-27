@@ -1,8 +1,10 @@
 package sdkv2
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -183,6 +185,263 @@ func TestOptions(t *testing.T) {
 						t.Fatalf("expected exactly %d DynamoDB attempts, got %d", expectedRetries, got)
 					}
 				})
+			}
+		})
+	})
+
+	t.Run("WithGzipRequestCompression", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("BasicCompression", func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				alternatorRequests atomic.Int32
+				dynamodbRequests   atomic.Int32
+				capturedHeaders    atomic.Pointer[http.Header]
+				capturedBody       atomic.Pointer[[]byte]
+			)
+
+			nodes := []string{"node1.local"}
+
+			mockTransport := &mockRoundTripper{
+				handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					alternatorRequests.Add(1)
+					return resp.AlternatorNodesResponse(nodes, req)
+				},
+				handleNodeHealthRequest: resp.HealthCheckResponse,
+				handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+					dynamodbRequests.Add(1)
+
+					// Capture headers
+					headers := req.Header.Clone()
+					capturedHeaders.Store(&headers)
+
+					// Verify Content-Encoding header is set
+					if req.Header.Get("Content-Encoding") != "gzip" {
+						t.Errorf("Expected Content-Encoding: gzip, got %q", req.Header.Get("Content-Encoding"))
+					}
+
+					// Decompress and capture body
+					gzipReader, err := gzip.NewReader(req.Body)
+					if err != nil {
+						return nil, err
+					}
+					defer func() { _ = gzipReader.Close() }()
+
+					body, err := io.ReadAll(gzipReader)
+					if err != nil {
+						return nil, err
+					}
+					capturedBody.Store(&body)
+
+					return resp.DynamoDBListTablesResponse([]string{"test-table"}, req)
+				},
+			}
+
+			h, err := NewHelper(
+				[]string{"node1.local"},
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+				WithCredentials("test-key", "test-secret"),
+				WithRequestCompression(NewGzipConfig().GzipRequestCompressor()),
+			)
+			if err != nil {
+				t.Fatalf("NewHelper returned error: %v", err)
+			}
+			defer h.Stop()
+
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes returned error: %v", err)
+			}
+
+			client, err := h.NewDynamoDB()
+			if err != nil {
+				t.Fatalf("NewDynamoDB returned error: %v", err)
+			}
+
+			_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
+				Limit: aws.Int32(10),
+			})
+			if err != nil {
+				t.Fatalf("ListTables returned error: %v", err)
+			}
+
+			if dynamodbRequests.Load() != 1 {
+				t.Errorf("Expected 1 DynamoDB request, got %d", dynamodbRequests.Load())
+			}
+
+			// Verify body was decompressed correctly
+			body := capturedBody.Load()
+			if body == nil {
+				t.Fatal("Expected body to be captured")
+			}
+			if len(*body) == 0 {
+				t.Error("Expected non-empty decompressed body")
+			}
+
+			// Verify essential headers are present
+			headers := capturedHeaders.Load()
+			if headers == nil {
+				t.Fatal("Expected headers to be captured")
+			}
+			if headers.Get("Content-Encoding") != "gzip" {
+				t.Error("Expected Content-Encoding: gzip header")
+			}
+			if headers.Get("X-Amz-Target") == "" {
+				t.Error("Expected X-Amz-Target header to be present")
+			}
+		})
+
+		t.Run("CompressionWithOptimizedHeaders", func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				capturedHeaders atomic.Pointer[http.Header]
+				capturedBody    atomic.Pointer[[]byte]
+			)
+
+			mockTransport := &mockRoundTripper{
+				handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
+				},
+				handleNodeHealthRequest: resp.HealthCheckResponse,
+				handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+					// Capture headers
+					headers := req.Header.Clone()
+					capturedHeaders.Store(&headers)
+
+					// Verify Content-Encoding is present
+					if req.Header.Get("Content-Encoding") != "gzip" {
+						t.Errorf("Expected Content-Encoding: gzip")
+					}
+
+					// Decompress body
+					gzipReader, err := gzip.NewReader(req.Body)
+					if err != nil {
+						return nil, err
+					}
+					defer func() { _ = gzipReader.Close() }()
+
+					body, err := io.ReadAll(gzipReader)
+					if err != nil {
+						return nil, err
+					}
+					capturedBody.Store(&body)
+
+					return resp.DynamoDBListTablesResponse([]string{"test-table"}, req)
+				},
+			}
+
+			h, err := NewHelper(
+				[]string{"node1.local"},
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+				WithCredentials("test-key", "test-secret"),
+				WithOptimizeHeaders(true),
+				WithRequestCompression(NewGzipConfig().GzipRequestCompressor()),
+			)
+			if err != nil {
+				t.Fatalf("NewHelper returned error: %v", err)
+			}
+			defer h.Stop()
+
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes returned error: %v", err)
+			}
+
+			client, err := h.NewDynamoDB()
+			if err != nil {
+				t.Fatalf("NewDynamoDB returned error: %v", err)
+			}
+
+			_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
+				Limit: aws.Int32(10),
+			})
+			if err != nil {
+				t.Fatalf("ListTables returned error: %v", err)
+			}
+
+			// Verify headers
+			headers := capturedHeaders.Load()
+			if headers == nil {
+				t.Fatal("Expected headers to be captured")
+			}
+
+			// Verify Content-Encoding survived header optimization
+			if headers.Get("Content-Encoding") != "gzip" {
+				t.Error("Content-Encoding header should survive header optimization")
+			}
+
+			// Verify body was decompressed correctly
+			body := capturedBody.Load()
+			if body == nil || len(*body) == 0 {
+				t.Error("Expected non-empty decompressed body")
+			}
+		})
+
+		t.Run("CompressionWithCustomLevel", func(t *testing.T) {
+			t.Parallel()
+
+			var dynamodbRequests atomic.Int32
+
+			mockTransport := &mockRoundTripper{
+				handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
+				},
+				handleNodeHealthRequest: resp.HealthCheckResponse,
+				handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+					dynamodbRequests.Add(1)
+
+					if req.Header.Get("Content-Encoding") != "gzip" {
+						t.Error("Expected Content-Encoding: gzip")
+					}
+
+					// Just verify we can decompress
+					gzipReader, err := gzip.NewReader(req.Body)
+					if err != nil {
+						return nil, err
+					}
+					defer func() { _ = gzipReader.Close() }()
+
+					_, err = io.ReadAll(gzipReader)
+					if err != nil {
+						return nil, err
+					}
+
+					return resp.DynamoDBListTablesResponse([]string{"test-table"}, req)
+				},
+			}
+
+			compressor := NewGzipConfig().WithLevel(gzip.BestSpeed)
+
+			h, err := NewHelper(
+				[]string{"node1.local"},
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+				WithCredentials("test-key", "test-secret"),
+				WithRequestCompression(compressor.GzipRequestCompressor()),
+			)
+			if err != nil {
+				t.Fatalf("NewHelper returned error: %v", err)
+			}
+			defer h.Stop()
+
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes returned error: %v", err)
+			}
+
+			client, err := h.NewDynamoDB()
+			if err != nil {
+				t.Fatalf("NewDynamoDB returned error: %v", err)
+			}
+
+			_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
+				Limit: aws.Int32(10),
+			})
+			if err != nil {
+				t.Fatalf("ListTables returned error: %v", err)
+			}
+
+			if dynamodbRequests.Load() != 1 {
+				t.Errorf("Expected 1 DynamoDB request, got %d", dynamodbRequests.Load())
 			}
 		})
 	})
