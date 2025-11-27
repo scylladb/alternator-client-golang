@@ -117,6 +117,75 @@ func TestOptions(t *testing.T) {
 			t.Errorf("expected mock to receive DynamoDB API requests")
 		}
 	})
+
+	t.Run("WithAWSConfigOptions", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("WithMaxRetries", func(t *testing.T) {
+			for _, maxRetries := range []int{0, 1, 2} {
+				t.Run(strconv.Itoa(maxRetries), func(t *testing.T) {
+					t.Parallel()
+
+					var (
+						alternatorRequests atomic.Int32
+						dynamodbRequests   atomic.Int32
+					)
+
+					mockTransport := &mockRoundTripper{
+						handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+							alternatorRequests.Add(1)
+							return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
+						},
+						handleNodeHealthRequest: resp.HealthCheckResponse,
+						handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+							dynamodbRequests.Add(1)
+							return resp.New().InternalServerError().Body("boom").Request(req).Build()
+						},
+					}
+					h, err := NewHelper(
+						[]string{"node1.local"},
+						WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+						WithAWSConfigOptions(
+							func(cfg *aws.Config) {
+								cfg.RetryMaxAttempts = maxRetries
+							}),
+					)
+					if err != nil {
+						t.Fatalf("NewHelper returned error: %v", err)
+					}
+					defer h.Stop()
+
+					if err := h.UpdateLiveNodes(); err != nil {
+						t.Fatalf("UpdateLiveNodes returned error: %v", err)
+					}
+
+					client, err := h.NewDynamoDB()
+					if err != nil {
+						t.Fatalf("NewDynamoDB returned error: %v", err)
+					}
+
+					_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
+						Limit: aws.Int32(5),
+					})
+					if err == nil {
+						t.Fatalf("expected ListTables to fail due to mocked 500 response")
+					}
+
+					if alternatorRequests.Load() == 0 {
+						t.Fatalf("expected Alternator discovery call to happen")
+					}
+
+					expectedRetries := int32(maxRetries)
+					if maxRetries == 0 {
+						expectedRetries = 3
+					}
+					if got := dynamodbRequests.Load(); got != expectedRetries {
+						t.Fatalf("expected exactly %d DynamoDB attempts, got %d", expectedRetries, got)
+					}
+				})
+			}
+		})
+	})
 }
 
 // mockRoundTripper is a test transport that returns different responses

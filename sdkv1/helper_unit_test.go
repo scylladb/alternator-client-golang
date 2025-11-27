@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 
@@ -118,6 +119,73 @@ func TestOptions(t *testing.T) {
 		if dynamodbRequests.Load() != 1 {
 			t.Errorf("expected mock to receive DynamoDB API requests")
 		}
+	})
+
+	t.Run("WithAWSConfigOptions", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("WithMaxRetries", func(t *testing.T) {
+			for _, maxRetries := range []int{0, 1, 6} {
+				t.Run(strconv.Itoa(maxRetries), func(t *testing.T) {
+					t.Parallel()
+
+					var (
+						alternatorRequests atomic.Int32
+						dynamodbRequests   atomic.Int32
+					)
+
+					mockTransport := &mockRoundTripper{
+						handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+							alternatorRequests.Add(1)
+							return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
+						},
+						handleNodeHealthRequest: resp.HealthCheckResponse,
+						handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+							dynamodbRequests.Add(1)
+							return resp.New().InternalServerError().Body("boom").Request(req).Build()
+						},
+					}
+
+					h, err := NewHelper(
+						[]string{"node1.local"},
+						WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+						WithAWSConfigOptions(func(cfg *aws.Config) {
+							cfg.MaxRetries = aws.Int(maxRetries)
+							cfg.SleepDelay = func(_ time.Duration) {}
+						}),
+					)
+					if err != nil {
+						t.Fatalf("NewHelper returned error: %v", err)
+					}
+					defer h.Stop()
+
+					if err := h.UpdateLiveNodes(); err != nil {
+						t.Fatalf("UpdateLiveNodes returned error: %v", err)
+					}
+
+					client, err := h.NewDynamoDB()
+					if err != nil {
+						t.Fatalf("NewDynamoDB returned error: %v", err)
+					}
+
+					_, err = client.ListTables(&dynamodb.ListTablesInput{
+						Limit: aws.Int64(5),
+					})
+					if err == nil {
+						t.Fatalf("expected ListTables to fail due to mocked 500 response")
+					}
+
+					if alternatorRequests.Load() == 0 {
+						t.Fatalf("expected Alternator discovery call to happen")
+					}
+					// AWS SDK v1 executes maxRetries+1 multiplied by two
+					expected := int32((maxRetries + 1) * 2)
+					if got := dynamodbRequests.Load(); got != expected {
+						t.Fatalf("expected %d DynamoDB attempts for maxRetries=%d, got %d", expected, maxRetries, got)
+					}
+				})
+			}
+		})
 	})
 }
 

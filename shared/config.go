@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/logx"
@@ -50,6 +51,10 @@ type Config struct {
 	IdleHTTPConnectionTimeout time.Duration
 	// A hook to control http transports
 	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
+	// Timeout for HTTP requests
+	HTTPClientTimeout time.Duration
+	// AWSConfigOptions holds []func(*aws.Config) where the aws.Config type differs for each SDK version (v1 vs v2)
+	AWSConfigOptions []any
 }
 
 // Option a configuration option
@@ -75,7 +80,9 @@ func NewDefaultConfig() *Config {
 		TLSSessionCache:           defaultTLSSessionCache,
 		MaxIdleHTTPConnections:    100,
 		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
+		HTTPClientTimeout:         http.DefaultClient.Timeout,
 		Logger:                    logxzap.DefaultLogger(),
+		AWSConfigOptions:          []any{},
 	}
 }
 
@@ -97,6 +104,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNIgnoreServerCertificateError(c.IgnoreServerCertificateError),
 		WithALNMaxIdleHTTPConnections(c.MaxIdleHTTPConnections),
 		WithALNIdleHTTPConnectionTimeout(c.IdleHTTPConnectionTimeout),
+		WithALNHTTPClientTimeout(c.HTTPClientTimeout),
 		WithALNRoutingScope(c.RoutingScope),
 		WithALNLogger(c.Logger),
 	}
@@ -305,6 +313,13 @@ func WithHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripper)
 	}
 }
 
+// WithHTTPClientTimeout sets timeout for HTTP requests
+func WithHTTPClientTimeout(value time.Duration) Option {
+	return func(config *Config) {
+		config.HTTPClientTimeout = value
+	}
+}
+
 // NewHTTPTransport takes `http.Transport` instance and patches it according to `Config`
 func NewHTTPTransport(config Config) http.RoundTripper {
 	alnConfig := config.ToALNConfig()
@@ -318,4 +333,36 @@ func NewHTTPTransport(config Config) http.RoundTripper {
 		transport = NewHeaderWhiteListingTransport(transport, config.OptimizeHeaders(config)...)
 	}
 	return transport
+}
+
+// CloneAWSConfigOptions returns a shallow copy of AWSConfigOptions slice
+func CloneAWSConfigOptions(options []any) []any {
+	if options == nil {
+		return nil
+	}
+	out := make([]any, len(options))
+	copy(out, options)
+	return out
+}
+
+// ConvertToAWSConfigOptions retrieves all custom options matching the expected type.
+// Returns an empty slice and nil error when nothing is found. Skips nil entries.
+// Returns an error when a non-nil option exists but has the wrong type.
+func ConvertToAWSConfigOptions[T any](opts []any) ([]T, error) {
+	var res []T
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		v, ok := opt.(T)
+		if !ok {
+			return nil, fmt.Errorf(
+				"unexpected aws config option type %T, want %T",
+				opt,
+				reflect.New(reflect.TypeOf(res).Elem()).Elem().Interface(),
+			)
+		}
+		res = append(res, v)
+	}
+	return res, nil
 }

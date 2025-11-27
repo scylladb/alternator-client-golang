@@ -113,7 +113,19 @@ var (
 	// WithHTTPTransportWrapper provides ability to control http transport
 	// For testing purposes only, don't use it on production
 	WithHTTPTransportWrapper = shared.WithHTTPTransportWrapper
+
+	// WithHTTPClientTimeout controls timeout for HTTP requests
+	WithHTTPClientTimeout = shared.WithHTTPClientTimeout
 )
+
+// WithAWSConfigOptions lets callers mutate the generated aws.Config before it is used by the SDK.
+func WithAWSConfigOptions(options ...func(*aws.Config)) Option {
+	return func(config *shared.Config) {
+		for _, option := range options {
+			config.AWSConfigOptions = append(config.AWSConfigOptions, option)
+		}
+	}
+}
 
 // AlternatorNodesSource an interface for nodes list provider
 type AlternatorNodesSource interface {
@@ -223,6 +235,15 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 
 	cfg.HTTPClient = &http.Client{
 		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(lb.cfg)),
+		Timeout:   lb.cfg.HTTPClientTimeout,
+	}
+
+	customizers, err := shared.ConvertToAWSConfigOptions[func(*aws.Config)](lb.cfg.AWSConfigOptions)
+	if err != nil {
+		return aws.Config{}, err
+	}
+	for _, opt := range customizers {
+		opt(&cfg)
 	}
 	return cfg, nil
 }
@@ -241,6 +262,7 @@ func (lb *Helper) newAWSSession() (*session.Session, error) {
 // Update takes config of current helper, updates its config and creates a new helper with updated config
 func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg := lb.cfg
+	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
 	for _, opt := range opts {
 		opt(&cfg)
 	}
