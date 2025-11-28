@@ -81,7 +81,7 @@ func TestOptions(t *testing.T) {
 		// Verify nodes were discovered correctly
 		gotNodes := h.nodes.GetNodes()
 		if len(gotNodes) != 3 {
-			t.Fatalf("expected 3 nodes from discovery, got %d", len(nodes))
+			t.Fatalf("expected 3 nodes from discovery, got %d", len(gotNodes))
 		}
 		for id, node := range gotNodes {
 			if node.Hostname() != nodes[id] {
@@ -221,6 +221,7 @@ func TestOptions(t *testing.T) {
 			}
 		})
 	})
+
 	t.Run("WithGzipRequestCompression", func(t *testing.T) {
 		t.Parallel()
 

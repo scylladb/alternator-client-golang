@@ -4,15 +4,24 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/klauspost/compress/gzip"
 
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/tests/mocks"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
@@ -86,7 +95,12 @@ func TestOptions(t *testing.T) {
 			}
 		}
 
-		client, err := h.NewDynamoDB()
+		client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+			options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+				options.MaxAttempts = 2
+				options.MaxBackoff = 1
+			})
+		})
 		if err != nil {
 			t.Fatalf("NewDynamoDB returned error: %v", err)
 		}
@@ -161,10 +175,6 @@ func TestOptions(t *testing.T) {
 								WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 									return mockTransport
 								}),
-								WithAWSConfigOptions(
-									func(cfg *aws.Config) {
-										cfg.RetryMaxAttempts = maxRetries
-									}),
 							)
 							if err != nil {
 								t.Fatalf("NewHelper returned error: %v", err)
@@ -175,7 +185,12 @@ func TestOptions(t *testing.T) {
 								t.Fatalf("UpdateLiveNodes returned error: %v", err)
 							}
 
-							client, err := h.NewDynamoDB()
+							client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+								options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+									options.MaxAttempts = maxRetries
+									options.MaxBackoff = 0
+								})
+							})
 							if err != nil {
 								t.Fatalf("NewDynamoDB returned error: %v", err)
 							}
@@ -341,4 +356,204 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestNodeHealthTracking(t *testing.T) { //nolint: tparallel // these subtests should not be parallel
+	t.Parallel()
+
+	// Custom config with faster reset interval for testing and disabled update intervals to ensure it does not
+	healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	healthConfig.Scoring.ResetInterval = 1 * time.Second
+	healthConfig.QuarantineReleasePeriod = -1 // Disable automatic release checks
+
+	connRefusedErr := &net.OpError{Err: syscall.ECONNREFUSED}
+
+	// Create URLs for all nodes
+	node1 := url.URL{Scheme: "http", Host: "node1.local:8080"}
+	node2 := url.URL{Scheme: "http", Host: "node2.local:8080"}
+	node3 := url.URL{Scheme: "http", Host: "node3.local:8080"}
+	node4 := url.URL{Scheme: "http", Host: "node4.local:8080"}
+
+	// Include all nodes in the mock (even though we'll only discover 3 initially)
+	allMockNodes := []url.URL{node1, node2, node3}
+
+	// Default DynamoDB response for healthy nodes
+	defaultDynamoDBResp := func(req *http.Request) (*http.Response, error) {
+		tableNames := []string{"test-table"}
+		return resp.DynamoDBListTablesResponse(tableNames, req)
+	}
+
+	mockTransport := mocks.NewMockClusterRoundTripper(allMockNodes, defaultDynamoDBResp)
+	mockTransport.SetNodeError(node2, connRefusedErr)
+
+	h, err := NewHelper(
+		[]string{node1.Hostname()},
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return mockTransport
+		}),
+		WithScheme("http"),
+		WithPort(8080),
+		WithNodeHealthStoreConfig(healthConfig),
+		WithIdleNodesListUpdatePeriod(0), // Disable automatic node list updates
+		WithAWSConfigOptions(
+			func(cfg *aws.Config) {
+				cfg.RetryMaxAttempts = 3 // Allow some retries to make sure that query does not fail
+			}),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper failed: %v", err)
+	}
+	defer h.Stop()
+
+	// Enforce seed for reproducibility
+	h.queryPlanSeed = 8
+
+	ddb, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 3
+			options.MaxBackoff = 0
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %s", err.Error())
+	}
+
+	t.Run("Phase-1:Node2-Down", func(t *testing.T) {
+		assertNodesStatus(t, h.nodes, []url.URL{}, []url.URL{node1})
+
+		// Trigger node discovery - mock will return 3 nodes
+		// it will also try to get them out of quarant
+		if err := h.UpdateLiveNodes(); err != nil {
+			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+		}
+
+		mockTransport.GetNodeHealthCounter(node1)
+
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
+	})
+
+	t.Run("Phase2:Node2-UP", func(t *testing.T) {
+		// Node 2 become functional
+		mockTransport.SetNodeHealthy(node2, nil)
+
+		if err := h.UpdateLiveNodes(); err != nil {
+			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+		}
+
+		// Quarantined node should stay in quarantine
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
+
+		// Test if quarantined nodes are up
+		h.nodes.TryReleaseQuarantinedNodes()
+
+		// Quarantined node should become active
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, []url.URL{})
+	})
+
+	t.Run("Phase-3-Node3-DOWN", func(t *testing.T) {
+		// Now node 3 is down
+		mockTransport.SetNodeError(node3, connRefusedErr)
+
+		for range 10 {
+			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+				Limit: aws.Int32(5),
+			})
+			// Error should not happen, because it should hit broken node and retry on next one
+			if err != nil {
+				t.Fatalf("ListTables - failed, while should not: %s", err.Error())
+			}
+		}
+
+		// Node3 should go into quarantine because requests failed to many times on it
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3})
+	})
+
+	t.Run("Phase4:Node4-ADDED", func(t *testing.T) {
+		// Node 4 was provisioned but it fails at start
+		mockTransport.SetNodeError(node4, connRefusedErr)
+
+		// Make client pick it up from alternator
+		if err := h.UpdateLiveNodes(); err != nil {
+			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+		}
+
+		// Node 4 should be added, but stay in quarantine
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3, node4})
+
+		// At this point two nodes down, but MaxAttempts=3, so requests should keep running without failures
+		for range 6 {
+			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+				Limit: aws.Int32(5),
+			})
+			// Error should not happen, because it should hit broken node and retry on next one
+			if err != nil {
+				t.Fatalf("ListTables - failed, while should not: %s", err.Error())
+			}
+		}
+	})
+
+	t.Run("Phase5:Node4-UP", func(t *testing.T) {
+		// Node 4 was provisioned but it fails at start
+		mockTransport.SetNodeHealthy(node4, nil)
+		mockTransport.SetNodeHealthy(node3, nil)
+
+		h.nodes.TryReleaseQuarantinedNodes()
+
+		// Node 4 should be released from quarantine
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
+	})
+
+	t.Run("Phase6:Node2-REMOVED(between UpdateLiveNodes)", func(t *testing.T) {
+		mockTransport.DeleteNode(node2)
+
+		for range 6 {
+			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+				Limit: aws.Int32(5),
+			})
+			// Error should not happen, because it should hit broken node and retry on next one
+			if err != nil {
+				t.Fatalf("ListTables - failed, while should not: %s", err.Error())
+			}
+		}
+
+		// Node 2 was removed from the cluster but discovery hasn't refreshed yet,
+		// so it should still be part of the active list rather than causing failures.
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
+
+		err = h.UpdateLiveNodes()
+		if err != nil {
+			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+		}
+
+		// Node 2 should be removed completely
+		assertNodesStatus(t, h.nodes, []url.URL{node1, node3, node4}, []url.URL{})
+	})
+}
+
+func sortNodes(nodes []url.URL) []url.URL {
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Hostname() < nodes[j].Hostname()
+	})
+	return nodes
+}
+
+func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, quarantinedNodes []url.URL) {
+	t.Helper()
+
+	allNodes := append(append([]url.URL{}, liveNodes...), quarantinedNodes...)
+
+	if diff := cmp.Diff(sortNodes(allNodes), sortNodes(nodes.GetNodes())); diff != "" {
+		t.Errorf("GetNodes() returend unexpected result (-want +got):\n%s", diff)
+	}
+
+	if diff := cmp.Diff(sortNodes(liveNodes), sortNodes(nodes.GetActiveNodes())); diff != "" {
+		t.Errorf("GetActiveNodes() returned unexpected result (-want +got):\n%s", diff)
+	}
+
+	if diff := cmp.Diff(sortNodes(quarantinedNodes), sortNodes(nodes.GetQuarantinedNodes())); diff != "" {
+		t.Errorf("GetQuarantinedNodes() returned unexpected result (-want +got):\n%s", diff)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
 }
