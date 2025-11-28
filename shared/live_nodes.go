@@ -36,6 +36,18 @@ type AlternatorLiveNodes struct {
 	updateSignal       chan struct{}
 }
 
+// GetActiveNodes returns nodes that are currently considered healthy.
+func (aln *AlternatorLiveNodes) GetActiveNodes() []url.URL {
+	// For now these are just plugs for future nodes health implementation
+	return aln.GetNodes()
+}
+
+// GetQuarantinedNodes returns nodes currently marked as unhealthy.
+func (aln *AlternatorLiveNodes) GetQuarantinedNodes() []url.URL {
+	// For now these are just plugs for future nodes health implementation
+	return nil
+}
+
 // ALNConfig a config for `AlternatorLiveNodes`
 type ALNConfig struct {
 	Scheme       string

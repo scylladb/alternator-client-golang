@@ -2,16 +2,16 @@ package sdkv2
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
+	"github.com/scylladb/alternator-client-golang/shared/tests/mocks"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
 
@@ -32,18 +32,18 @@ func TestOptions(t *testing.T) {
 		nodes := []string{"node1.local", "node2.local", "node3.local"}
 		const port = 8080
 
-		mockTransport := &mockRoundTripper{
-			handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+		mockTransport := &mocks.MockRoundTripper{
+			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
 				alternatorRequests.Add(1)
 				lastRequest.Store(req)
 				return resp.AlternatorNodesResponse(nodes, req)
 			},
-			handleNodeHealthRequest: func(req *http.Request) (*http.Response, error) {
+			NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
 				nodeHealthRequests.Add(1)
 				lastRequest.Store(req)
 				return resp.HealthCheckResponse(req)
 			},
-			handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+			DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
 				dynamodbRequests.Add(1)
 				lastRequest.Store(req)
 				tableNames := []string{"test-table-1", "test-table-2"}
@@ -122,105 +122,87 @@ func TestOptions(t *testing.T) {
 		t.Parallel()
 
 		t.Run("WithMaxRetries", func(t *testing.T) {
+			t.Parallel()
+
 			for _, maxRetries := range []int{0, 1, 2} {
-				t.Run(strconv.Itoa(maxRetries), func(t *testing.T) {
+				t.Run("maxRetries="+strconv.Itoa(maxRetries), func(t *testing.T) {
 					t.Parallel()
 
-					var (
-						alternatorRequests atomic.Int32
-						dynamodbRequests   atomic.Int32
-					)
+					for _, numberOfNodes := range []int{1, 2, 3} {
+						t.Run("numberOfNodes="+strconv.Itoa(numberOfNodes), func(t *testing.T) {
+							t.Parallel()
 
-					mockTransport := &mockRoundTripper{
-						handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
-							alternatorRequests.Add(1)
-							return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
-						},
-						handleNodeHealthRequest: resp.HealthCheckResponse,
-						handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
-							dynamodbRequests.Add(1)
-							return resp.New().InternalServerError().Body("boom").Request(req).Build()
-						},
-					}
-					h, err := NewHelper(
-						[]string{"node1.local"},
-						WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
-						WithAWSConfigOptions(
-							func(cfg *aws.Config) {
-								cfg.RetryMaxAttempts = maxRetries
-							}),
-					)
-					if err != nil {
-						t.Fatalf("NewHelper returned error: %v", err)
-					}
-					defer h.Stop()
+							var (
+								alternatorRequests atomic.Int32
+								dynamodbRequests   []string
+							)
 
-					if err := h.UpdateLiveNodes(); err != nil {
-						t.Fatalf("UpdateLiveNodes returned error: %v", err)
-					}
+							var nodes []string
 
-					client, err := h.NewDynamoDB()
-					if err != nil {
-						t.Fatalf("NewDynamoDB returned error: %v", err)
-					}
+							for i := 0; i < numberOfNodes; i++ {
+								nodes = append(nodes, fmt.Sprintf("node%d.local", i+1))
+							}
 
-					_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
-						Limit: aws.Int32(5),
-					})
-					if err == nil {
-						t.Fatalf("expected ListTables to fail due to mocked 500 response")
-					}
+							mockTransport := &mocks.MockRoundTripper{
+								AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+									alternatorRequests.Add(1)
+									return resp.AlternatorNodesResponse(nodes, req)
+								},
+								NodeHealthRequest: resp.HealthCheckResponse,
+								DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+									dynamodbRequests = append(dynamodbRequests, req.URL.Hostname())
+									return resp.New().InternalServerError().Body("boom").Request(req).Build()
+								},
+							}
+							h, err := NewHelper(
+								[]string{nodes[0]},
+								WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+									return mockTransport
+								}),
+								WithAWSConfigOptions(
+									func(cfg *aws.Config) {
+										cfg.RetryMaxAttempts = maxRetries
+									}),
+							)
+							if err != nil {
+								t.Fatalf("NewHelper returned error: %v", err)
+							}
+							defer h.Stop()
 
-					if alternatorRequests.Load() == 0 {
-						t.Fatalf("expected Alternator discovery call to happen")
-					}
+							if err := h.UpdateLiveNodes(); err != nil {
+								t.Fatalf("UpdateLiveNodes returned error: %v", err)
+							}
 
-					expectedRetries := int32(maxRetries)
-					if maxRetries == 0 {
-						expectedRetries = 3
-					}
-					if got := dynamodbRequests.Load(); got != expectedRetries {
-						t.Fatalf("expected exactly %d DynamoDB attempts, got %d", expectedRetries, got)
+							client, err := h.NewDynamoDB()
+							if err != nil {
+								t.Fatalf("NewDynamoDB returned error: %v", err)
+							}
+
+							_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{
+								Limit: aws.Int32(5),
+							})
+							if err == nil {
+								t.Fatalf("expected ListTables to fail due to mocked 500 response")
+							}
+
+							if alternatorRequests.Load() == 0 {
+								t.Fatalf("expected Alternator discovery call to happen")
+							}
+
+							expectedRetries := maxRetries
+							if maxRetries == 0 {
+								expectedRetries = 3
+							}
+							if expectedRetries > numberOfNodes {
+								expectedRetries = numberOfNodes
+							}
+							if got := len(dynamodbRequests); got != expectedRetries {
+								t.Fatalf("expected exactly %d DynamoDB attempts, got %d", expectedRetries, got)
+							}
+						})
 					}
 				})
 			}
 		})
 	})
-}
-
-// mockRoundTripper is a test transport that returns different responses
-// depending on whether it's an Alternator discovery request, node health request, or DynamoDB API request
-type mockRoundTripper struct {
-	handleAlternatorRequest func(*http.Request) (*http.Response, error)
-	handleNodeHealthRequest func(*http.Request) (*http.Response, error)
-	handleDynamoDBRequest   func(*http.Request) (*http.Response, error)
-}
-
-func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req == nil {
-		return nil, errors.New("request is nil")
-	}
-
-	// Distinguish between different request types based on URL path and method
-	if strings.HasPrefix(req.URL.Path, "/localnodes") {
-		// This is an Alternator request to discover nodes
-		if m.handleAlternatorRequest != nil {
-			return m.handleAlternatorRequest(req)
-		}
-		return nil, errors.New("handleAlternatorRequest not configured")
-	}
-
-	if (req.URL.Path == "/" || req.URL.Path == "") && req.Method == "GET" {
-		// This is a node health check request (GET to /)
-		if m.handleNodeHealthRequest != nil {
-			return m.handleNodeHealthRequest(req)
-		}
-		return nil, errors.New("handleNodeHealthRequest not configured")
-	}
-
-	// This is a DynamoDB API request (POST to /)
-	if m.handleDynamoDBRequest != nil {
-		return m.handleDynamoDBRequest(req)
-	}
-	return nil, errors.New("handleDynamoDBRequest not configured")
 }

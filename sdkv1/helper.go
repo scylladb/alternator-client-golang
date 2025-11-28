@@ -30,14 +30,18 @@ This package depends on the shared submodule, which contains reusable configurat
 package sdkv1
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+
+	"github.com/scylladb/alternator-client-golang/shared/errs"
 
 	"github.com/scylladb/alternator-client-golang/shared"
 )
@@ -131,6 +135,8 @@ func WithAWSConfigOptions(options ...func(*aws.Config)) Option {
 type AlternatorNodesSource interface {
 	NextNode() url.URL
 	GetNodes() []url.URL
+	GetActiveNodes() []url.URL
+	GetQuarantinedNodes() []url.URL
 	UpdateLiveNodes() error
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
@@ -278,7 +284,9 @@ func (lb *Helper) NewDynamoDB() (*dynamodb.DynamoDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dynamodb.New(sess), nil
+	client := dynamodb.New(sess)
+	lb.injectQueryPlan(client)
+	return client, nil
 }
 
 type roundTripper struct {
@@ -287,8 +295,12 @@ type roundTripper struct {
 }
 
 func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	node := rt.lb.NextNode()
-	req.URL = &node
+	if node, err := getRequestNodeFromContext(req.Context()); err == nil {
+		req.URL.Scheme = node.Scheme
+		req.URL.Host = node.Host
+	} else {
+		return nil, err
+	}
 	return rt.originalTransport.RoundTrip(req)
 }
 
@@ -297,4 +309,56 @@ func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTrippe
 		originalTransport: original,
 		lb:                lb,
 	}
+}
+
+type (
+	queryPlanKeyType   struct{}
+	requestNodeKeyType struct{}
+)
+
+var (
+	// A context key to store/retrieve a query plan assigned to the request
+	queryPlanKey = queryPlanKeyType{}
+	// A context key to store/retrieve a node assigned to the request
+	requestNodeKey = requestNodeKeyType{}
+)
+
+func getQueryPlanFromContext(ctx context.Context) *shared.LazyQueryPlan {
+	plan, _ := ctx.Value(queryPlanKey).(*shared.LazyQueryPlan)
+	return plan
+}
+
+func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
+	val, ok := ctx.Value(requestNodeKey).(url.URL)
+	if !ok || val.Host == "" {
+		return url.URL{}, errs.ErrCtxHasNoNode
+	}
+	return val, nil
+}
+
+func setRequestNode(ctx context.Context, node url.URL) context.Context {
+	return context.WithValue(ctx, requestNodeKey, node)
+}
+
+func (lb *Helper) injectQueryPlan(client *dynamodb.DynamoDB) {
+	client.Handlers.Validate.PushFront(func(r *request.Request) {
+		r.SetContext(context.WithValue(r.Context(), queryPlanKey, shared.NewLazyQueryPlan(lb.nodes)))
+	})
+
+	client.Handlers.Sign.PushFront(func(r *request.Request) {
+		plan := getQueryPlanFromContext(r.Context())
+		if plan == nil {
+			r.Error = errs.ErrCtxHasNoQueryPlan
+			return
+		}
+		node := plan.Next()
+		if node.Host == "" {
+			r.Error = errs.ErrQueryPlanExhausted
+			return
+		}
+		r.SetContext(setRequestNode(r.Context(), node))
+		r.HTTPRequest.URL.Scheme = node.Scheme
+		r.HTTPRequest.URL.Host = node.Host
+		r.HTTPRequest.Host = node.Host
+	})
 }
