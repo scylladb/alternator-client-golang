@@ -1,14 +1,13 @@
 package sdkv1
 
 import (
-	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/scylladb/alternator-client-golang/shared/tests/mocks"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -32,18 +31,18 @@ func TestOptions(t *testing.T) {
 		nodes := []string{"node1.local", "node2.local", "node3.local"}
 		const port = 8080
 
-		mockTransport := &mockRoundTripper{
-			handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+		mockTransport := &mocks.MockRoundTripper{
+			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
 				alternatorRequests.Add(1)
 				lastRequest.Store(req)
 				return resp.AlternatorNodesResponse(nodes, req)
 			},
-			handleNodeHealthRequest: func(req *http.Request) (*http.Response, error) {
+			NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
 				nodeHealthRequests.Add(1)
 				lastRequest.Store(req)
 				return resp.HealthCheckResponse(req)
 			},
-			handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+			DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
 				dynamodbRequests.Add(1)
 				lastRequest.Store(req)
 				tableNames := []string{"test-table-1", "test-table-2"}
@@ -77,7 +76,7 @@ func TestOptions(t *testing.T) {
 		// Verify nodes were discovered correctly
 		gotNodes := h.nodes.GetNodes()
 		if len(gotNodes) != 3 {
-			t.Fatalf("expected 3 nodes from discovery, got %d", len(nodes))
+			t.Fatalf("expected 3 nodes from discovery, got %d", len(gotNodes))
 		}
 		for id, node := range gotNodes {
 			if node.Hostname() != nodes[id] {
@@ -134,13 +133,13 @@ func TestOptions(t *testing.T) {
 						dynamodbRequests   atomic.Int32
 					)
 
-					mockTransport := &mockRoundTripper{
-						handleAlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					mockTransport := &mocks.MockRoundTripper{
+						AlternatorRequest: func(req *http.Request) (*http.Response, error) {
 							alternatorRequests.Add(1)
 							return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
 						},
-						handleNodeHealthRequest: resp.HealthCheckResponse,
-						handleDynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+						NodeHealthRequest: resp.HealthCheckResponse,
+						DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
 							dynamodbRequests.Add(1)
 							return resp.New().InternalServerError().Body("boom").Request(req).Build()
 						},
@@ -187,39 +186,4 @@ func TestOptions(t *testing.T) {
 			}
 		})
 	})
-}
-
-type mockRoundTripper struct {
-	handleAlternatorRequest func(*http.Request) (*http.Response, error)
-	handleNodeHealthRequest func(*http.Request) (*http.Response, error)
-	handleDynamoDBRequest   func(*http.Request) (*http.Response, error)
-}
-
-func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req == nil {
-		return nil, errors.New("request is nil")
-	}
-
-	// Distinguish between different request types based on URL path and method
-	if strings.HasPrefix(req.URL.Path, "/localnodes") {
-		// This is an Alternator request to discover nodes
-		if m.handleAlternatorRequest != nil {
-			return m.handleAlternatorRequest(req)
-		}
-		return nil, errors.New("handleAlternatorRequest not configured")
-	}
-
-	if (req.URL.Path == "/" || req.URL.Path == "") && req.Method == "GET" {
-		// This is a node health check request (GET to /)
-		if m.handleNodeHealthRequest != nil {
-			return m.handleNodeHealthRequest(req)
-		}
-		return nil, errors.New("handleNodeHealthRequest not configured")
-	}
-
-	// This is a DynamoDB API request (POST to /)
-	if m.handleDynamoDBRequest != nil {
-		return m.handleDynamoDBRequest(req)
-	}
-	return nil, errors.New("handleDynamoDBRequest not configured")
 }

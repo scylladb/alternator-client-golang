@@ -1,28 +1,33 @@
 //go:build integration
 // +build integration
 
-package sdkv2_test
+package sdkv2
 
 import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
+	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	"github.com/aws/smithy-go"
-
-	"github.com/scylladb/alternator-client-golang/shared/rt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 
-	helper "github.com/scylladb/alternator-client-golang/sdkv2"
+	"github.com/scylladb/alternator-client-golang/shared"
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
 var (
@@ -33,11 +38,276 @@ var (
 
 var notFoundErr = new(*smithy.OperationError)
 
+type mockNodesSource struct {
+	active      []url.URL
+	quarantined []url.URL
+	healthStore *nodeshealth.NodeHealthStore
+
+	nextIdx  int
+	reported map[string]int
+	mu       sync.Mutex
+}
+
+func (m *mockNodesSource) NextNode() url.URL {
+	nodes := m.GetActiveNodes()
+	if len(nodes) == 0 {
+		return url.URL{}
+	}
+	node := nodes[m.nextIdx%len(nodes)]
+	m.nextIdx++
+	return node
+}
+
+func (m *mockNodesSource) GetNodes() []url.URL {
+	return append([]url.URL(nil), m.active...)
+}
+
+func (m *mockNodesSource) GetActiveNodes() []url.URL {
+	if m.healthStore != nil {
+		return append([]url.URL(nil), m.healthStore.GetActiveNodes()...)
+	}
+	return append([]url.URL(nil), m.active...)
+}
+
+func (m *mockNodesSource) GetQuarantinedNodes() []url.URL {
+	if m.healthStore != nil {
+		return append([]url.URL(nil), m.healthStore.GetQuarantinedNodes()...)
+	}
+	return append([]url.URL(nil), m.quarantined...)
+}
+
+func (m *mockNodesSource) UpdateLiveNodes() error { return nil }
+func (m *mockNodesSource) Start()                 {}
+func (m *mockNodesSource) Stop()                  {}
+
+func (m *mockNodesSource) CheckIfRackAndDatacenterSetCorrectly() error {
+	return nil
+}
+
+func (m *mockNodesSource) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
+	return true, nil
+}
+
+func (m *mockNodesSource) ReportNodeError(node url.URL, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.reported == nil {
+		m.reported = map[string]int{}
+	}
+	m.reported[node.Host]++
+
+	if m.healthStore != nil {
+		m.healthStore.ReportNodeError(node, err)
+	}
+}
+
+func (m *mockNodesSource) reports() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]int, len(m.reported))
+	for k, v := range m.reported {
+		out[k] = v
+	}
+	return out
+}
+
+func (m *mockNodesSource) healthStatus(host string) *nodeshealth.NodeHealthStatus {
+	if m.healthStore == nil {
+		return nil
+	}
+	status := m.healthStore.GetNodeStatus(url.URL{Scheme: "http", Host: host})
+	if status == nil {
+		return nil
+	}
+	statusCopy := *status
+	return &statusCopy
+}
+
+type hostResponse struct {
+	status int
+	body   string
+	err    error
+}
+
+type switchingTransport struct {
+	responses map[string]hostResponse
+
+	mu    sync.Mutex
+	hosts []string
+}
+
+func (m *switchingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Host
+	m.mu.Lock()
+	m.hosts = append(m.hosts, host)
+	resp := m.responses[host]
+	m.mu.Unlock()
+
+	if resp.err != nil {
+		return nil, resp.err
+	}
+
+	status := resp.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	body := resp.body
+	if body == "" {
+		body = `{"TableNames":[]}`
+	}
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, nil
+}
+
+func (m *switchingTransport) Hosts() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.hosts...)
+}
+
+func newHealthStore(t *testing.T, nodes []url.URL) *nodeshealth.NodeHealthStore {
+	t.Helper()
+	cfg := nodeshealth.DefaultNodeHealthStoreConfig()
+	cfg.Scoring.QuarantineScoreCutOff = 1
+	store, err := nodeshealth.NewNodeHealthStore(cfg, nil, nodes)
+	if err != nil {
+		t.Fatalf("failed to create node health store: %v", err)
+	}
+	return store
+}
+
+func newExecutionPlanClient(
+	t *testing.T,
+	nodes *mockNodesSource,
+	transport http.RoundTripper,
+	attempts int,
+) (*Helper, *dynamodb.Client) {
+	t.Helper()
+
+	lb := &Helper{nodes: nodes, cfg: *shared.NewDefaultConfig()}
+	awsCfg, err := lb.awsConfig()
+	if err != nil {
+		t.Fatalf("awsConfig returned error: %v", err)
+	}
+	awsCfg.HTTPClient = &http.Client{Transport: lb.wrapHTTPTransport(transport)}
+	awsCfg.Retryer = func() aws.Retryer {
+		return retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = attempts
+			o.Backoff = retry.BackoffDelayerFunc(func(int, error) (time.Duration, error) {
+				return 0, nil
+			})
+		})
+	}
+	client := dynamodb.NewFromConfig(
+		awsCfg,
+		dynamodb.WithEndpointResolverV2(lb.endpointResolverV2()),
+		dynamodb.WithAPIOptions(lb.executionPlanAPIOption()),
+	)
+	return lb, client
+}
+
+func TestExecutionPlan_FirstNodeDown(t *testing.T) {
+	initialNodes := []url.URL{
+		{Scheme: "http", Host: "up.local:8080"},
+		{Scheme: "http", Host: "down.local:8080"},
+	}
+	nodes := &mockNodesSource{active: initialNodes}
+	nodes.healthStore = newHealthStore(t, initialNodes)
+	transport := &switchingTransport{
+		responses: map[string]hostResponse{
+			"down.local:8080": {err: errors.New("dial error")},
+		},
+	}
+
+	_, client := newExecutionPlanClient(t, nodes, transport, 2)
+
+	plan := shared.NewLazyExecutionPlan(nodes)
+	plan.Seed(1) // deterministically pick the second node (down) first
+	ctx := middleware.WithStackValue(context.Background(), executionPlanKey, plan)
+
+	if _, err := client.ListTables(ctx, &dynamodb.ListTablesInput{Limit: aws.Int32(1)}); err != nil {
+		t.Fatalf("ListTables returned error: %v", err)
+	}
+
+	hosts := transport.Hosts()
+	if len(hosts) != 2 {
+		t.Fatalf("expected two attempts, got %v", hosts)
+	}
+	if hosts[0] != "down.local:8080" || hosts[1] != "up.local:8080" {
+		t.Fatalf("unexpected host order: %v", hosts)
+	}
+
+	reports := nodes.reports()
+	if reports["down.local:8080"] != 1 {
+		t.Fatalf("expected down node to be reported once, reports: %v", reports)
+	}
+	if reports["up.local:8080"] != 0 {
+		t.Fatalf("unexpected error report for healthy node, reports: %v", reports)
+	}
+
+	downStatus := nodes.healthStatus("down.local:8080")
+	if downStatus == nil || !downStatus.Quarantined() {
+		t.Fatalf("expected down node to be quarantined, got %#v", downStatus)
+	}
+	upStatus := nodes.healthStatus("up.local:8080")
+	if upStatus == nil || upStatus.Quarantined() {
+		t.Fatalf("expected up node to remain active, got %#v", upStatus)
+	}
+}
+
+func TestExecutionPlan_AllNodesDown(t *testing.T) {
+	initialNodes := []url.URL{
+		{Scheme: "http", Host: "first.local:8080"},
+		{Scheme: "http", Host: "second.local:8080"},
+	}
+	nodes := &mockNodesSource{active: initialNodes}
+	nodes.healthStore = newHealthStore(t, initialNodes)
+	transport := &switchingTransport{
+		responses: map[string]hostResponse{
+			"first.local:8080":  {err: errors.New("dial first")},
+			"second.local:8080": {err: errors.New("dial second")},
+		},
+	}
+
+	_, client := newExecutionPlanClient(t, nodes, transport, 2)
+
+	plan := shared.NewLazyExecutionPlan(nodes)
+	plan.Seed(1)
+	ctx := middleware.WithStackValue(context.Background(), executionPlanKey, plan)
+
+	if _, err := client.ListTables(ctx, &dynamodb.ListTablesInput{Limit: aws.Int32(1)}); err == nil {
+		t.Fatalf("expected error when all nodes are down")
+	}
+
+	hosts := transport.Hosts()
+	if len(hosts) != 2 {
+		t.Fatalf("expected two attempts before giving up, got %v", hosts)
+	}
+	if hosts[0] == hosts[1] {
+		t.Fatalf("expected different nodes per attempt, got %v", hosts)
+	}
+
+	reports := nodes.reports()
+	if reports["first.local:8080"] == 0 || reports["second.local:8080"] == 0 {
+		t.Fatalf("expected both nodes to be reported, reports: %v", reports)
+	}
+
+	for _, host := range []string{"first.local:8080", "second.local:8080"} {
+		status := nodes.healthStatus(host)
+		if status == nil || !status.Quarantined() {
+			t.Fatalf("expected %s to be quarantined, got %#v", host, status)
+		}
+	}
+}
+
 func TestRoutingFallback(t *testing.T) {
-	h, err := helper.NewHelper(
+	h, err := NewHelper(
 		knownNodes,
-		helper.WithPort(httpPort),
-		helper.WithRoutingScope(rt.NewDCScope("wrongDC", rt.NewDCScope("datacenter1", nil))),
+		WithPort(httpPort),
+		WithRoutingScope(rt.NewDCScope("wrongDC", rt.NewDCScope("datacenter1", nil))),
 	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
@@ -70,7 +340,7 @@ func TestRoutingFallback(t *testing.T) {
 }
 
 func TestCheckIfRackAndDatacenterSetCorrectly_WrongDC(t *testing.T) {
-	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("wrongDC"))
+	h, err := NewHelper(knownNodes, WithPort(httpPort), WithDatacenter("wrongDC"))
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
 	}
@@ -82,7 +352,7 @@ func TestCheckIfRackAndDatacenterSetCorrectly_WrongDC(t *testing.T) {
 }
 
 func TestCheckIfRackAndDatacenterSetCorrectly_CorrectDC(t *testing.T) {
-	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("datacenter1"))
+	h, err := NewHelper(knownNodes, WithPort(httpPort), WithDatacenter("datacenter1"))
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
 	}
@@ -94,11 +364,11 @@ func TestCheckIfRackAndDatacenterSetCorrectly_CorrectDC(t *testing.T) {
 }
 
 func TestCheckIfRackAndDatacenterSetCorrectly_WrongRack(t *testing.T) {
-	h, err := helper.NewHelper(
+	h, err := NewHelper(
 		knownNodes,
-		helper.WithPort(httpPort),
-		helper.WithDatacenter("wrongDC"),
-		helper.WithRack("wrongRack"),
+		WithPort(httpPort),
+		WithDatacenter("wrongDC"),
+		WithRack("wrongRack"),
 	)
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
@@ -111,11 +381,11 @@ func TestCheckIfRackAndDatacenterSetCorrectly_WrongRack(t *testing.T) {
 }
 
 func TestCheckIfRackAndDatacenterSetCorrectly_CorrectRack(t *testing.T) {
-	h, err := helper.NewHelper(
+	h, err := NewHelper(
 		knownNodes,
-		helper.WithPort(httpPort),
-		helper.WithDatacenter("datacenter1"),
-		helper.WithRack("rack1"),
+		WithPort(httpPort),
+		WithDatacenter("datacenter1"),
+		WithRack("rack1"),
 	)
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
@@ -128,7 +398,7 @@ func TestCheckIfRackAndDatacenterSetCorrectly_CorrectRack(t *testing.T) {
 }
 
 func TestCheckIfRackDatacenterFeatureIsSupported(t *testing.T) {
-	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("datacenter1"))
+	h, err := NewHelper(knownNodes, WithPort(httpPort), WithDatacenter("datacenter1"))
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
 	}
@@ -145,14 +415,14 @@ func TestCheckIfRackDatacenterFeatureIsSupported(t *testing.T) {
 
 func TestDynamoDBOperations(t *testing.T) {
 	t.Run("Plain", func(t *testing.T) {
-		testDynamoDBOperations(t, helper.WithPort(httpPort))
+		testDynamoDBOperations(t, WithPort(httpPort))
 	})
 	t.Run("SSL", func(t *testing.T) {
 		testDynamoDBOperations(
 			t,
-			helper.WithScheme("https"),
-			helper.WithPort(httpsPort),
-			helper.WithIgnoreServerCertificateError(true),
+			WithScheme("https"),
+			WithPort(httpsPort),
+			WithIgnoreServerCertificateError(true),
 		)
 	})
 }
@@ -167,16 +437,16 @@ func (w *KeyWriter) Write(p []byte) (int, error) {
 }
 
 func TestKeyLogWriter(t *testing.T) {
-	opts := []helper.Option{
-		helper.WithScheme("https"),
-		helper.WithPort(httpsPort),
-		helper.WithIgnoreServerCertificateError(true),
-		helper.WithNodesListUpdatePeriod(0),
-		helper.WithIdleNodesListUpdatePeriod(0),
+	opts := []Option{
+		WithScheme("https"),
+		WithPort(httpsPort),
+		WithIgnoreServerCertificateError(true),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(0),
 	}
 	t.Run("AlternatorLiveNodes", func(t *testing.T) {
 		keyWriter := &KeyWriter{}
-		h, err := helper.NewHelper(knownNodes, append(slices.Clone(opts), helper.WithKeyLogWriter(keyWriter))...)
+		h, err := NewHelper(knownNodes, append(slices.Clone(opts), WithKeyLogWriter(keyWriter))...)
 		if err != nil {
 			t.Fatalf("failed to create alternator helper: %v", err)
 		}
@@ -194,7 +464,7 @@ func TestKeyLogWriter(t *testing.T) {
 
 	t.Run("DynamoDBAPI", func(t *testing.T) {
 		keyWriter := &KeyWriter{}
-		h, err := helper.NewHelper(knownNodes, append(slices.Clone(opts), helper.WithKeyLogWriter(keyWriter))...)
+		h, err := NewHelper(knownNodes, append(slices.Clone(opts), WithKeyLogWriter(keyWriter))...)
 		if err != nil {
 			t.Fatalf("failed to create alternator helper: %v", err)
 		}
@@ -265,18 +535,18 @@ func newSessionCache() *sessionCache {
 func TestTLSSessionCache(t *testing.T) {
 	t.Skip("No scylla release available yet")
 
-	opts := []helper.Option{
-		helper.WithScheme("https"),
-		helper.WithPort(httpsPort),
-		helper.WithIgnoreServerCertificateError(true),
-		helper.WithNodesListUpdatePeriod(0),
-		helper.WithIdleNodesListUpdatePeriod(0),
-		helper.WithMaxIdleHTTPConnections(-1), // Make http client not to persist https connection
+	opts := []Option{
+		WithScheme("https"),
+		WithPort(httpsPort),
+		WithIgnoreServerCertificateError(true),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(0),
+		WithMaxIdleHTTPConnections(-1), // Make http client not to persist https connection
 	}
 
 	t.Run("AlternatorLiveNodes", func(t *testing.T) {
 		cache := newSessionCache()
-		h, err := helper.NewHelper(knownNodes, append(slices.Clone(opts), helper.WithTLSSessionCache(cache))...)
+		h, err := NewHelper(knownNodes, append(slices.Clone(opts), WithTLSSessionCache(cache))...)
 		if err != nil {
 			t.Fatalf("failed to create alternator helper: %v", err)
 		}
@@ -298,7 +568,7 @@ func TestTLSSessionCache(t *testing.T) {
 
 	t.Run("DynamoDBAPI", func(t *testing.T) {
 		cache := newSessionCache()
-		h, err := helper.NewHelper(knownNodes, append(slices.Clone(opts), helper.WithTLSSessionCache(cache))...)
+		h, err := NewHelper(knownNodes, append(slices.Clone(opts), WithTLSSessionCache(cache))...)
 		if err != nil {
 			t.Fatalf("failed to create alternator helper: %v", err)
 		}
@@ -326,17 +596,17 @@ func TestTLSSessionCache(t *testing.T) {
 	})
 }
 
-func testDynamoDBOperations(t *testing.T, opts ...helper.Option) {
+func testDynamoDBOperations(t *testing.T, opts ...Option) {
 	t.Helper()
 
 	const tableName = "test_table"
-	h, err := helper.NewHelper(knownNodes, opts...)
+	h, err := NewHelper(knownNodes, opts...)
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
 	}
 	defer h.Stop()
 
-	ddb, err := h.Update(helper.WithCredentials("whatever", "secret")).NewDynamoDB()
+	ddb, err := h.Update(WithCredentials("whatever", "secret")).NewDynamoDB()
 	if err != nil {
 		t.Errorf("failed to create DynamoDB client: %v", err)
 	}
