@@ -167,6 +167,7 @@ func TestKeyLogWriter(t *testing.T) {
 		helper.WithIgnoreServerCertificateError(true),
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
+		helper.WithCredentials("whatever", "secret"),
 	}
 	t.Run("AlternatorLiveNodes", func(t *testing.T) {
 		keyWriter := &KeyWriter{}
@@ -199,9 +200,12 @@ func TestKeyLogWriter(t *testing.T) {
 			t.Fatalf("failed to create DynamoDB client: %v", err)
 		}
 
-		_, _ = ddb.DeleteTable(&dynamodb.DeleteTableInput{
+		_, err = ddb.DeleteTable(&dynamodb.DeleteTableInput{
 			TableName: aws.String("table-that-does-not-exist"),
 		})
+		if err != nil && !errors.As(err, notFoundErr) {
+			t.Fatalf("unexpected operation error: %v", err)
+		}
 
 		if len(keyWriter.keyData) == 0 {
 			t.Fatalf("keyData should not be empty")

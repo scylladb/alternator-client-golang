@@ -39,9 +39,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
+	"github.com/scylladb/alternator-client-golang/shared/errs"
+
 	"github.com/scylladb/alternator-client-golang/shared"
 
 	smithyendpoints "github.com/aws/smithy-go/endpoints"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Option is option for the `NewHelper`
@@ -140,6 +144,8 @@ type AlternatorNodesSource interface {
 	NextNode() url.URL
 	GetNodes() []url.URL
 	UpdateLiveNodes() error
+	GetActiveNodes() []url.URL
+	GetQuarantinedNodes() []url.URL
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
 	Start()
@@ -271,7 +277,12 @@ func (lb *Helper) NewDynamoDB() (*dynamodb.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dynamodb.NewFromConfig(cfg, dynamodb.WithEndpointResolverV2(lb.endpointResolverV2())), nil
+
+	return dynamodb.NewFromConfig(
+		cfg,
+		dynamodb.WithEndpointResolverV2(lb.endpointResolverV2()),
+		dynamodb.WithAPIOptions(lb.queryPlanAPIOption()),
+	), nil
 }
 
 // EndpointResolverV2 implementation for `dynamodb.EndpointResolverV2` that makes it return alternator nodes
@@ -281,10 +292,92 @@ type EndpointResolverV2 struct {
 
 // ResolveEndpoint returns alternator endpoint wrapped in `smithyendpoints.Endpoint`
 func (r *EndpointResolverV2) ResolveEndpoint(
-	_ context.Context,
+	ctx context.Context,
 	_ dynamodb.EndpointParameters,
 ) (smithyendpoints.Endpoint, error) {
-	return smithyendpoints.Endpoint{
-		URI: r.lb.NextNode(),
-	}, nil
+	if node, err := getRequestNodeFromContext(ctx); err == nil {
+		return smithyendpoints.Endpoint{URI: node}, nil
+	}
+	return smithyendpoints.Endpoint{}, errs.ErrCtxHasNoNode
+}
+
+type (
+	queryPlanKeyType   struct{}
+	requestNodeKeyType struct{}
+)
+
+var (
+	// A context key to store/retrieve a query plan assigned to the request
+	queryPlanKey = queryPlanKeyType{}
+	// A context key to store/retrieve a node assigned to the request
+	requestNodeKey               = requestNodeKeyType{}
+	queryPlanMiddlewareName      = "alternatorQueryPlanMiddleware"
+	queryPlanFinalMiddlewareName = "alternatorQueryPlanMiddlewareFinal"
+)
+
+func getQueryPlanFromContext(ctx context.Context) *shared.LazyQueryPlan {
+	val, _ := middleware.GetStackValue(ctx, queryPlanKey).(*shared.LazyQueryPlan)
+	return val
+}
+
+func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
+	val, ok := middleware.GetStackValue(ctx, requestNodeKey).(url.URL)
+	if !ok || val.Host == "" {
+		return url.URL{}, errs.ErrCtxHasNoNode
+	}
+	return val, nil
+}
+
+func setQueryPlan(ctx context.Context, nodes AlternatorNodesSource) context.Context {
+	return middleware.WithStackValue(ctx, queryPlanKey, shared.NewLazyQueryPlan(nodes))
+}
+
+func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		if err := stack.Initialize.Add(
+			middleware.InitializeMiddlewareFunc(
+				queryPlanMiddlewareName,
+				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					return next.HandleInitialize(setQueryPlan(ctx, lb.nodes), in)
+				},
+			),
+			middleware.Before,
+		); err != nil {
+			return err
+		}
+
+		mw := middleware.FinalizeMiddlewareFunc(
+			queryPlanFinalMiddlewareName,
+			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+				plan := getQueryPlanFromContext(ctx)
+				if plan == nil {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrCtxHasNoQueryPlan
+				}
+				node := plan.Next()
+				if node.Host == "" {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
+				}
+
+				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
+
+				req, ok := in.Request.(*smithyhttp.Request)
+				if !ok {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf(
+						"unexpected request type %T",
+						in.Request,
+					)
+				}
+				req.URL.Scheme = node.Scheme
+				req.URL.Host = node.Host
+				req.Host = node.Host
+
+				return next.HandleFinalize(ctx, in)
+			},
+		)
+
+		if err := stack.Finalize.Insert(mw, "Retry", middleware.After); err != nil {
+			return stack.Finalize.Add(mw, middleware.Before)
+		}
+		return nil
+	}
 }
