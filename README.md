@@ -154,6 +154,26 @@ It is supported only for AWS SDKv2, example how to enable it:
     }
 ```
 
+### Request compression
+
+It is possible to enable request compression with:
+```go
+    h, err := helper.NewHelper(
+		[]string{"x.x.x.x"},
+	    helper.WithPort(9999),
+		helper.WithCredentials("whatever", "secret"),
+		helper.WithRequestCompression(NewGzipConfig().GzipRequestCompressor()),
+	)
+    if err != nil {
+        panic(fmt.Sprintf("failed to create alternator helper: %v", err))
+    }
+```
+For now only Gzip compression is supported in the future there is a possiblity to add more.
+
+#### GZIP compression
+
+To create a new Gzip configuration, use `NewGzipConfig()`. You can also set compression level via `WithLevel()` option to control the trade-off between compression speed and compression ratio.
+
 ### Decrypting TLS
 
 Read wireshark wiki regarding decrypting TLS traffic: https://wiki.wireshark.org/TLS#using-the-pre-master-secret
