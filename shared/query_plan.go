@@ -29,6 +29,14 @@ func NewLazyQueryPlan(nodes nodesSource) *LazyQueryPlan {
 	}
 }
 
+// NewLazyQueryPlanWithSeed constructs a plan bound to the provided nodes source.
+func NewLazyQueryPlanWithSeed(nodes nodesSource, seed int64) *LazyQueryPlan {
+	return &LazyQueryPlan{
+		nodes: nodes,
+		rnd:   rand.New(rand.NewSource(seed)),
+	}
+}
+
 // Next returns the next node to try. It iterates over active nodes first and then
 // quarantined nodes, picking a random node from the remaining pool and removing it
 // so that a node is never returned twice. If no nodes remain, it returns the zero url.URL.

@@ -106,6 +106,9 @@ var (
 	// in a form of custom implementation of `CertSource` interface
 	WithClientCertificateSource = shared.WithClientCertificateSource
 
+	// WithNodeHealthStoreConfig overrides the entire node health tracking configuration.
+	WithNodeHealthStoreConfig = shared.WithNodeHealthStoreConfig
+
 	// WithIgnoreServerCertificateError makes both http clients ignore tls error when value is true
 	WithIgnoreServerCertificateError = shared.WithIgnoreServerCertificateError
 
@@ -155,6 +158,8 @@ type AlternatorNodesSource interface {
 	GetQuarantinedNodes() []url.URL
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
+	ReportNodeError(nodeURL url.URL, err error)
+	TryReleaseQuarantinedNodes() []url.URL
 	Start()
 	Stop()
 }
@@ -176,6 +181,8 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 type Helper struct {
 	nodes AlternatorNodesSource
 	cfg   shared.Config
+	// For testing purposes only
+	queryPlanSeed int64
 }
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
@@ -214,7 +221,7 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 	}
 
 	cfg.HTTPClient = &http.Client{
-		Transport: shared.NewHTTPTransport(lb.cfg),
+		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(lb.cfg)),
 		Timeout:   lb.cfg.HTTPClientTimeout,
 	}
 
@@ -279,7 +286,7 @@ func (lb *Helper) endpointResolverV2() dynamodb.EndpointResolverV2 {
 }
 
 // NewDynamoDB creates a new DynamoDB client preconfigured to route requests to Alternator nodes
-func (lb *Helper) NewDynamoDB() (*dynamodb.Client, error) {
+func (lb *Helper) NewDynamoDB(opts ...func(options *dynamodb.Options)) (*dynamodb.Client, error) {
 	cfg, err := lb.awsConfig()
 	if err != nil {
 		return nil, err
@@ -287,9 +294,41 @@ func (lb *Helper) NewDynamoDB() (*dynamodb.Client, error) {
 
 	return dynamodb.NewFromConfig(
 		cfg,
-		dynamodb.WithEndpointResolverV2(lb.endpointResolverV2()),
-		dynamodb.WithAPIOptions(lb.queryPlanAPIOption()),
+		append(opts,
+			dynamodb.WithEndpointResolverV2(lb.endpointResolverV2()),
+			dynamodb.WithAPIOptions(lb.queryPlanAPIOption()),
+		)...,
 	), nil
+}
+
+type roundTripper struct {
+	originalTransport http.RoundTripper
+	lb                *Helper
+}
+
+func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	node, err := getRequestNodeFromContext(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	req.URL.Scheme = node.Scheme
+	req.URL.Host = node.Host
+	req.Host = node.Host
+	resp, err := rt.originalTransport.RoundTrip(req)
+	if err != nil && req.URL != nil {
+		rt.lb.nodes.ReportNodeError(url.URL{
+			Host:   req.URL.Host,
+			Scheme: req.URL.Scheme,
+		}, err)
+	}
+	return resp, err
+}
+
+func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTripper {
+	return &roundTripper{
+		originalTransport: original,
+		lb:                lb,
+	}
 }
 
 // EndpointResolverV2 implementation for `dynamodb.EndpointResolverV2` that makes it return alternator nodes
@@ -335,8 +374,14 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 	return val, nil
 }
 
-func setQueryPlan(ctx context.Context, nodes AlternatorNodesSource) context.Context {
-	return middleware.WithStackValue(ctx, queryPlanKey, shared.NewLazyQueryPlan(nodes))
+func (lb *Helper) setQueryPlan(ctx context.Context) context.Context {
+	var qp *shared.LazyQueryPlan
+	if lb.queryPlanSeed == 0 {
+		qp = shared.NewLazyQueryPlan(lb.nodes)
+	} else {
+		qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
+	}
+	return middleware.WithStackValue(ctx, queryPlanKey, qp)
 }
 
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
@@ -345,7 +390,7 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 			middleware.InitializeMiddlewareFunc(
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
-					return next.HandleInitialize(setQueryPlan(ctx, lb.nodes), in)
+					return next.HandleInitialize(lb.setQueryPlan(ctx), in)
 				},
 			),
 			middleware.Before,
