@@ -70,3 +70,12 @@ scylla-rm:
 
 .prepare-golangci:
 	$(MAKE) -C .. .prepare-golangci
+
+.PHONY: update-go-mod
+update-go-mod:
+	go mod tidy
+
+.PHONY: upgrade-all-deps
+upgrade-all-deps:
+	go get -u ./...
+	go mod tidy

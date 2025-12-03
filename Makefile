@@ -126,3 +126,55 @@ scylla-rm: $(GOBIN)/docker-compose
 
 $(GOBIN)/docker-compose: Makefile
 	$(call dl_bin,docker-compose,$(DOCKER_COMPOSE_DOWNLOAD_URL))
+
+.PHONY: update-go-mod
+update-go-mod:
+	$(MAKE) -C ./shared update-go-mod
+	$(MAKE) -C ./sdkv1 update-go-mod
+	$(MAKE) -C ./sdkv2 update-go-mod
+
+.PHONY: upgrade-all-deps
+upgrade-all-deps:
+	$(MAKE) -C ./shared upgrade-all-deps
+	$(MAKE) -C ./sdkv1 upgrade-all-deps
+	$(MAKE) -C ./sdkv2 upgrade-all-deps
+
+.PHONY: create-release-commits
+create-release-commits:
+	@if [ -z "$(version)" ]; then echo "Usage: make create-release-commits version=vX.Y.Z"; exit 1; fi
+	@$(MAKE) update-go-mod
+	VERSION="$(version)"; \
+	for module in sdkv1 sdkv2; do \
+		( cd $$module && \
+			go mod edit -require=github.com/scylladb/alternator-client-golang/shared@$$VERSION && \
+			(go mod edit -dropreplace github.com/scylladb/alternator-client-golang/shared || true) ); \
+	done; \
+	git add sdkv1/go.mod sdkv2/go.mod; \
+	git commit -m "Release $$VERSION"; \
+	git tag "$$VERSION"; \
+	git tag "shared/$$VERSION"; \
+	git tag "sdkv1/$$VERSION"; \
+	git tag "sdkv2/$$VERSION"; \
+	for module in sdkv1 sdkv2; do \
+		( cd $$module && go mod edit -replace=github.com/scylladb/alternator-client-golang/shared=../shared ); \
+	done; \
+	git add sdkv1/go.mod sdkv2/go.mod; \
+	git commit -m "New iteration"
+
+.PHONY: push-release-commits
+push-release-commits:
+	@set -eu; \
+	LAST1=$$(git log -1 --pretty=%s); \
+	LAST2=$$(git log -2 --pretty=%s | tail -n 1); \
+	if [ "$$LAST1" != "New iteration" ]; then echo "Head commit must be 'New iteration'"; exit 1; fi; \
+	case "$$LAST2" in \
+	"Release "*) ;; \
+	*) echo "Second commit must be 'Release <version>'"; exit 1;; \
+	esac; \
+	VERSION=$${LAST2#"Release "}; \
+	if [ -z "$$VERSION" ]; then echo "Unable to parse version from release commit: $$LAST2"; exit 1; fi; \
+	for tag in "$$VERSION" "shared/$$VERSION" "sdkv1/$$VERSION" "sdkv2/$$VERSION"; do \
+		if ! git rev-parse --verify "$$tag" >/dev/null 2>&1; then echo "Missing tag $$tag"; exit 1; fi; \
+	done; \
+	git push origin HEAD; \
+	git push origin "$$VERSION" "shared/$$VERSION" "sdkv1/$$VERSION" "sdkv2/$$VERSION"
