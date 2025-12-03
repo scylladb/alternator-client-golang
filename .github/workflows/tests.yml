@@ -23,8 +23,8 @@ jobs:
       - name: Install GoLang
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25"
           go-version-file: "go.work"
+          cache-dependency-path: "**/go.sum"
 
       - name: Run build
         run: |
