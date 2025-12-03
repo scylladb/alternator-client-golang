@@ -10,7 +10,7 @@ require (
 	github.com/aws/smithy-go v1.24.0
 	github.com/google/go-cmp v0.7.0
 	github.com/klauspost/compress v1.18.2
-	github.com/scylladb/alternator-client-golang/shared v0.0.0-20250916125851-cc515eb951ad
+	github.com/scylladb/alternator-client-golang/shared v1.0.3
 )
 
 require (
