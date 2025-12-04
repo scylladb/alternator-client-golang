@@ -34,12 +34,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
+	"github.com/scylladb/alternator-client-golang/shared/murmur"
 
 	"github.com/scylladb/alternator-client-golang/shared"
 
@@ -147,6 +151,16 @@ var (
 
 	// WithHTTPClientTimeout controls timeout for HTTP requests
 	WithHTTPClientTimeout = shared.WithHTTPClientTimeout
+
+	// WithKeyRouteAffinity enables routing optimization heuristics for the specified operation types.
+	WithKeyRouteAffinity = shared.WithKeyRouteAffinity
+)
+
+const (
+	// KeyRouteAffinityWrite enables routing optimization for all write operations
+	KeyRouteAffinityWrite = shared.KeyRouteAffinityWrite
+	// KeyRouteAffinityAll enables routing optimization for all operations including reads
+	KeyRouteAffinityAll = shared.KeyRouteAffinityAll
 )
 
 // AlternatorNodesSource an interface for nodes list provider
@@ -179,10 +193,14 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 // It internally relies on the shared.AlternatorLiveNodes component for tracking
 // and routing to healthy nodes.
 type Helper struct {
-	nodes AlternatorNodesSource
-	cfg   shared.Config
-	// For testing purposes only
+	nodes         AlternatorNodesSource
+	cfg           shared.Config
 	queryPlanSeed int64
+
+	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
+	// and potentially updated via auto-discovery from CreateTable operations.
+	pkInfoMutex    sync.RWMutex
+	pkInfoPerTable map[string][]string
 }
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
@@ -197,9 +215,19 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	if err != nil {
 		return nil, err
 	}
+
+	// Pre-populate runtime partition key information from config
+	pkInfoPerTable := make(map[string][]string)
+	if cfg.KeyRouteAffinity.PkInfoPerTable != nil {
+		for table, keys := range cfg.KeyRouteAffinity.PkInfoPerTable {
+			pkInfoPerTable[table] = slices.Clone(keys)
+		}
+	}
+
 	return &Helper{
-		nodes: nodes,
-		cfg:   *cfg,
+		nodes:          nodes,
+		cfg:            *cfg,
+		pkInfoPerTable: pkInfoPerTable,
 	}, nil
 }
 
@@ -243,8 +271,9 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 		opt(&cfg)
 	}
 	return &Helper{
-		nodes: lb.nodes,
-		cfg:   cfg,
+		nodes:          lb.nodes,
+		cfg:            cfg,
+		pkInfoPerTable: lb.pkInfoPerTable,
 	}
 }
 
@@ -374,23 +403,31 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 	return val, nil
 }
 
-func (lb *Helper) setQueryPlan(ctx context.Context) context.Context {
-	var qp *shared.LazyQueryPlan
-	if lb.queryPlanSeed == 0 {
-		qp = shared.NewLazyQueryPlan(lb.nodes)
-	} else {
-		qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
-	}
-	return middleware.WithStackValue(ctx, queryPlanKey, qp)
-}
-
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
 			middleware.InitializeMiddlewareFunc(
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
-					return next.HandleInitialize(lb.setQueryPlan(ctx), in)
+					var qp *shared.LazyQueryPlan
+					if lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityNone {
+						if lb.queryPlanSeed == 0 {
+							qp = shared.NewLazyQueryPlan(lb.nodes)
+						} else {
+							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
+						}
+					} else {
+						lb.maybeUpdatePkInformation(in)
+						if pkHash, err := lb.getPkHash(in); err == nil {
+							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, pkHash)
+						} else {
+							qp = shared.NewLazyQueryPlan(lb.nodes)
+						}
+					}
+
+					ctx = middleware.WithStackValue(ctx, queryPlanKey, qp)
+
+					return next.HandleInitialize(ctx, in)
 				},
 			),
 			middleware.Before,
@@ -432,4 +469,160 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 		}
 		return nil
 	}
+}
+
+// SetPartitionKeyInfo stores partition key information for a table in a thread-safe manner.
+func (lb *Helper) SetPartitionKeyInfo(tableName string, keys []string) {
+	lb.pkInfoMutex.Lock()
+	defer lb.pkInfoMutex.Unlock()
+	lb.pkInfoPerTable[tableName] = keys
+}
+
+// GetPartitionKeyInfo retrieves partition key information for a table in a thread-safe manner.
+func (lb *Helper) GetPartitionKeyInfo(tableName string) ([]string, bool) {
+	lb.pkInfoMutex.RLock()
+	defer lb.pkInfoMutex.RUnlock()
+	keys, ok := lb.pkInfoPerTable[tableName]
+	return keys, ok
+}
+
+func (lb *Helper) extractPartitionKey(
+	item map[string]types.AttributeValue,
+	tableName string,
+) (map[string]types.AttributeValue, error) {
+	pkInfo, exists := lb.GetPartitionKeyInfo(tableName)
+	if !exists {
+		return nil, fmt.Errorf("partition key information not found for table %s", tableName)
+	}
+
+	partitionKey := make(map[string]types.AttributeValue)
+	for _, keyName := range pkInfo {
+		if val, ok := item[keyName]; ok {
+			partitionKey[keyName] = val
+		} else {
+			return nil, fmt.Errorf("part of partition key is missing: %s", keyName)
+		}
+	}
+
+	if len(partitionKey) == 0 {
+		return nil, fmt.Errorf("partition key is empty for table %s", tableName)
+	}
+	return partitionKey, nil
+}
+
+func (lb *Helper) hashPartitionKey(partitionKey map[string]types.AttributeValue, tableName string) (int64, error) {
+	pkInfo, exists := lb.GetPartitionKeyInfo(tableName)
+	if !exists || len(partitionKey) == 0 {
+		return 0, fmt.Errorf("partition key information not found for table %s", tableName)
+	}
+
+	h := murmur.New()
+
+	for _, keyName := range pkInfo {
+		if val, ok := partitionKey[keyName]; ok {
+			switch v := val.(type) {
+			case *types.AttributeValueMemberS:
+				h.Write([]byte(v.Value))
+			case *types.AttributeValueMemberN:
+				h.Write([]byte(v.Value))
+			case *types.AttributeValueMemberB:
+				h.Write(v.Value)
+			}
+		}
+	}
+
+	return int64(h.Sum64()), nil
+}
+
+func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
+	shouldOptimize := false
+	var tableName string
+	var partitionKey map[string]types.AttributeValue
+	var err error
+
+	switch params := in.Parameters.(type) {
+	case *dynamodb.PutItemInput:
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		tableName = aws.ToString(params.TableName)
+		partitionKey, err = lb.extractPartitionKey(params.Item, tableName)
+		if err != nil {
+			h := murmur.New()
+			h.Write([]byte(err.Error()))
+			return int64(h.Sum64()), nil
+		}
+
+	case *dynamodb.UpdateItemInput:
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		tableName = aws.ToString(params.TableName)
+		partitionKey = params.Key
+
+	case *dynamodb.DeleteItemInput:
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		tableName = aws.ToString(params.TableName)
+		partitionKey = params.Key
+
+	case *dynamodb.GetItemInput:
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		tableName = aws.ToString(params.TableName)
+		partitionKey = params.Key
+	}
+
+	if shouldOptimize && partitionKey != nil {
+		return lb.hashPartitionKey(partitionKey, tableName)
+	}
+	return 0, fmt.Errorf("could not get a proper hash")
+}
+
+// maybeUpdatePkInformation updates partition key information from CreateTable operations
+// or learns from Get/Update/Delete operations if the table doesn't already have partition key info stored.
+func (lb *Helper) maybeUpdatePkInformation(in middleware.InitializeInput) {
+	switch params := in.Parameters.(type) {
+	case *dynamodb.CreateTableInput:
+		tableName := aws.ToString(params.TableName)
+
+		// Check if we already have partition key info for this table
+		if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
+			return
+		}
+
+		var partitionKeys []string
+		for _, key := range params.KeySchema {
+			partitionKeys = append(partitionKeys, aws.ToString(key.AttributeName))
+		}
+
+		if len(partitionKeys) > 0 {
+			lb.SetPartitionKeyInfo(tableName, partitionKeys)
+		}
+
+	case *dynamodb.GetItemInput:
+		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
+
+	case *dynamodb.UpdateItemInput:
+		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
+
+	case *dynamodb.DeleteItemInput:
+		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
+	}
+}
+
+// learnPartitionKeysFromKeyMap extracts and stores partition key names from a Key map.
+// The key names are sorted alphabetically for consistency since map iteration order is random.
+func (lb *Helper) learnPartitionKeysFromKeyMap(tableName string, key map[string]types.AttributeValue) {
+	// Check if we already have partition key info for this table
+	if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
+		return
+	}
+
+	if len(key) == 0 {
+		return
+	}
+
+	// Extract and sort key names for consistency
+	partitionKeys := make([]string, 0, len(key))
+	for keyName := range key {
+		partitionKeys = append(partitionKeys, keyName)
+	}
+	slices.Sort(partitionKeys)
+
+	lb.SetPartitionKeyInfo(tableName, partitionKeys)
 }

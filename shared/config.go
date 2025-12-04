@@ -63,6 +63,40 @@ type Config struct {
 	RequestCompression RequestCompressionFunc
 	// NodeHealthStoreConfig controls node health tracking logic
 	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
+	// KeyRouteAffinity configures which operations should use routing optimization heuristics
+	KeyRouteAffinity KeyRouteAffinityConfig
+}
+
+// KeyRouteAffinity specifies the type of operations that should use routing optimization
+type KeyRouteAffinity int
+
+const (
+	// KeyRouteAffinityNone disables routing optimization for all operations
+	KeyRouteAffinityNone KeyRouteAffinity = iota
+	// KeyRouteAffinityWrite enables routing optimization for all write operations (Put, Update, Delete)
+	KeyRouteAffinityWrite
+	// KeyRouteAffinityAll enables routing optimization for all operations including reads
+	KeyRouteAffinityAll
+)
+
+// KeyRouteAffinityConfig holds configuration for routing optimization heuristics
+type KeyRouteAffinityConfig struct {
+	Type           KeyRouteAffinity
+	PkInfoPerTable map[string][]string
+}
+
+// NewKeyRouteAffinityConfig creates a new KeyRouteAffinityConfig with initialized map
+func NewKeyRouteAffinityConfig(keyRouteAffinity KeyRouteAffinity) KeyRouteAffinityConfig {
+	return KeyRouteAffinityConfig{
+		Type:           keyRouteAffinity,
+		PkInfoPerTable: make(map[string][]string),
+	}
+}
+
+// WithPkInfo sets the partition key information per table for routing optimization
+func (kr KeyRouteAffinityConfig) WithPkInfo(pkInfo map[string][]string) KeyRouteAffinityConfig {
+	kr.PkInfoPerTable = pkInfo
+	return kr
 }
 
 // RequestCompressionFunc is a function that compresses request bodies.
@@ -435,6 +469,14 @@ func CloneAWSConfigOptions(options []any) []any {
 	out := make([]any, len(options))
 	copy(out, options)
 	return out
+}
+
+// WithKeyRouteAffinity enables routing optimization heuristics for the specified operation types.
+// Routing optimization benefits from routing to the same coordinator to improve Paxos performance.
+func WithKeyRouteAffinity(keyRouteAffinityConfig KeyRouteAffinityConfig) Option {
+	return func(config *Config) {
+		config.KeyRouteAffinity = keyRouteAffinityConfig
+	}
 }
 
 // ConvertToAWSConfigOptions retrieves all custom options matching the expected type.
