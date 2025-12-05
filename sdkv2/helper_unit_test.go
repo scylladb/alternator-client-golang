@@ -503,8 +503,8 @@ func TestNodeHealthTracking(t *testing.T) { //nolint: tparallel // these subtest
 		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
 	})
 
-	t.Run("Phase6:Node2-REMOVED(between UpdateLiveNodes)", func(t *testing.T) {
-		mockTransport.DeleteNode(node2)
+	t.Run("Phase6:Node1-REMOVED(between UpdateLiveNodes)", func(t *testing.T) {
+		mockTransport.DeleteNode(node1)
 
 		for range 6 {
 			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
@@ -516,17 +516,17 @@ func TestNodeHealthTracking(t *testing.T) { //nolint: tparallel // these subtest
 			}
 		}
 
-		// Node 2 was removed from the cluster but discovery hasn't refreshed yet,
-		// so it should still be part of the active list rather than causing failures.
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
+		// Node 1 was removed from the cluster, but it wasn't discovered yet by `UpdateLiveNodes`
+		// so it should stay in quarantined list.
+		assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{node1})
 
 		err = h.UpdateLiveNodes()
 		if err != nil {
 			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
 		}
 
-		// Node 2 should be removed completely
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node3, node4}, []url.URL{})
+		// Node 1 is gone completely
+		assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{})
 	})
 }
 
