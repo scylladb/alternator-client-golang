@@ -3,12 +3,12 @@
 ## Glossary
 
 - Alternator.
-An DynamoDB API implemented on top of ScyllaDB backend.  
+An DynamoDB API implemented on top of ScyllaDB backend.
 Unlike AWS DynamoDB’s single endpoint, Alternator is distributed across multiple nodes.
 Could be deployed anywhere: locally, on AWS, on any cloud provider.
 
 - Client-side load balancing.
-A method where the client selects which server (node) to send requests to, 
+A method where the client selects which server (node) to send requests to,
 rather than relying on a load balancing service.
 
 - DynamoDB.
@@ -19,7 +19,7 @@ The official AWS SDK for the Go programming language, used to interact with AWS 
 Have two versions: [v1](https://github.com/aws/aws-sdk-go) and [v2](https://github.com/aws/aws-sdk-go-v2)
 
 - DynamoDB/Alternator Endpoint.
-The base URL a client connects to. 
+The base URL a client connects to.
 In AWS DynamoDB, this is typically something like http://dynamodb.us-east-1.amazonaws.com.
 In DynamoDB it is any of Alternator nodes
 
@@ -28,7 +28,7 @@ A physical or logical grouping of racks.
 On Scylla Cloud in regular setup it represents cloud provider region where nodes are deployed.
 
 - Rack.
-A logical grouping akin to an availability zone within a datacenter. 
+A logical grouping akin to an availability zone within a datacenter.
 On Scylla Cloud in regular setup it represents cloud provider availability zone where nodes are deployed.
 
 ## Introduction
@@ -40,7 +40,7 @@ There is a separate library every AWS SDK version:
 
 ## Using the library
 
-You create a regular `dynamodb.DynamoDB` client by one of the methods listed below and 
+You create a regular `dynamodb.DynamoDB` client by one of the methods listed below and
 the rest of the application can use this dynamodb client normally
 this `db` object is thread-safe and can be used from multiple threads.
 
@@ -71,7 +71,7 @@ To check if cluster support datacenter/rack feature supported you can call `Chec
 		return fmt.Errorf("failed to check if rack/dc feature is supported: %v", err)
 	}
 	if !supported {
-        return fmt.Errorf("dc/rack feature is not supporte")	
+        return fmt.Errorf("dc/rack feature is not supporte")
     }
 ```
 
@@ -131,7 +131,7 @@ h, _ := helper.NewHelper(
 ddb, _ := h.NewDynamoDB()
 _, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String("tbl"), Key: key})
 ```
-SDK v1 users can apply the same pattern with the `*WithContext` methods (e.g., `GetItemWithContext`). 
+SDK v1 users can apply the same pattern with the `*WithContext` methods (e.g., `GetItemWithContext`).
 
 ## Distinctive features
 
@@ -144,9 +144,9 @@ Artificial testing showed that this technic can reduce outgoing traffic up to 56
 It is supported only for AWS SDKv2, example how to enable it:
 ```go
     h, err := helper.NewHelper(
-		[]string{"x.x.x.x"}, 
-	    helper.WithPort(9999), 
-		helper.WithCredentials("whatever", "secret"), 
+		[]string{"x.x.x.x"},
+	    helper.WithPort(9999),
+		helper.WithCredentials("whatever", "secret"),
 		helper.WithOptimizeHeaders(true),
 	)
     if err != nil {
@@ -173,6 +173,70 @@ For now only Gzip compression is supported in the future there is a possiblity t
 #### GZIP compression
 
 To create a new Gzip configuration, use `NewGzipConfig()`. You can also set compression level via `WithLevel()` option to control the trade-off between compression speed and compression ratio.
+
+### KeyRouteAffinity
+
+When using Lightweight Transactions (LWT) in ScyllaDB/Alternator, routing requests for the same partition key to the same coordinator node can significantly improve performance.
+This is because LWT operations require consensus among replicas, and using the same coordinator reduces coordination overhead.
+KeyRouteAffnity is a way to reduce this overhead by ensuring that two queries targeting same partition key will be scheduled to the same coordinator.
+Instead of using random selection of nodes in a round-robin fassion it provides a way to have a deterministic, idempotent selection of nodes basing on PK.
+
+#### Alternator Write Isolation Modes
+
+ScyllaDB's Alternator supports different write isolation modes configured via `alternator_write_isolation`:
+
+- **`always`**: All write operations use LWT (Paxos consensus). Maximum consistency but higher latency.
+- **`only_rmw_uses_lwt`**: Only Read-Modify-Write operations (UpdateItem with conditions, DeleteItem with conditions) use LWT. This is the **recommended setting** for most use cases.
+- **`forbid_rmw`**: LWTs are completely disabled. Conditional operations will fail.
+- **`unsafe_rmw`**: Unsafe - does not use LWT for RMW operations.
+
+#### When to Use KeyRouteAffinity
+
+Enable KeyRouteAffinity when:
+- Your Alternator cluster is configured with `alternator_write_isolation: only_rmw_uses_lwt` (use `KeyRouteAffinityWrite`) or `always` (use `KeyRouteAffinityAll`)
+- You perform conditional updates/deletes on the same items repeatedly
+- You want to optimize LWT performance by ensuring the same coordinator handles requests for the same partition key
+
+#### Configuration Options
+
+There are three KeyRouteAffinity modes:
+
+1. **`KeyRouteAffinityNone`** (default): Disabled. Requests are distributed randomly across nodes.
+2. **`KeyRouteAffinityWrite`**: Enables routing optimization for write operations (PutItem, UpdateItem, DeleteItem).
+3. **`KeyRouteAffinityAll`**: Enables routing optimization for all operations including reads (GetItem).
+
+#### Automatic Partition Key Discovery
+
+The driver automatically learns partition key information from your DynamoDB operations:
+
+- **CreateTable**: Extracts partition keys from `KeySchema`
+- **GetItem, UpdateItem, DeleteItem**: Learns from the `Key` parameter (keys are sorted alphabetically for consistency)
+- **PutItem**: ❌ **Cannot auto-discover** - the `Item` parameter doesn't distinguish between partition keys and regular attributes
+
+#### Pre-Configuring Partition Keys with WithPkInfo
+
+If your workload consists **only of PutItem operations**, the driver cannot automatically discover partition keys. In this case, use `WithPkInfo` to pre-configure the partition key columns:
+
+```go
+h, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithPort(9999),
+    helper.WithCredentials("whatever", "secret"),
+    helper.WithKeyRouteAffinity(
+        helper.NewKeyRouteAffinityConfig(helper.KeyRouteAffinityWrite).
+            WithPkInfo(map[string][]string{
+                "users":  {"userId"},
+            }),
+    ),
+)
+```
+
+**When to use `WithPkInfo`:**
+- ✅ Your workload is **PutItem-only** and you want routing optimization from the first request
+- ✅ You want to avoid the small overhead of auto-discovery
+- ✅ You know your table schemas upfront and want explicit configuration
+
+**Important**: For composite keys in `WithPkInfo`, the order doesn't matter - the driver will sort them alphabetically internally for consistent hashing.
 
 ### Decrypting TLS
 
