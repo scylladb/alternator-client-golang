@@ -29,7 +29,7 @@ func NewLazyQueryPlan(nodes nodesSource) *LazyQueryPlan {
 	}
 }
 
-// NewLazyQueryPlanWithSeed constructs a plan bound to the provided nodes source.
+// NewLazyQueryPlanWithSeed constructs a plan bound to the provided nodes source with provided seed.
 func NewLazyQueryPlanWithSeed(nodes nodesSource, seed int64) *LazyQueryPlan {
 	return &LazyQueryPlan{
 		nodes: nodes,

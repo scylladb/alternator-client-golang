@@ -175,3 +175,54 @@ func DynamoDBListTablesResponse(tableNames []string, req *http.Request) (*http.R
 		Request(req).
 		Build()
 }
+
+// DynamoDBPutItemResponse creates a mock DynamoDB PutItem response
+func DynamoDBPutItemResponse(req *http.Request) (*http.Response, error) {
+	body := `{}`
+	return New().
+		OK().
+		ContentType(ct.DynamoDBJSON).
+		Body(body).
+		Request(req).
+		Build()
+}
+
+// DynamoDBGetItemResponse creates a mock DynamoDB GetItem response
+func DynamoDBGetItemResponse(item interface{}, req *http.Request) (*http.Response, error) {
+	body := `{"Item":{}}`
+	if item != nil {
+		itemJSON, err := json.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		body = `{"Item":` + string(itemJSON) + `}`
+	}
+	return New().
+		OK().
+		ContentType(ct.DynamoDBJSON).
+		Body(body).
+		Request(req).
+		Build()
+}
+
+// DynamoDBUpdateItemResponse creates a mock DynamoDB UpdateItem response
+func DynamoDBUpdateItemResponse(req *http.Request) (*http.Response, error) {
+	body := `{}`
+	return New().
+		OK().
+		ContentType(ct.DynamoDBJSON).
+		Body(body).
+		Request(req).
+		Build()
+}
+
+// DynamoDBDeleteItemResponse creates a mock DynamoDB DeleteItem response
+func DynamoDBDeleteItemResponse(req *http.Request) (*http.Response, error) {
+	body := `{}`
+	return New().
+		OK().
+		ContentType(ct.DynamoDBJSON).
+		Body(body).
+		Request(req).
+		Build()
+}
