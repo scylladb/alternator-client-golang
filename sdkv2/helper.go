@@ -32,9 +32,11 @@ package sdkv2
 import (
 	"context"
 	"fmt"
+	"hash"
 	"net/http"
 	"net/url"
 	"slices"
+	"sort"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -486,70 +488,93 @@ func (lb *Helper) GetPartitionKeyInfo(tableName string) ([]string, bool) {
 	return keys, ok
 }
 
-func (lb *Helper) extractPartitionKey(
-	item map[string]types.AttributeValue,
-	tableName string,
-) (map[string]types.AttributeValue, error) {
+func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, tableName string) (int64, error) {
 	pkInfo, exists := lb.GetPartitionKeyInfo(tableName)
-	if !exists {
-		return nil, fmt.Errorf("partition key information not found for table %s", tableName)
-	}
-
-	partitionKey := make(map[string]types.AttributeValue)
-	for _, keyName := range pkInfo {
-		if val, ok := item[keyName]; ok {
-			partitionKey[keyName] = val
-		} else {
-			return nil, fmt.Errorf("part of partition key is missing: %s", keyName)
-		}
-	}
-
-	if len(partitionKey) == 0 {
-		return nil, fmt.Errorf("partition key is empty for table %s", tableName)
-	}
-	return partitionKey, nil
-}
-
-func (lb *Helper) hashPartitionKey(partitionKey map[string]types.AttributeValue, tableName string) (int64, error) {
-	pkInfo, exists := lb.GetPartitionKeyInfo(tableName)
-	if !exists || len(partitionKey) == 0 {
+	if !exists || len(values) == 0 {
 		return 0, fmt.Errorf("partition key information not found for table %s", tableName)
 	}
 
 	h := murmur.New()
 
 	for _, keyName := range pkInfo {
-		if val, ok := partitionKey[keyName]; ok {
-			switch v := val.(type) {
-			case *types.AttributeValueMemberS:
-				h.Write([]byte(v.Value))
-			case *types.AttributeValueMemberN:
-				h.Write([]byte(v.Value))
-			case *types.AttributeValueMemberB:
-				h.Write(v.Value)
-			}
+		val, ok := values[keyName]
+		if !ok {
+			return 0, fmt.Errorf("value for key %s not found", keyName)
+		}
+		if err := writeToHash(h, val); err != nil {
+			return 0, fmt.Errorf("failed to hash value for key %s: %w", keyName, err)
 		}
 	}
 
 	return int64(h.Sum64()), nil
 }
 
+func writeToHash(h hash.Hash64, val types.AttributeValue) error {
+	switch v := val.(type) {
+	case *types.AttributeValueMemberS:
+		h.Write([]byte(v.Value))
+	case *types.AttributeValueMemberSS:
+		for _, chunk := range v.Value {
+			h.Write([]byte(chunk))
+		}
+	case *types.AttributeValueMemberBS:
+		for _, chunk := range v.Value {
+			h.Write(chunk)
+		}
+	case *types.AttributeValueMemberBOOL:
+		if v.Value {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+	case *types.AttributeValueMemberL:
+		for n, el := range v.Value {
+			if err := writeToHash(h, el); err != nil {
+				return fmt.Errorf("failed to hash list value %d: %w", n, err)
+			}
+		}
+	case *types.AttributeValueMemberM:
+		keys := make([]string, 0, len(v.Value))
+		for key := range v.Value {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if err := writeToHash(h, v.Value[key]); err != nil {
+				return fmt.Errorf("failed to hash map value for key %s: %w", key, err)
+			}
+		}
+	case *types.AttributeValueMemberN:
+		h.Write([]byte(v.Value))
+	case *types.AttributeValueMemberNS:
+		for _, el := range v.Value {
+			h.Write([]byte(el))
+		}
+	case *types.AttributeValueMemberNULL:
+		if v.Value {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+	case *types.AttributeValueMemberB:
+		h.Write(v.Value)
+	case *types.UnknownUnionMember:
+		h.Write(v.Value)
+	default:
+		return fmt.Errorf("unknown type %T", v)
+	}
+	return nil
+}
+
 func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	shouldOptimize := false
 	var tableName string
 	var partitionKey map[string]types.AttributeValue
-	var err error
-
 	switch params := in.Parameters.(type) {
 	case *dynamodb.PutItemInput:
 		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
 		tableName = aws.ToString(params.TableName)
-		partitionKey, err = lb.extractPartitionKey(params.Item, tableName)
-		if err != nil {
-			h := murmur.New()
-			h.Write([]byte(err.Error()))
-			return int64(h.Sum64()), nil
-		}
+		partitionKey = params.Item
 
 	case *dynamodb.UpdateItemInput:
 		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
