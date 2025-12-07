@@ -159,7 +159,7 @@ var (
 )
 
 const (
-	// KeyRouteAffinityWrite enables routing optimization for all write operations
+	// KeyRouteAffinityWrite enables routing optimization for conditional write operations
 	KeyRouteAffinityWrite = shared.KeyRouteAffinityWrite
 	// KeyRouteAffinityAll enables routing optimization for all operations including reads
 	KeyRouteAffinityAll = shared.KeyRouteAffinityAll
@@ -572,22 +572,51 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	var partitionKey map[string]types.AttributeValue
 	switch params := in.Parameters.(type) {
 	case *dynamodb.PutItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityWrite:
+			// Only conditional PUTS
+			shouldOptimize = params.ConditionExpression != nil || params.ConditionalOperator != "" || len(params.Expected) != 0
+		case KeyRouteAffinityAll:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Item
 
 	case *dynamodb.UpdateItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityWrite:
+			// Only conditional UPDATEs
+			shouldOptimize = params.ConditionExpression != nil || params.ConditionalOperator != "" || len(params.Expected) != 0
+		case KeyRouteAffinityAll:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
 	case *dynamodb.DeleteItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityWrite:
+			// Only conditional DELETs
+			shouldOptimize = params.ConditionExpression != nil || params.ConditionalOperator != "" || len(params.Expected) != 0
+		case KeyRouteAffinityAll:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
 	case *dynamodb.GetItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityAll:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 	}

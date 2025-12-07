@@ -202,7 +202,7 @@ Enable KeyRouteAffinity when:
 There are three KeyRouteAffinity modes:
 
 1. **`KeyRouteAffinityNone`** (default): Disabled. Requests are distributed randomly across nodes.
-2. **`KeyRouteAffinityWrite`**: Enables routing optimization for write operations (PutItem, UpdateItem, DeleteItem).
+2. **`KeyRouteAffinityWrite`**: Enables routing optimization for conditional write operations (PutItem, UpdateItem, DeleteItem).
 3. **`KeyRouteAffinityAll`**: Enables routing optimization for all operations including reads (GetItem).
 
 #### Automatic Partition Key Discovery
