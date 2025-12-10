@@ -73,7 +73,7 @@ type KeyRouteAffinity int
 const (
 	// KeyRouteAffinityNone disables routing optimization for all operations
 	KeyRouteAffinityNone KeyRouteAffinity = iota
-	// KeyRouteAffinityWrite enables routing optimization for all write operations (Put, Update, Delete)
+	// KeyRouteAffinityWrite enables routing optimization for conditional write operations (Put, Update, Delete)
 	KeyRouteAffinityWrite
 	// KeyRouteAffinityAll enables routing optimization for all operations including reads
 	KeyRouteAffinityAll
