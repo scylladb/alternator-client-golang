@@ -16,14 +16,14 @@ package logx
 type Level int
 
 const (
-	// Debug is a level for messages for verbose output useful in development.
-	Debug Level = iota
-	// Info is a level for informational messages for normal application operation.
-	Info
-	// Warn is a level for unexpected situations that are recoverable.
-	Warn
-	// Error is a level for problems that require attention.
-	Error
+	// DebugLevel is a level for messages for verbose output useful in development.
+	DebugLevel Level = iota
+	// InfoLevel is a level for informational messages for normal application operation.
+	InfoLevel
+	// WarnLevel is a level for unexpected situations that are recoverable.
+	WarnLevel
+	// ErrorLevel is a level for problems that require attention.
+	ErrorLevel
 )
 
 // Attr represents a key/value pair used for structured logging.
@@ -84,3 +84,19 @@ func (n Noop) Named(string) Logger { return n }
 
 // Enabled always returns false, indicating logging is disabled.
 func (Noop) Enabled(Level) bool { return false }
+
+// Error wraps an error with Attr, so that it could be attached to a log message
+func Error(err error) Attr {
+	return NamedError("error", err)
+}
+
+// NamedError constructs an attr that lazily stores err.Error() under the
+// provided key. Errors which also implement fmt.Formatter (like those produced
+// by github.com/pkg/errors) will also have their verbose representation stored
+// under key+"Verbose". If passed a nil error, the field is a no-op.
+//
+// For the common case in which the key is simply "error", the Error function
+// is shorter and less repetitive.
+func NamedError(key string, err error) Attr {
+	return Attr{Key: key, Value: err}
+}

@@ -57,22 +57,22 @@ func (l *Logger) Log(lvl logx.Level, msg string, attrs ...logx.Attr) {
 
 // Debug logs a message at the Debug level with optional structured attributes.
 func (l *Logger) Debug(msg string, attrs ...logx.Attr) {
-	l.Log(logx.Debug, msg, attrs...)
+	l.Log(logx.DebugLevel, msg, attrs...)
 }
 
 // Info logs a message at the Info level with optional structured attributes.
 func (l *Logger) Info(msg string, attrs ...logx.Attr) {
-	l.Log(logx.Info, msg, attrs...)
+	l.Log(logx.InfoLevel, msg, attrs...)
 }
 
 // Warn logs a message at the Warn level with optional structured attributes.
 func (l *Logger) Warn(msg string, attrs ...logx.Attr) {
-	l.Log(logx.Warn, msg, attrs...)
+	l.Log(logx.WarnLevel, msg, attrs...)
 }
 
 // Error logs a message at the Error level with optional structured attributes.
 func (l *Logger) Error(msg string, attrs ...logx.Attr) {
-	l.Log(logx.Error, msg, attrs...)
+	l.Log(logx.ErrorLevel, msg, attrs...)
 }
 
 // With returns a new Logger instance that includes the given attributes
@@ -95,11 +95,11 @@ func (l *Logger) Enabled(lvl logx.Level) bool {
 // toZapLevel converts a logx.Level to the corresponding zapcore.Level.
 func toZapLevel(l logx.Level) zapcore.Level {
 	switch l {
-	case logx.Debug:
+	case logx.DebugLevel:
 		return zapcore.DebugLevel
-	case logx.Info:
+	case logx.InfoLevel:
 		return zapcore.InfoLevel
-	case logx.Warn:
+	case logx.WarnLevel:
 		return zapcore.WarnLevel
 	default:
 		return zapcore.ErrorLevel
