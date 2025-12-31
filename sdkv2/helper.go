@@ -206,10 +206,7 @@ type Helper struct {
 	cfg           shared.Config
 	queryPlanSeed int64
 
-	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
-	// and potentially updated via auto-discovery from CreateTable operations.
-	pkInfoMutex    sync.RWMutex
-	pkInfoPerTable map[string]string
+	keyAffinity keyAffinity
 }
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
@@ -234,9 +231,9 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	}
 
 	return &Helper{
-		nodes:          nodes,
-		cfg:            *cfg,
-		pkInfoPerTable: pkInfoPerTable,
+		nodes:       nodes,
+		cfg:         *cfg,
+		keyAffinity: keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
 }
 
@@ -280,9 +277,9 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 		opt(&cfg)
 	}
 	return &Helper{
-		nodes:          lb.nodes,
-		cfg:            cfg,
-		pkInfoPerTable: lb.pkInfoPerTable,
+		nodes:       lb.nodes,
+		cfg:         cfg,
+		keyAffinity: lb.keyAffinity.Clone(),
 	}
 }
 
@@ -482,16 +479,16 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 
 // SetPartitionKeyName stores partition key information for a table in a thread-safe manner.
 func (lb *Helper) SetPartitionKeyName(tableName, keyName string) {
-	lb.pkInfoMutex.Lock()
-	defer lb.pkInfoMutex.Unlock()
-	lb.pkInfoPerTable[tableName] = keyName
+	lb.keyAffinity.pkInfoMutex.Lock()
+	defer lb.keyAffinity.pkInfoMutex.Unlock()
+	lb.keyAffinity.pkInfoPerTable[tableName] = keyName
 }
 
 // GetPartitionKeyName retrieves partition key information for a table in a thread-safe manner.
 func (lb *Helper) GetPartitionKeyName(tableName string) string {
-	lb.pkInfoMutex.RLock()
-	defer lb.pkInfoMutex.RUnlock()
-	return lb.pkInfoPerTable[tableName]
+	lb.keyAffinity.pkInfoMutex.RLock()
+	defer lb.keyAffinity.pkInfoMutex.RUnlock()
+	return lb.keyAffinity.pkInfoPerTable[tableName]
 }
 
 func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, tableName string) (int64, error) {
@@ -695,5 +692,41 @@ func (lb *Helper) learnPartitionKeysFromKeyMap(tableName string, key map[string]
 
 	if partitionKeyName != "" {
 		lb.SetPartitionKeyName(tableName, partitionKeyName)
+	}
+}
+
+type keyAffinity struct {
+	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
+	// and potentially updated via auto-discovery from CreateTable operations.
+	pkInfoMutex    sync.RWMutex
+	pkInfoPerTable map[string]string
+}
+
+// SetPartitionKeyName stores partition key information for a table in a thread-safe manner.
+func (k *keyAffinity) SetPartitionKeyName(tableName, keyName string) {
+	k.pkInfoMutex.Lock()
+	defer k.pkInfoMutex.Unlock()
+	k.pkInfoPerTable[tableName] = keyName
+}
+
+// GetPartitionKeyName retrieves partition key information for a table in a thread-safe manner.
+func (k *keyAffinity) GetPartitionKeyName(tableName string) string {
+	k.pkInfoMutex.RLock()
+	defer k.pkInfoMutex.RUnlock()
+	return k.pkInfoPerTable[tableName]
+}
+
+// Clone returns copy of keyAffinity.
+func (k *keyAffinity) Clone() keyAffinity {
+	k.pkInfoMutex.RLock()
+	defer k.pkInfoMutex.RUnlock()
+
+	pkInfoPerTable := make(map[string]string, len(k.pkInfoPerTable))
+	for t, v := range k.pkInfoPerTable {
+		pkInfoPerTable[t] = v
+	}
+
+	return keyAffinity{
+		pkInfoPerTable: pkInfoPerTable,
 	}
 }
