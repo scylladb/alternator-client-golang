@@ -9,6 +9,8 @@ on:
 jobs:
   add-issue-to-drivers-team:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Add issue ${{ github.event.issue.number }} to Drivers-Team github project
         uses: actions/add-to-project@v1.0.2
