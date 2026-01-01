@@ -15,6 +15,7 @@ import (
 
 	"github.com/aws/smithy-go"
 
+	"github.com/scylladb/alternator-client-golang/shared"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -323,6 +324,164 @@ func TestTLSSessionCache(t *testing.T) {
 		if len(cache.values) == 0 {
 			t.Fatalf("no ticket was learned")
 		}
+	})
+}
+
+func TestKeyRouteAffinityAutodiscovery(t *testing.T) {
+	t.Run("PlainHTTP", func(t *testing.T) {
+		testKeyRouteAffinityAutodiscovery(t, helper.WithPort(httpPort))
+	})
+	t.Run("SSL", func(t *testing.T) {
+		testKeyRouteAffinityAutodiscovery(
+			t,
+			helper.WithScheme("https"),
+			helper.WithPort(httpsPort),
+			helper.WithIgnoreServerCertificateError(true),
+		)
+	})
+}
+
+func testKeyRouteAffinityAutodiscovery(t *testing.T, opts ...helper.Option) {
+	t.Helper()
+
+	const tableName = "test_autodiscovery_table"
+
+	// Create helper with KeyRouteAffinity enabled but WITHOUT pre-configured partition key info
+	// This will test the autodiscovery feature
+	baseOpts := append([]helper.Option{
+		helper.WithKeyRouteAffinity(
+			shared.NewKeyRouteAffinityConfig(shared.KeyRouteAffinityAnyWrite),
+			// Note: NOT calling .WithPkInfo() here - we want to test autodiscovery
+		),
+		helper.WithCredentials("whatever", "secret"),
+	}, opts...)
+
+	h, err := helper.NewHelper(knownNodes, baseOpts...)
+	if err != nil {
+		t.Fatalf("failed to create alternator helper: %v", err)
+	}
+	defer h.Stop()
+
+	ddb, err := h.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("failed to create DynamoDB client: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Clean up any existing table
+	_, _ = ddb.DeleteTable(ctx, &dynamodb.DeleteTableInput{
+		TableName: aws.String(tableName),
+	})
+
+	// Create a table with a specific partition key name
+	_, err = ddb.CreateTable(
+		ctx,
+		&dynamodb.CreateTableInput{
+			TableName: aws.String(tableName),
+			KeySchema: []types.KeySchemaElement{
+				{
+					AttributeName: aws.String("UserID"),
+					KeyType:       "HASH",
+				},
+			},
+			AttributeDefinitions: []types.AttributeDefinition{
+				{
+					AttributeName: aws.String("UserID"),
+					AttributeType: "S",
+				},
+			},
+			ProvisionedThroughput: &types.ProvisionedThroughput{
+				ReadCapacityUnits:  aws.Int64(1),
+				WriteCapacityUnits: aws.Int64(1),
+			},
+		})
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	// Perform a simple write operation - this should trigger autodiscovery
+	item1, err := attributevalue.MarshalMap(map[string]interface{}{
+		"UserID": "user-001",
+		"Name":   "Alice",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal item: %v", err)
+	}
+
+	_, err = ddb.PutItem(
+		ctx,
+		&dynamodb.PutItemInput{
+			TableName: aws.String(tableName),
+			Item:      item1,
+		})
+	if err != nil {
+		t.Fatalf("failed to put first item (autodiscovery should happen here): %v", err)
+	}
+
+	// Perform another write to verify the key was cached and works correctly
+	item2, err := attributevalue.MarshalMap(map[string]interface{}{
+		"UserID": "user-002",
+		"Name":   "Bob",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal second item: %v", err)
+	}
+
+	_, err = ddb.PutItem(
+		ctx,
+		&dynamodb.PutItemInput{
+			TableName: aws.String(tableName),
+			Item:      item2,
+		})
+	if err != nil {
+		t.Fatalf("failed to put second item (should use cached partition key): %v", err)
+	}
+
+	// Verify the items were written correctly by reading them back
+	userIDKey1, err := attributevalue.Marshal("user-001")
+	if err != nil {
+		t.Fatalf("failed to marshal key: %v", err)
+	}
+
+	result1, err := ddb.GetItem(
+		ctx,
+		&dynamodb.GetItemInput{
+			TableName: aws.String(tableName),
+			Key: map[string]types.AttributeValue{
+				"UserID": userIDKey1,
+			},
+		})
+	if err != nil {
+		t.Fatalf("failed to read first record: %v", err)
+	}
+	if result1.Item == nil {
+		t.Errorf("first item not found - autodiscovery may have failed")
+	}
+
+	userIDKey2, err := attributevalue.Marshal("user-002")
+	if err != nil {
+		t.Fatalf("failed to marshal key: %v", err)
+	}
+
+	result2, err := ddb.GetItem(
+		ctx,
+		&dynamodb.GetItemInput{
+			TableName: aws.String(tableName),
+			Key: map[string]types.AttributeValue{
+				"UserID": userIDKey2,
+			},
+		})
+	if err != nil {
+		t.Fatalf("failed to read second record: %v", err)
+	}
+	if result2.Item == nil {
+		t.Errorf("second item not found - cached partition key may not be working")
+	}
+
+	// Clean up
+	_, _ = ddb.DeleteTable(ctx, &dynamodb.DeleteTableInput{
+		TableName: aws.String(tableName),
 	})
 }
 

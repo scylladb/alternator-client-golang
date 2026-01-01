@@ -44,6 +44,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
+	"github.com/scylladb/alternator-client-golang/shared/logx"
 	"github.com/scylladb/alternator-client-golang/shared/murmur"
 
 	"github.com/scylladb/alternator-client-golang/shared"
@@ -423,7 +424,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
 						}
 					} else {
-						lb.maybeUpdatePkInformation(in)
 						if pkHash, err := lb.getPkHash(in); err == nil {
 							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, pkHash)
 						} else {
@@ -477,31 +477,21 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	}
 }
 
-// SetPartitionKeyInfo stores partition key information for a table in a thread-safe manner.
-func (lb *Helper) SetPartitionKeyInfo(tableName, keyName string) {
-	lb.keyAffinity.SetPartitionKeyName(tableName, keyName)
-}
-
-// GetPartitionKeyInfo retrieves partition key information for a table in a thread-safe manner.
-func (lb *Helper) GetPartitionKeyInfo(tableName string) (string, bool) {
-	keyName := lb.keyAffinity.GetPartitionKeyName(tableName)
-	return keyName, keyName != ""
-}
-
 func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, tableName string) (int64, error) {
-	keyName, exists := lb.GetPartitionKeyInfo(tableName)
-	if !exists || len(values) == 0 {
+	pkName := lb.keyAffinity.GetPartitionKeyName(tableName)
+	if pkName == "" {
+		lb.triggerPKInformationUpdate(tableName)
 		return 0, fmt.Errorf("partition key information not found for table %s", tableName)
 	}
 
 	h := murmur.New()
 
-	val, ok := values[keyName]
+	keyValue, ok := values[pkName]
 	if !ok {
-		return 0, fmt.Errorf("value for key %s not found", keyName)
+		return 0, fmt.Errorf("value for key %s not found", pkName)
 	}
-	if err := writeToHash(h, val); err != nil {
-		return 0, fmt.Errorf("failed to hash value for key %s: %w", keyName, err)
+	if err := writeToHash(h, keyValue); err != nil {
+		return 0, fmt.Errorf("failed to hash value for key %s: %w", pkName, err)
 	}
 
 	return int64(h.Sum64()), nil
@@ -596,71 +586,61 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	return 0, fmt.Errorf("could not get a proper hash")
 }
 
-// maybeUpdatePkInformation updates partition key information from CreateTable operations
-// or learns from Get/Update/Delete operations if the table doesn't already have partition key info stored.
-func (lb *Helper) maybeUpdatePkInformation(in middleware.InitializeInput) {
-	switch params := in.Parameters.(type) {
-	case *dynamodb.CreateTableInput:
-		tableName := aws.ToString(params.TableName)
+// triggerPKInformationUpdate trigger background update of partition key information
+// it runs DescribeTable and reads PK information from it
+func (lb *Helper) triggerPKInformationUpdate(tableName string) {
+	lb.keyAffinity.pkInfoMutex.Lock()
+	if lb.keyAffinity.pkInfoIsUpdating {
+		lb.keyAffinity.pkInfoMutex.Unlock()
+		return
+	}
+	lb.keyAffinity.pkInfoIsUpdating = true
+	lb.keyAffinity.pkInfoMutex.Unlock()
+	logger := lb.cfg.Logger.Named("keyAffinity key info reader")
 
-		// Check if we already have partition key info for this table
-		if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
+	go func() {
+		defer func() {
+			lb.keyAffinity.pkInfoMutex.Lock()
+			lb.keyAffinity.pkInfoIsUpdating = false
+			lb.keyAffinity.pkInfoMutex.Unlock()
+		}()
+
+		cl, err := lb.NewDynamoDB()
+		if err != nil {
+			logger.Error("failed to create new DynamoDB client", logx.Error(err))
 			return
 		}
 
-		// Extract the partition key (HASH key) from KeySchema
-		var partitionKeyName string
-		for _, key := range params.KeySchema {
-			if key.KeyType == types.KeyTypeHash {
-				partitionKeyName = aws.ToString(key.AttributeName)
-				break
+		res, err := cl.DescribeTable(context.Background(), &dynamodb.DescribeTableInput{
+			TableName: aws.String(tableName),
+		})
+		if err != nil {
+			logger.Error("failed to describe table", logx.Error(err), logx.A("tableName", tableName))
+			return
+		}
+
+		for _, key := range res.Table.KeySchema {
+			if keyName := aws.ToString(key.AttributeName); key.KeyType == types.KeyTypeHash && keyName != "" {
+				lb.keyAffinity.SetPartitionKeyName(tableName, keyName)
+				logger.Debug(
+					"successfully learned key information for table",
+					logx.A("tableName", tableName),
+					logx.A("key", keyName),
+				)
+				return
 			}
 		}
 
-		if partitionKeyName != "" {
-			lb.SetPartitionKeyInfo(tableName, partitionKeyName)
-		}
-
-	case *dynamodb.GetItemInput:
-		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
-
-	case *dynamodb.UpdateItemInput:
-		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
-
-	case *dynamodb.DeleteItemInput:
-		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
-	}
-}
-
-// learnPartitionKeysFromKeyMap extracts and stores partition key names from a Key map.
-// The key names are sorted alphabetically for consistency since map iteration order is random.
-func (lb *Helper) learnPartitionKeysFromKeyMap(tableName string, key map[string]types.AttributeValue) {
-	// Check if we already have partition key info for this table
-	if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
-		return
-	}
-
-	if len(key) == 0 {
-		return
-	}
-
-	// Extract the first key name (assuming single partition key)
-	var partitionKeyName string
-	for keyName := range key {
-		partitionKeyName = keyName
-		break
-	}
-
-	if partitionKeyName != "" {
-		lb.SetPartitionKeyInfo(tableName, partitionKeyName)
-	}
+		logger.Error("failed to learn key information for table", logx.A("tableName", tableName))
+	}()
 }
 
 type keyAffinity struct {
 	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
 	// and potentially updated via auto-discovery from CreateTable operations.
-	pkInfoMutex    sync.RWMutex
-	pkInfoPerTable map[string]string
+	pkInfoMutex      sync.RWMutex
+	pkInfoPerTable   map[string]string
+	pkInfoIsUpdating bool
 }
 
 // SetPartitionKeyName stores partition key information for a table in a thread-safe manner.
