@@ -71,12 +71,22 @@ type Config struct {
 type KeyRouteAffinity int
 
 const (
-	// KeyRouteAffinityNone disables routing optimization for all operations
-	KeyRouteAffinityNone KeyRouteAffinity = iota
-	// KeyRouteAffinityWrite enables routing optimization for all write operations (Put, Update, Delete)
+	_ KeyRouteAffinity = iota
+	// KeyRouteAffinityWrite enables route affinity for conditional write operations, writes that require read before write
+	// Deprecated: deprecated ude to the confusing name, use KeyRouteAffinityRMW instead
 	KeyRouteAffinityWrite
-	// KeyRouteAffinityAll enables routing optimization for all operations including reads
+	// KeyRouteAffinityAll enables route affinity for all write operations
+	// Deprecated: deprecated ude to the confusing name, use KeyRouteAffinityAnyWrite instead
 	KeyRouteAffinityAll
+)
+
+const (
+	// KeyRouteAffinityNone disables route affinity for all operations
+	KeyRouteAffinityNone KeyRouteAffinity = iota
+	// KeyRouteAffinityRMW enables route affinity for conditional write operations, writes that require read before write
+	KeyRouteAffinityRMW
+	// KeyRouteAffinityAnyWrite enables route affinity for all write operations
+	KeyRouteAffinityAnyWrite
 )
 
 // KeyRouteAffinityConfig holds configuration for routing optimization heuristics
