@@ -35,7 +35,6 @@ import (
 	"hash"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"sync"
 
@@ -45,6 +44,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
+	"github.com/scylladb/alternator-client-golang/shared/logx"
 	"github.com/scylladb/alternator-client-golang/shared/murmur"
 
 	"github.com/scylladb/alternator-client-golang/shared"
@@ -159,10 +159,18 @@ var (
 )
 
 const (
-	// KeyRouteAffinityWrite enables routing optimization for all write operations
+	// KeyRouteAffinityNone disables route affinity for all operations
+	KeyRouteAffinityNone = shared.KeyRouteAffinityNone
+	// KeyRouteAffinityWrite enables route affinity for conditional write operations, writes that require read before write
+	// Deprecated: deprecated ude to the confusing name, use KeyRouteAffinityRMW instead
 	KeyRouteAffinityWrite = shared.KeyRouteAffinityWrite
-	// KeyRouteAffinityAll enables routing optimization for all operations including reads
+	// KeyRouteAffinityAll enables route affinity for all write operations
+	// Deprecated: deprecated ude to the confusing name, use KeyRouteAffinityAnyWrite instead
 	KeyRouteAffinityAll = shared.KeyRouteAffinityAll
+	// KeyRouteAffinityRMW enables route affinity for conditional write operations, writes that require read before write
+	KeyRouteAffinityRMW = shared.KeyRouteAffinityRMW
+	// KeyRouteAffinityAnyWrite enables route affinity for all write operations
+	KeyRouteAffinityAnyWrite = shared.KeyRouteAffinityAnyWrite
 )
 
 // AlternatorNodesSource an interface for nodes list provider
@@ -199,10 +207,7 @@ type Helper struct {
 	cfg           shared.Config
 	queryPlanSeed int64
 
-	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
-	// and potentially updated via auto-discovery from CreateTable operations.
-	pkInfoMutex    sync.RWMutex
-	pkInfoPerTable map[string][]string
+	keyAffinity keyAffinity
 }
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
@@ -219,17 +224,17 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	}
 
 	// Pre-populate runtime partition key information from config
-	pkInfoPerTable := make(map[string][]string)
+	pkInfoPerTable := make(map[string]string)
 	if cfg.KeyRouteAffinity.PkInfoPerTable != nil {
-		for table, keys := range cfg.KeyRouteAffinity.PkInfoPerTable {
-			pkInfoPerTable[table] = slices.Clone(keys)
+		for table, keyName := range cfg.KeyRouteAffinity.PkInfoPerTable {
+			pkInfoPerTable[table] = keyName
 		}
 	}
 
 	return &Helper{
-		nodes:          nodes,
-		cfg:            *cfg,
-		pkInfoPerTable: pkInfoPerTable,
+		nodes:       nodes,
+		cfg:         *cfg,
+		keyAffinity: keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
 }
 
@@ -273,9 +278,9 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 		opt(&cfg)
 	}
 	return &Helper{
-		nodes:          lb.nodes,
-		cfg:            cfg,
-		pkInfoPerTable: lb.pkInfoPerTable,
+		nodes:       lb.nodes,
+		cfg:         cfg,
+		keyAffinity: lb.keyAffinity.Clone(),
 	}
 }
 
@@ -412,14 +417,13 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
-					if lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityNone {
+					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						if lb.queryPlanSeed == 0 {
 							qp = shared.NewLazyQueryPlan(lb.nodes)
 						} else {
 							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
 						}
 					} else {
-						lb.maybeUpdatePkInformation(in)
 						if pkHash, err := lb.getPkHash(in); err == nil {
 							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, pkHash)
 						} else {
@@ -473,37 +477,21 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	}
 }
 
-// SetPartitionKeyInfo stores partition key information for a table in a thread-safe manner.
-func (lb *Helper) SetPartitionKeyInfo(tableName string, keys []string) {
-	lb.pkInfoMutex.Lock()
-	defer lb.pkInfoMutex.Unlock()
-	lb.pkInfoPerTable[tableName] = keys
-}
-
-// GetPartitionKeyInfo retrieves partition key information for a table in a thread-safe manner.
-func (lb *Helper) GetPartitionKeyInfo(tableName string) ([]string, bool) {
-	lb.pkInfoMutex.RLock()
-	defer lb.pkInfoMutex.RUnlock()
-	keys, ok := lb.pkInfoPerTable[tableName]
-	return keys, ok
-}
-
 func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, tableName string) (int64, error) {
-	pkInfo, exists := lb.GetPartitionKeyInfo(tableName)
-	if !exists || len(values) == 0 {
+	pkName := lb.keyAffinity.GetPartitionKeyName(tableName)
+	if pkName == "" {
+		lb.triggerPKInformationUpdate(tableName)
 		return 0, fmt.Errorf("partition key information not found for table %s", tableName)
 	}
 
 	h := murmur.New()
 
-	for _, keyName := range pkInfo {
-		val, ok := values[keyName]
-		if !ok {
-			return 0, fmt.Errorf("value for key %s not found", keyName)
-		}
-		if err := writeToHash(h, val); err != nil {
-			return 0, fmt.Errorf("failed to hash value for key %s: %w", keyName, err)
-		}
+	keyValue, ok := values[pkName]
+	if !ok {
+		return 0, fmt.Errorf("value for key %s not found", pkName)
+	}
+	if err := writeToHash(h, keyValue); err != nil {
+		return 0, fmt.Errorf("failed to hash value for key %s: %w", pkName, err)
 	}
 
 	return int64(h.Sum64()), nil
@@ -512,20 +500,35 @@ func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, table
 func writeToHash(h hash.Hash64, val types.AttributeValue) error {
 	switch v := val.(type) {
 	case *types.AttributeValueMemberS:
-		h.Write([]byte(v.Value))
+		_, err := h.Write([]byte(v.Value))
+		if err != nil {
+			return fmt.Errorf("failed to hash string: %w", err)
+		}
 	case *types.AttributeValueMemberSS:
-		for _, chunk := range v.Value {
-			h.Write([]byte(chunk))
+		for id, chunk := range v.Value {
+			_, err := h.Write([]byte(chunk))
+			if err != nil {
+				return fmt.Errorf("failed to hash string set value %d: %w", id, err)
+			}
 		}
 	case *types.AttributeValueMemberBS:
-		for _, chunk := range v.Value {
-			h.Write(chunk)
+		for id, chunk := range v.Value {
+			_, err := h.Write(chunk)
+			if err != nil {
+				return fmt.Errorf("failed to hash binary set value %d: %w", id, err)
+			}
 		}
 	case *types.AttributeValueMemberBOOL:
 		if v.Value {
-			h.Write([]byte{1})
+			_, err := h.Write([]byte{1})
+			if err != nil {
+				return fmt.Errorf("failed to hash boolean value: %w", err)
+			}
 		} else {
-			h.Write([]byte{0})
+			_, err := h.Write([]byte{0})
+			if err != nil {
+				return fmt.Errorf("failed to hash boolean value: %w", err)
+			}
 		}
 	case *types.AttributeValueMemberL:
 		for n, el := range v.Value {
@@ -540,26 +543,47 @@ func writeToHash(h hash.Hash64, val types.AttributeValue) error {
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
+			if _, err := h.Write([]byte(key)); err != nil {
+				return fmt.Errorf("failed to hash map value for key %q: %w", key, err)
+			}
 			if err := writeToHash(h, v.Value[key]); err != nil {
-				return fmt.Errorf("failed to hash map value for key %s: %w", key, err)
+				return fmt.Errorf("failed to hash map value for key %q: %w", key, err)
 			}
 		}
 	case *types.AttributeValueMemberN:
-		h.Write([]byte(v.Value))
+		_, err := h.Write([]byte(v.Value))
+		if err != nil {
+			return fmt.Errorf("failed to hash list value: %w", err)
+		}
 	case *types.AttributeValueMemberNS:
-		for _, el := range v.Value {
-			h.Write([]byte(el))
+		for id, el := range v.Value {
+			_, err := h.Write([]byte(el))
+			if err != nil {
+				return fmt.Errorf("failed to hash number set value %d: %w", id, err)
+			}
 		}
 	case *types.AttributeValueMemberNULL:
 		if v.Value {
-			h.Write([]byte{1})
+			_, err := h.Write([]byte{1})
+			if err != nil {
+				return fmt.Errorf("failed to hash null value: %w", err)
+			}
 		} else {
-			h.Write([]byte{0})
+			_, err := h.Write([]byte{0})
+			if err != nil {
+				return fmt.Errorf("failed to hash null value: %w", err)
+			}
 		}
 	case *types.AttributeValueMemberB:
-		h.Write(v.Value)
+		_, err := h.Write(v.Value)
+		if err != nil {
+			return fmt.Errorf("failed to hash boolean value: %w", err)
+		}
 	case *types.UnknownUnionMember:
-		h.Write(v.Value)
+		_, err := h.Write(v.Value)
+		if err != nil {
+			return fmt.Errorf("failed to hash union value: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown type %T", v)
 	}
@@ -572,82 +596,210 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	var partitionKey map[string]types.AttributeValue
 	switch params := in.Parameters.(type) {
 	case *dynamodb.PutItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW:
+			shouldOptimize = doesPutNeedReadBeforeWrite(params)
+		case KeyRouteAffinityAnyWrite:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Item
 
 	case *dynamodb.UpdateItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW:
+			shouldOptimize = doesUpdateNeedReadBeforeWrite(params)
+		case KeyRouteAffinityAnyWrite:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
 	case *dynamodb.DeleteItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW:
+			shouldOptimize = doesDeleteNeedReadBeforeWrite(params)
+		case KeyRouteAffinityAnyWrite:
+			shouldOptimize = true
+		default:
+			shouldOptimize = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
-	case *dynamodb.GetItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
-		tableName = aws.ToString(params.TableName)
-		partitionKey = params.Key
+	case *dynamodb.BatchWriteItemInput:
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW, KeyRouteAffinityAnyWrite:
+			// In the case of multi table batch alternator makes it LWT if any table involved is configured to do so
+			// But here for sake of simplicity we apply session-wide configuration to all requests
+			shouldOptimize = true
+		outer:
+			for table, req := range params.RequestItems {
+				tableName = table
+				for _, op := range req {
+					if op.DeleteRequest != nil {
+						partitionKey = op.DeleteRequest.Key
+						break outer
+					}
+					if op.PutRequest != nil {
+						partitionKey = op.PutRequest.Item
+						break outer
+					}
+				}
+			}
+		default:
+			shouldOptimize = false
+		}
 	}
 
-	if shouldOptimize && partitionKey != nil {
-		return lb.hashPartitionKey(partitionKey, tableName)
+	if shouldOptimize && tableName != "" {
+		if partitionKey != nil {
+			return lb.hashPartitionKey(partitionKey, tableName)
+		}
 	}
+
 	return 0, fmt.Errorf("could not get a proper hash")
 }
 
-// maybeUpdatePkInformation updates partition key information from CreateTable operations
-// or learns from Get/Update/Delete operations if the table doesn't already have partition key info stored.
-func (lb *Helper) maybeUpdatePkInformation(in middleware.InitializeInput) {
-	switch params := in.Parameters.(type) {
-	case *dynamodb.CreateTableInput:
-		tableName := aws.ToString(params.TableName)
+// triggerPKInformationUpdate trigger background update of partition key information
+// it runs DescribeTable and reads PK information from it
+func (lb *Helper) triggerPKInformationUpdate(tableName string) {
+	lb.keyAffinity.pkInfoMutex.Lock()
+	if lb.keyAffinity.pkInfoIsUpdating {
+		lb.keyAffinity.pkInfoMutex.Unlock()
+		return
+	}
+	lb.keyAffinity.pkInfoIsUpdating = true
+	lb.keyAffinity.pkInfoMutex.Unlock()
+	logger := lb.cfg.Logger.Named("keyAffinity key info reader")
 
-		// Check if we already have partition key info for this table
-		if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
+	go func() {
+		defer func() {
+			lb.keyAffinity.pkInfoMutex.Lock()
+			lb.keyAffinity.pkInfoIsUpdating = false
+			lb.keyAffinity.pkInfoMutex.Unlock()
+		}()
+
+		cl, err := lb.NewDynamoDB()
+		if err != nil {
+			logger.Error("failed to create new DynamoDB client", logx.Error(err))
 			return
 		}
 
-		var partitionKeys []string
-		for _, key := range params.KeySchema {
-			partitionKeys = append(partitionKeys, aws.ToString(key.AttributeName))
+		res, err := cl.DescribeTable(context.Background(), &dynamodb.DescribeTableInput{
+			TableName: aws.String(tableName),
+		})
+		if err != nil {
+			logger.Error("failed to describe table", logx.Error(err), logx.A("tableName", tableName))
+			return
 		}
 
-		if len(partitionKeys) > 0 {
-			lb.SetPartitionKeyInfo(tableName, partitionKeys)
+		for _, key := range res.Table.KeySchema {
+			if keyName := aws.ToString(key.AttributeName); key.KeyType == types.KeyTypeHash && keyName != "" {
+				lb.keyAffinity.SetPartitionKeyName(tableName, keyName)
+				logger.Debug(
+					"successfully learned key information for table",
+					logx.A("tableName", tableName),
+					logx.A("key", keyName),
+				)
+				return
+			}
 		}
 
-	case *dynamodb.GetItemInput:
-		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
+		logger.Error("failed to learn key information for table", logx.A("tableName", tableName))
+	}()
+}
 
-	case *dynamodb.UpdateItemInput:
-		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
+type keyAffinity struct {
+	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
+	// and potentially updated via auto-discovery from CreateTable operations.
+	pkInfoMutex      sync.RWMutex
+	pkInfoPerTable   map[string]string
+	pkInfoIsUpdating bool
+}
 
-	case *dynamodb.DeleteItemInput:
-		lb.learnPartitionKeysFromKeyMap(aws.ToString(params.TableName), params.Key)
+// SetPartitionKeyName stores partition key information for a table in a thread-safe manner.
+func (k *keyAffinity) SetPartitionKeyName(tableName, keyName string) {
+	k.pkInfoMutex.Lock()
+	defer k.pkInfoMutex.Unlock()
+	k.pkInfoPerTable[tableName] = keyName
+}
+
+// GetPartitionKeyName retrieves partition key information for a table in a thread-safe manner.
+func (k *keyAffinity) GetPartitionKeyName(tableName string) string {
+	k.pkInfoMutex.RLock()
+	defer k.pkInfoMutex.RUnlock()
+	return k.pkInfoPerTable[tableName]
+}
+
+// Clone returns copy of keyAffinity.
+func (k *keyAffinity) Clone() keyAffinity {
+	k.pkInfoMutex.RLock()
+	defer k.pkInfoMutex.RUnlock()
+
+	pkInfoPerTable := make(map[string]string, len(k.pkInfoPerTable))
+	for t, v := range k.pkInfoPerTable {
+		pkInfoPerTable[t] = v
+	}
+
+	return keyAffinity{
+		pkInfoPerTable: pkInfoPerTable,
 	}
 }
 
-// learnPartitionKeysFromKeyMap extracts and stores partition key names from a Key map.
-// The key names are sorted alphabetically for consistency since map iteration order is random.
-func (lb *Helper) learnPartitionKeysFromKeyMap(tableName string, key map[string]types.AttributeValue) {
-	// Check if we already have partition key info for this table
-	if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
-		return
+// doesUpdateNeedReadBeforeWrite checks if UpdateItem operation will be executed as LWT on Alternator side
+// it is done to be inline with following Alternator code:
+// https://github.com/scylladb/scylladb/blob/3c376d1b6470bdbe6e66ee32f6a680a87e36a91f/alternator/executor.cc#L3941-L3971
+func doesUpdateNeedReadBeforeWrite(u *dynamodb.UpdateItemInput) bool {
+	if !isEmptyString(u.UpdateExpression) || !isEmptyString(u.ConditionExpression) || len(u.Expected) != 0 {
+		return true
 	}
 
-	if len(key) == 0 {
-		return
+	switch u.ReturnValues {
+	case types.ReturnValueNone, types.ReturnValueUpdatedNew, "":
+		break
+	default:
+		return true
+	}
+	for _, act := range u.AttributeUpdates {
+		switch act.Action {
+		case types.AttributeActionAdd:
+			return true
+		case types.AttributeActionDelete:
+			if act.Value != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// doesDeleteNeedReadBeforeWrite checks if DeleteItem operation will be executed as LWT on Alternator side
+// it is done to be inline with following Alternator code:
+// https://github.com/scylladb/scylladb/blob/3c376d1b6470bdbe6e66ee32f6a680a87e36a91f/alternator/executor.cc#L2926-L2930
+func doesDeleteNeedReadBeforeWrite(d *dynamodb.DeleteItemInput) bool {
+	if len(d.Expected) != 0 || !isEmptyString(d.ConditionExpression) {
+		return true
 	}
 
-	// Extract and sort key names for consistency
-	partitionKeys := make([]string, 0, len(key))
-	for keyName := range key {
-		partitionKeys = append(partitionKeys, keyName)
-	}
-	slices.Sort(partitionKeys)
+	return d.ReturnValues == types.ReturnValueAllOld
+}
 
-	lb.SetPartitionKeyInfo(tableName, partitionKeys)
+// doesPutNeedReadBeforeWrite checks if PutItem operation will be executed as LWT on Alternator side
+// it is done to be inline with following Alternator code:
+// https://github.com/scylladb/scylladb/blob/3c376d1b6470bdbe6e66ee32f6a680a87e36a91f/alternator/executor.cc#L2826-L2830
+func doesPutNeedReadBeforeWrite(p *dynamodb.PutItemInput) bool {
+	if len(p.Expected) != 0 || !isEmptyString(p.ConditionExpression) {
+		return true
+	}
+
+	return p.ReturnValues == types.ReturnValueAllOld
+}
+
+func isEmptyString(s *string) bool {
+	return s == nil || len(*s) == 0
 }
