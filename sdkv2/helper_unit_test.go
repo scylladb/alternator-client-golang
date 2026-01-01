@@ -571,8 +571,8 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 				name: "KeyRouteAffinityWrite",
 				optimizeOption: func() Option {
 					return WithKeyRouteAffinity(
-						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string][]string{
-							"test-table": {"id"},
+						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+							"test-table": "id",
 						}),
 					)
 				},
@@ -582,8 +582,8 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 				name: "KeyRouteAffinityAll",
 				optimizeOption: func() Option {
 					return WithKeyRouteAffinity(
-						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string][]string{
-							"test-table": {"id"},
+						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
+							"test-table": "id",
 						}),
 					)
 				},
@@ -713,8 +713,8 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 				WithCredentials("test-key", "test-secret"),
 				WithKeyRouteAffinity(
-					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string][]string{
-						"test-table": {"id"},
+					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
+						"test-table": "id",
 					}),
 				),
 			)
@@ -790,8 +790,8 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 				WithCredentials("test-key", "test-secret"),
 				WithKeyRouteAffinity(
-					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string][]string{
-						"test-table": {"id"},
+					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+						"test-table": "id",
 					}),
 				),
 			)
