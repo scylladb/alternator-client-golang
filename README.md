@@ -215,7 +215,8 @@ The driver automatically learns partition key information from your DynamoDB ope
 
 #### Pre-Configuring Partition Keys with WithPkInfo
 
-If your workload consists **only of PutItem operations**, the driver cannot automatically discover partition keys. In this case, use `WithPkInfo` to pre-configure the partition key columns:
+If your workload consists **only of PutItem operations**, the driver cannot automatically discover partition key. 
+In this case, use `WithPkInfo` to pre-configure the partition key column:
 
 ```go
 h, err := helper.NewHelper(
@@ -224,8 +225,8 @@ h, err := helper.NewHelper(
     helper.WithCredentials("whatever", "secret"),
     helper.WithKeyRouteAffinity(
         helper.NewKeyRouteAffinityConfig(helper.KeyRouteAffinityWrite).
-            WithPkInfo(map[string][]string{
-                "users":  {"userId"},
+            WithPkInfo(map[string]string{
+                "users":  "userId",
             }),
     ),
 )
@@ -235,8 +236,6 @@ h, err := helper.NewHelper(
 - ✅ Your workload is **PutItem-only** and you want routing optimization from the first request
 - ✅ You want to avoid the small overhead of auto-discovery
 - ✅ You know your table schemas upfront and want explicit configuration
-
-**Important**: For composite keys in `WithPkInfo`, the order doesn't matter - the driver will sort them alphabetically internally for consistent hashing.
 
 ### Decrypting TLS
 
