@@ -512,20 +512,35 @@ func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, table
 func writeToHash(h hash.Hash64, val types.AttributeValue) error {
 	switch v := val.(type) {
 	case *types.AttributeValueMemberS:
-		h.Write([]byte(v.Value))
+		_, err := h.Write([]byte(v.Value))
+		if err != nil {
+			return fmt.Errorf("failed to hash string: %w", err)
+		}
 	case *types.AttributeValueMemberSS:
-		for _, chunk := range v.Value {
-			h.Write([]byte(chunk))
+		for id, chunk := range v.Value {
+			_, err := h.Write([]byte(chunk))
+			if err != nil {
+				return fmt.Errorf("failed to hash string set value %d: %w", id, err)
+			}
 		}
 	case *types.AttributeValueMemberBS:
-		for _, chunk := range v.Value {
-			h.Write(chunk)
+		for id, chunk := range v.Value {
+			_, err := h.Write(chunk)
+			if err != nil {
+				return fmt.Errorf("failed to hash binary set value %d: %w", id, err)
+			}
 		}
 	case *types.AttributeValueMemberBOOL:
 		if v.Value {
-			h.Write([]byte{1})
+			_, err := h.Write([]byte{1})
+			if err != nil {
+				return fmt.Errorf("failed to hash boolean value: %w", err)
+			}
 		} else {
-			h.Write([]byte{0})
+			_, err := h.Write([]byte{0})
+			if err != nil {
+				return fmt.Errorf("failed to hash boolean value: %w", err)
+			}
 		}
 	case *types.AttributeValueMemberL:
 		for n, el := range v.Value {
@@ -540,26 +555,47 @@ func writeToHash(h hash.Hash64, val types.AttributeValue) error {
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
+			if _, err := h.Write([]byte(key)); err != nil {
+				return fmt.Errorf("failed to hash map value for key %q: %w", key, err)
+			}
 			if err := writeToHash(h, v.Value[key]); err != nil {
-				return fmt.Errorf("failed to hash map value for key %s: %w", key, err)
+				return fmt.Errorf("failed to hash map value for key %q: %w", key, err)
 			}
 		}
 	case *types.AttributeValueMemberN:
-		h.Write([]byte(v.Value))
+		_, err := h.Write([]byte(v.Value))
+		if err != nil {
+			return fmt.Errorf("failed to hash list value: %w", err)
+		}
 	case *types.AttributeValueMemberNS:
-		for _, el := range v.Value {
-			h.Write([]byte(el))
+		for id, el := range v.Value {
+			_, err := h.Write([]byte(el))
+			if err != nil {
+				return fmt.Errorf("failed to hash number set value %d: %w", id, err)
+			}
 		}
 	case *types.AttributeValueMemberNULL:
 		if v.Value {
-			h.Write([]byte{1})
+			_, err := h.Write([]byte{1})
+			if err != nil {
+				return fmt.Errorf("failed to hash null value: %w", err)
+			}
 		} else {
-			h.Write([]byte{0})
+			_, err := h.Write([]byte{0})
+			if err != nil {
+				return fmt.Errorf("failed to hash null value: %w", err)
+			}
 		}
 	case *types.AttributeValueMemberB:
-		h.Write(v.Value)
+		_, err := h.Write(v.Value)
+		if err != nil {
+			return fmt.Errorf("failed to hash boolean value: %w", err)
+		}
 	case *types.UnknownUnionMember:
-		h.Write(v.Value)
+		_, err := h.Write(v.Value)
+		if err != nil {
+			return fmt.Errorf("failed to hash union value: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown type %T", v)
 	}
