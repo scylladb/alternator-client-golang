@@ -159,10 +159,18 @@ var (
 )
 
 const (
-	// KeyRouteAffinityWrite enables routing optimization for all write operations
+	// KeyRouteAffinityNone disables route affinity for all operations
+	KeyRouteAffinityNone = shared.KeyRouteAffinityNone
+	// KeyRouteAffinityWrite enables route affinity for conditional write operations, writes that require read before write
+	// Deprecated: deprecated ude to the confusing name, use KeyRouteAffinityRMW instead
 	KeyRouteAffinityWrite = shared.KeyRouteAffinityWrite
-	// KeyRouteAffinityAll enables routing optimization for all operations including reads
+	// KeyRouteAffinityAll enables route affinity for all write operations
+	// Deprecated: deprecated ude to the confusing name, use KeyRouteAffinityAnyWrite instead
 	KeyRouteAffinityAll = shared.KeyRouteAffinityAll
+	// KeyRouteAffinityRMW enables route affinity for conditional write operations, writes that require read before write
+	KeyRouteAffinityRMW = shared.KeyRouteAffinityRMW
+	// KeyRouteAffinityAnyWrite enables route affinity for all write operations
+	KeyRouteAffinityAnyWrite = shared.KeyRouteAffinityAnyWrite
 )
 
 // AlternatorNodesSource an interface for nodes list provider
@@ -412,7 +420,7 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
-					if lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityNone {
+					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						if lb.queryPlanSeed == 0 {
 							qp = shared.NewLazyQueryPlan(lb.nodes)
 						} else {
@@ -572,22 +580,22 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	var partitionKey map[string]types.AttributeValue
 	switch params := in.Parameters.(type) {
 	case *dynamodb.PutItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityRMW || lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Item
 
 	case *dynamodb.UpdateItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityRMW || lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
 	case *dynamodb.DeleteItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityWrite || lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityRMW || lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
 	case *dynamodb.GetItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == shared.KeyRouteAffinityAll
+		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 	}
