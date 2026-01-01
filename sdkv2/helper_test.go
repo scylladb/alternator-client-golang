@@ -12,9 +12,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/smithy-go"
 
+	"github.com/scylladb/alternator-client-golang/shared"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -326,8 +328,21 @@ func TestTLSSessionCache(t *testing.T) {
 	})
 }
 
-func testDynamoDBOperations(t *testing.T, opts ...helper.Option) {
-	t.Helper()
+func TestKeyRouteAffinityAutodiscovery(t *testing.T) {
+	t.Run("PlainHTTP", func(t *testing.T) {
+		testKeyRouteAffinityAutodiscovery(t, helper.WithPort(httpPort))
+	})
+	t.Run("SSL", func(t *testing.T) {
+		testKeyRouteAffinityAutodiscovery(
+			t,
+			helper.WithScheme("https"),
+			helper.WithPort(httpsPort),
+			helper.WithIgnoreServerCertificateError(true),
+		)
+	})
+}
+
+func testDynamoDBOperations(t *testing.T, opts ...helper.Option) { //nolint: thelper // it is not a helper
 
 	const tableName = "test_table"
 	h, err := helper.NewHelper(knownNodes, opts...)
@@ -420,5 +435,101 @@ func testDynamoDBOperations(t *testing.T, opts ...helper.Option) {
 		})
 	if err != nil {
 		t.Errorf("failed to delete record: %v", err)
+	}
+}
+
+func testKeyRouteAffinityAutodiscovery(t *testing.T, opts ...helper.Option) { //nolint: thelper // it is not a helper
+	const tableName = "test_autodiscovery_table"
+
+	baseOpts := append([]helper.Option{
+		helper.WithKeyRouteAffinity(
+			shared.NewKeyRouteAffinityConfig(shared.KeyRouteAffinityAnyWrite),
+			// Note: NOT calling .WithPkInfo() here - we want to test autodiscovery
+		),
+		helper.WithCredentials("whatever", "secret"),
+	}, opts...)
+
+	h, err := helper.NewHelper(knownNodes, baseOpts...)
+	if err != nil {
+		t.Fatalf("failed to create alternator helper: %v", err)
+	}
+	defer h.Stop()
+
+	err = h.UpdateLiveNodes()
+	if err != nil {
+		t.Fatalf("failed to update live nodes: %v", err)
+	}
+
+	ddb, err := h.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("failed to create DynamoDB client: %v", err)
+	}
+
+	ctx := context.Background()
+
+	if h.GetPartitionKeyName(tableName) != "" {
+		t.Fatalf("pk information for table %q should not exist", tableName)
+	}
+
+	_, _ = ddb.DeleteTable(ctx, &dynamodb.DeleteTableInput{
+		TableName: aws.String(tableName),
+	})
+
+	_, err = ddb.CreateTable(
+		ctx,
+		&dynamodb.CreateTableInput{
+			TableName: aws.String(tableName),
+			KeySchema: []types.KeySchemaElement{
+				{
+					AttributeName: aws.String("UserID"),
+					KeyType:       types.KeyTypeHash,
+				},
+				{
+					AttributeName: aws.String("UserName"),
+					KeyType:       types.KeyTypeRange,
+				},
+			},
+			AttributeDefinitions: []types.AttributeDefinition{
+				{
+					AttributeName: aws.String("UserID"),
+					AttributeType: "S",
+				},
+				{
+					AttributeName: aws.String("UserName"),
+					AttributeType: "S",
+				},
+			},
+			ProvisionedThroughput: &types.ProvisionedThroughput{
+				ReadCapacityUnits:  aws.Int64(1),
+				WriteCapacityUnits: aws.Int64(1),
+			},
+		})
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	item, err := attributevalue.MarshalMap(map[string]interface{}{
+		"UserID":   "SomeUser",
+		"UserName": "some-user-name",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal item: %v", err)
+	}
+	_, err = ddb.PutItem(
+		ctx,
+		&dynamodb.PutItemInput{
+			TableName: aws.String(tableName),
+			Item:      item,
+		})
+	if err != nil {
+		t.Fatalf("failed to get item: %v", err)
+	}
+
+	endTime := time.Now().Add(5 * time.Second)
+	for keyPresent := false; !keyPresent; keyPresent = h.GetPartitionKeyName(tableName) != "" {
+		time.Sleep(10 * time.Millisecond)
+		if time.Now().After(endTime) {
+			t.Fatalf("timeout waiting for key")
+		}
 	}
 }

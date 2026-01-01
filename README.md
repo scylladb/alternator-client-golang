@@ -179,7 +179,7 @@ To create a new Gzip configuration, use `NewGzipConfig()`. You can also set comp
 When using Lightweight Transactions (LWT) in ScyllaDB/Alternator, routing requests for the same partition key to the same coordinator node can significantly improve performance.
 This is because LWT operations require consensus among replicas, and using the same coordinator reduces coordination overhead.
 KeyRouteAffnity is a way to reduce this overhead by ensuring that two queries targeting same partition key will be scheduled to the same coordinator.
-Instead of using random selection of nodes in a round-robin fassion it provides a way to have a deterministic, idempotent selection of nodes basing on PK.
+Instead of using random selection of nodes in a round-robin fashion it provides a way to have a deterministic, idempotent selection of nodes basing on PK.
 
 #### Alternator Write Isolation Modes
 
@@ -207,16 +207,14 @@ There are three KeyRouteAffinity modes:
 
 #### Automatic Partition Key Discovery
 
-The driver automatically learns partition key information from your DynamoDB operations:
-
-- **CreateTable**: Extracts partition keys from `KeySchema`
-- **GetItem, UpdateItem, DeleteItem**: Learns from the `Key` parameter (keys are sorted alphabetically for consistency)
-- **PutItem**: ❌ **Cannot auto-discover** - the `Item` parameter doesn't distinguish between partition keys and regular attributes
+The driver automatically discovers the partition key.
+It periodically runs DescribeTable in the background to retrieve the partition key name.
+Until the partition key is discovered, operations run without partition-key optimizations.
 
 #### Pre-Configuring Partition Keys with WithPkInfo
 
-If your workload consists **only of PutItem operations**, the driver cannot automatically discover partition key. 
-In this case, use `WithPkInfo` to pre-configure the partition key column name:
+If you don't want to wait till driver automatically discovers partition key you can use `WithPkInfo` to pre-configure the 
+partition key column name for tables you are working with:
 ```go
 h, err := helper.NewHelper(
     []string{"x.x.x.x"},
@@ -230,11 +228,6 @@ h, err := helper.NewHelper(
     ),
 )
 ```
-
-**When to use `WithPkInfo`:**
-- ✅ Your workload is **PutItem-only** and you want routing optimization from the first request
-- ✅ You want to avoid the small overhead of auto-discovery
-- ✅ You know your table schemas upfront and want explicit configuration
 
 ### Decrypting TLS
 
