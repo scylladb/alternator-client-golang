@@ -35,7 +35,6 @@ import (
 	"hash"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"sync"
 
@@ -210,7 +209,7 @@ type Helper struct {
 	// Runtime copy of partition key information, pre-populated from cfg.KeyRouteAffinity.PkInfoPerTable
 	// and potentially updated via auto-discovery from CreateTable operations.
 	pkInfoMutex    sync.RWMutex
-	pkInfoPerTable map[string][]string
+	pkInfoPerTable map[string]string
 }
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
@@ -227,10 +226,10 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	}
 
 	// Pre-populate runtime partition key information from config
-	pkInfoPerTable := make(map[string][]string)
+	pkInfoPerTable := make(map[string]string)
 	if cfg.KeyRouteAffinity.PkInfoPerTable != nil {
-		for table, keys := range cfg.KeyRouteAffinity.PkInfoPerTable {
-			pkInfoPerTable[table] = slices.Clone(keys)
+		for table, keyName := range cfg.KeyRouteAffinity.PkInfoPerTable {
+			pkInfoPerTable[table] = keyName
 		}
 	}
 
@@ -481,37 +480,34 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	}
 }
 
-// SetPartitionKeyInfo stores partition key information for a table in a thread-safe manner.
-func (lb *Helper) SetPartitionKeyInfo(tableName string, keys []string) {
+// SetPartitionKeyName stores partition key information for a table in a thread-safe manner.
+func (lb *Helper) SetPartitionKeyName(tableName, keyName string) {
 	lb.pkInfoMutex.Lock()
 	defer lb.pkInfoMutex.Unlock()
-	lb.pkInfoPerTable[tableName] = keys
+	lb.pkInfoPerTable[tableName] = keyName
 }
 
-// GetPartitionKeyInfo retrieves partition key information for a table in a thread-safe manner.
-func (lb *Helper) GetPartitionKeyInfo(tableName string) ([]string, bool) {
+// GetPartitionKeyName retrieves partition key information for a table in a thread-safe manner.
+func (lb *Helper) GetPartitionKeyName(tableName string) string {
 	lb.pkInfoMutex.RLock()
 	defer lb.pkInfoMutex.RUnlock()
-	keys, ok := lb.pkInfoPerTable[tableName]
-	return keys, ok
+	return lb.pkInfoPerTable[tableName]
 }
 
 func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, tableName string) (int64, error) {
-	pkInfo, exists := lb.GetPartitionKeyInfo(tableName)
-	if !exists || len(values) == 0 {
+	keyName := lb.GetPartitionKeyName(tableName)
+	if keyName == "" || len(values) == 0 {
 		return 0, fmt.Errorf("partition key information not found for table %s", tableName)
 	}
 
 	h := murmur.New()
 
-	for _, keyName := range pkInfo {
-		val, ok := values[keyName]
-		if !ok {
-			return 0, fmt.Errorf("value for key %s not found", keyName)
-		}
-		if err := writeToHash(h, val); err != nil {
-			return 0, fmt.Errorf("failed to hash value for key %s: %w", keyName, err)
-		}
+	val, ok := values[keyName]
+	if !ok {
+		return 0, fmt.Errorf("value for key %s not found", keyName)
+	}
+	if err := writeToHash(h, val); err != nil {
+		return 0, fmt.Errorf("failed to hash value for key %s: %w", keyName, err)
 	}
 
 	return int64(h.Sum64()), nil
@@ -650,17 +646,21 @@ func (lb *Helper) maybeUpdatePkInformation(in middleware.InitializeInput) {
 		tableName := aws.ToString(params.TableName)
 
 		// Check if we already have partition key info for this table
-		if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
+		if keyName := lb.GetPartitionKeyName(tableName); keyName == "" {
 			return
 		}
 
-		var partitionKeys []string
+		// Extract the partition key (HASH key) from KeySchema
+		var partitionKeyName string
 		for _, key := range params.KeySchema {
-			partitionKeys = append(partitionKeys, aws.ToString(key.AttributeName))
+			if key.KeyType == types.KeyTypeHash {
+				partitionKeyName = aws.ToString(key.AttributeName)
+				break
+			}
 		}
 
-		if len(partitionKeys) > 0 {
-			lb.SetPartitionKeyInfo(tableName, partitionKeys)
+		if partitionKeyName != "" {
+			lb.SetPartitionKeyName(tableName, partitionKeyName)
 		}
 
 	case *dynamodb.GetItemInput:
@@ -678,7 +678,7 @@ func (lb *Helper) maybeUpdatePkInformation(in middleware.InitializeInput) {
 // The key names are sorted alphabetically for consistency since map iteration order is random.
 func (lb *Helper) learnPartitionKeysFromKeyMap(tableName string, key map[string]types.AttributeValue) {
 	// Check if we already have partition key info for this table
-	if _, exists := lb.GetPartitionKeyInfo(tableName); exists {
+	if keyName := lb.GetPartitionKeyName(tableName); keyName != "" {
 		return
 	}
 
@@ -686,12 +686,14 @@ func (lb *Helper) learnPartitionKeysFromKeyMap(tableName string, key map[string]
 		return
 	}
 
-	// Extract and sort key names for consistency
-	partitionKeys := make([]string, 0, len(key))
+	// Extract the first key name (assuming single partition key)
+	var partitionKeyName string
 	for keyName := range key {
-		partitionKeys = append(partitionKeys, keyName)
+		partitionKeyName = keyName
+		break
 	}
-	slices.Sort(partitionKeys)
 
-	lb.SetPartitionKeyInfo(tableName, partitionKeys)
+	if partitionKeyName != "" {
+		lb.SetPartitionKeyName(tableName, partitionKeyName)
+	}
 }

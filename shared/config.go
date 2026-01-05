@@ -63,11 +63,11 @@ type Config struct {
 	RequestCompression RequestCompressionFunc
 	// NodeHealthStoreConfig controls node health tracking logic
 	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
-	// KeyRouteAffinity configures which operations should use routing optimization heuristics
+	// KeyRouteAffinity configures route affinity feature
 	KeyRouteAffinity KeyRouteAffinityConfig
 }
 
-// KeyRouteAffinity specifies the type of operations that should use routing optimization
+// KeyRouteAffinity specifies the type of operations that should use route affinity
 type KeyRouteAffinity int
 
 const (
@@ -92,20 +92,20 @@ const (
 // KeyRouteAffinityConfig holds configuration for routing optimization heuristics
 type KeyRouteAffinityConfig struct {
 	Type           KeyRouteAffinity
-	PkInfoPerTable map[string][]string
+	PkInfoPerTable map[string]string
 }
 
 // NewKeyRouteAffinityConfig creates a new KeyRouteAffinityConfig with initialized map
 func NewKeyRouteAffinityConfig(keyRouteAffinity KeyRouteAffinity) KeyRouteAffinityConfig {
 	return KeyRouteAffinityConfig{
 		Type:           keyRouteAffinity,
-		PkInfoPerTable: make(map[string][]string),
+		PkInfoPerTable: make(map[string]string),
 	}
 }
 
-// WithPkInfo sets the partition key information per table for routing optimization
-func (kr KeyRouteAffinityConfig) WithPkInfo(pkInfo map[string][]string) KeyRouteAffinityConfig {
-	kr.PkInfoPerTable = pkInfo
+// WithPkInfo sets the partition key name per table for route affinity
+func (kr KeyRouteAffinityConfig) WithPkInfo(pkNamePerTable map[string]string) KeyRouteAffinityConfig {
+	kr.PkInfoPerTable = pkNamePerTable
 	return kr
 }
 
@@ -481,8 +481,8 @@ func CloneAWSConfigOptions(options []any) []any {
 	return out
 }
 
-// WithKeyRouteAffinity enables routing optimization heuristics for the specified operation types.
-// Routing optimization benefits from routing to the same coordinator to improve Paxos performance.
+// WithKeyRouteAffinity enables route affinity for the specified operation types.
+// Route affinity makes driver pick same coordinator to improve Paxos performance.
 func WithKeyRouteAffinity(keyRouteAffinityConfig KeyRouteAffinityConfig) Option {
 	return func(config *Config) {
 		config.KeyRouteAffinity = keyRouteAffinityConfig
