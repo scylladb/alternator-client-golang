@@ -193,7 +193,7 @@ ScyllaDB's Alternator supports different write isolation modes configured via `a
 #### When to Use KeyRouteAffinity
 
 Enable KeyRouteAffinity when:
-- Your Alternator cluster is configured with `alternator_write_isolation: only_rmw_uses_lwt` (use `KeyRouteAffinityWrite`) or `always` (use `KeyRouteAffinityAll`)
+- Your Alternator cluster is configured with `alternator_write_isolation: only_rmw_uses_lwt` (use `KeyRouteAffinityRMW`) or `always` (use `KeyRouteAffinityAnyWrite`)
 - You perform conditional updates/deletes on the same items repeatedly
 - You want to optimize LWT performance by ensuring the same coordinator handles requests for the same partition key
 
@@ -202,8 +202,8 @@ Enable KeyRouteAffinity when:
 There are three KeyRouteAffinity modes:
 
 1. **`KeyRouteAffinityNone`** (default): Disabled. Requests are distributed randomly across nodes.
-2. **`KeyRouteAffinityWrite`**: Enables routing optimization for write operations (PutItem, UpdateItem, DeleteItem).
-3. **`KeyRouteAffinityAll`**: Enables routing optimization for all operations including reads (GetItem).
+2. **`KeyRouteAffinityRMW`**: Enables route affinity for conditional write operations, operations that needs read before write.
+3. **`KeyRouteAffinityAnyWrite`**: Enables routing optimization for all write operations.
 
 #### Automatic Partition Key Discovery
 
