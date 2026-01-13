@@ -630,34 +630,77 @@ func writeToHash(h hash.Hash64, val types.AttributeValue) error {
 }
 
 func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
-	shouldOptimize := false
+	shouldGetHash := false
 	var tableName string
 	var partitionKey map[string]types.AttributeValue
 	switch params := in.Parameters.(type) {
 	case *dynamodb.PutItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityRMW || lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW:
+			shouldGetHash = doesPutNeedReadBeforeWrite(params)
+		case KeyRouteAffinityAnyWrite:
+			shouldGetHash = true
+		default:
+			shouldGetHash = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Item
 
 	case *dynamodb.UpdateItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityRMW || lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW:
+			shouldGetHash = doesUpdateNeedReadBeforeWrite(params)
+		case KeyRouteAffinityAnyWrite:
+			shouldGetHash = true
+		default:
+			shouldGetHash = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
 	case *dynamodb.DeleteItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityRMW || lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW:
+			shouldGetHash = doesDeleteNeedReadBeforeWrite(params)
+		case KeyRouteAffinityAnyWrite:
+			shouldGetHash = true
+		default:
+			shouldGetHash = false
+		}
 		tableName = aws.ToString(params.TableName)
 		partitionKey = params.Key
 
-	case *dynamodb.GetItemInput:
-		shouldOptimize = lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite
-		tableName = aws.ToString(params.TableName)
-		partitionKey = params.Key
+	case *dynamodb.BatchWriteItemInput:
+		switch lb.cfg.KeyRouteAffinity.Type {
+		case KeyRouteAffinityRMW, KeyRouteAffinityAnyWrite:
+			// In the case of multi table batch alternator makes it LWT if any table involved is configured to do so
+			// But here for sake of simplicity we apply session-wide configuration to all requests
+			shouldGetHash = true
+		outer:
+			for table, req := range params.RequestItems {
+				tableName = table
+				for _, op := range req {
+					if op.DeleteRequest != nil {
+						partitionKey = op.DeleteRequest.Key
+						break outer
+					}
+					if op.PutRequest != nil {
+						partitionKey = op.PutRequest.Item
+						break outer
+					}
+				}
+			}
+		default:
+			shouldGetHash = false
+		}
 	}
 
-	if shouldOptimize && partitionKey != nil {
-		return lb.hashPartitionKey(partitionKey, tableName)
+	if shouldGetHash && tableName != "" {
+		if partitionKey != nil {
+			return lb.hashPartitionKey(partitionKey, tableName)
+		}
 	}
+
 	return 0, fmt.Errorf("could not get a proper hash")
 }
 
@@ -714,4 +757,57 @@ func (k *keyAffinity) Clone() keyAffinity {
 	return keyAffinity{
 		pkInfoPerTable: pkInfoPerTable,
 	}
+}
+
+// doesUpdateNeedReadBeforeWrite checks if UpdateItem operation will be executed as LWT on Alternator side
+// it is done to be inline with following Alternator code:
+// https://github.com/scylladb/scylladb/blob/3c376d1b6470bdbe6e66ee32f6a680a87e36a91f/alternator/executor.cc#L3941-L3971
+func doesUpdateNeedReadBeforeWrite(u *dynamodb.UpdateItemInput) bool {
+	if !isEmptyString(u.UpdateExpression) || !isEmptyString(u.ConditionExpression) || len(u.Expected) != 0 {
+		return true
+	}
+
+	switch u.ReturnValues {
+	case types.ReturnValueNone, types.ReturnValueUpdatedNew, "":
+		break
+	default:
+		return true
+	}
+	for _, act := range u.AttributeUpdates {
+		switch act.Action {
+		case types.AttributeActionAdd:
+			return true
+		case types.AttributeActionDelete:
+			if act.Value != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// doesDeleteNeedReadBeforeWrite checks if DeleteItem operation will be executed as LWT on Alternator side
+// it is done to be inline with following Alternator code:
+// https://github.com/scylladb/scylladb/blob/3c376d1b6470bdbe6e66ee32f6a680a87e36a91f/alternator/executor.cc#L2926-L2930
+func doesDeleteNeedReadBeforeWrite(d *dynamodb.DeleteItemInput) bool {
+	if len(d.Expected) != 0 || !isEmptyString(d.ConditionExpression) {
+		return true
+	}
+
+	return d.ReturnValues == types.ReturnValueAllOld
+}
+
+// doesPutNeedReadBeforeWrite checks if PutItem operation will be executed as LWT on Alternator side
+// it is done to be inline with following Alternator code:
+// https://github.com/scylladb/scylladb/blob/3c376d1b6470bdbe6e66ee32f6a680a87e36a91f/alternator/executor.cc#L2826-L2830
+func doesPutNeedReadBeforeWrite(p *dynamodb.PutItemInput) bool {
+	if len(p.Expected) != 0 || !isEmptyString(p.ConditionExpression) {
+		return true
+	}
+
+	return p.ReturnValues == types.ReturnValueAllOld
+}
+
+func isEmptyString(s *string) bool {
+	return s == nil || len(*s) == 0
 }

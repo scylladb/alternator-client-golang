@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -17,13 +18,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/klauspost/compress/gzip"
 
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/scylladb/alternator-client-golang/shared"
+
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/scylladb/alternator-client-golang/shared"
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
+	"github.com/scylladb/alternator-client-golang/shared/tests/ct"
 	"github.com/scylladb/alternator-client-golang/shared/tests/mocks"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
@@ -530,6 +533,609 @@ func TestNodeHealthTracking(t *testing.T) { //nolint: tparallel // these subtest
 		// Node 1 is gone completely
 		assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{})
 	})
+
+	t.Run("WithKeyRouteAffinity", func(t *testing.T) {
+		t.Parallel()
+
+		type ctxKey string
+		const operationCtxKey ctxKey = "operation"
+
+		operations := map[string]func(context.Context, *dynamodb.Client, string) error{
+			"GET": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+				})
+				return err
+			},
+			// UPDATE operations that should NOT be optimized in Write mode
+			"UPDATE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ExpressionAttributeNames: map[string]string{
+						"#v": "value",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":val": &types.AttributeValueMemberN{Value: "1"},
+					},
+				})
+				return err
+			},
+			"UPDATE-RETURN-NONE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueNone,
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionPut,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-RETURN-UPDATED-NEW": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueUpdatedNew,
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionPut,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-ATTRIBUTE-DELETE-NO-VALUE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionDelete,
+						},
+					},
+				})
+				return err
+			},
+			// UPDATE operations that SHOULD be optimized in Write mode
+			"UPDATE-WITH-UPDATE-EXPRESSION": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					UpdateExpression: aws.String("SET #v = :val"),
+					ExpressionAttributeNames: map[string]string{
+						"#v": "value",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":val": &types.AttributeValueMemberN{Value: "1"},
+					},
+				})
+				return err
+			},
+			"UPDATE-CONDITIONAL": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					UpdateExpression:    aws.String("SET #v = :val"),
+					ConditionExpression: aws.String("attribute_exists(id)"),
+					ExpressionAttributeNames: map[string]string{
+						"#v": "value",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":val": &types.AttributeValueMemberN{Value: "2"},
+					},
+				})
+				return err
+			},
+			"UPDATE-WITH-EXPECTED": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					Expected: map[string]types.ExpectedAttributeValue{
+						"id": {
+							Exists: aws.Bool(true),
+						},
+					},
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionPut,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-RETURN-ALL-OLD": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueAllOld,
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionPut,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-RETURN-UPDATED-OLD": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueUpdatedOld,
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionPut,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-RETURN-ALL-NEW": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueAllNew,
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"value": {
+							Action: types.AttributeActionPut,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-ATTRIBUTE-ADD": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"counter": {
+							Action: types.AttributeActionAdd,
+							Value:  &types.AttributeValueMemberN{Value: "1"},
+						},
+					},
+				})
+				return err
+			},
+			"UPDATE-ATTRIBUTE-DELETE-WITH-VALUE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					AttributeUpdates: map[string]types.AttributeValueUpdate{
+						"tags": {
+							Action: types.AttributeActionDelete,
+							Value:  &types.AttributeValueMemberSS{Value: []string{"tag1"}},
+						},
+					},
+				})
+				return err
+			},
+			// DELETE operations that should NOT be optimized in Write mode
+			"DELETE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+				})
+				return err
+			},
+			"DELETE-RETURN-NONE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueNone,
+				})
+				return err
+			},
+			// DELETE operations that SHOULD be optimized in Write mode
+			"DELETE-CONDITIONAL": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ConditionExpression: aws.String("attribute_exists(id)"),
+				})
+				return err
+			},
+			"DELETE-WITH-EXPECTED": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					Expected: map[string]types.ExpectedAttributeValue{
+						"id": {
+							Exists: aws.Bool(true),
+						},
+					},
+				})
+				return err
+			},
+			"DELETE-RETURN-ALL-OLD": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+					TableName: aws.String("test-table"),
+					Key: map[string]types.AttributeValue{
+						"id": &types.AttributeValueMemberS{Value: key},
+					},
+					ReturnValues: types.ReturnValueAllOld,
+				})
+				return err
+			},
+			// INSERT (PutItem) operations that should NOT be optimized in Write mode
+			"INSERT": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+					TableName: aws.String("test-table"),
+					Item: map[string]types.AttributeValue{
+						"id":    &types.AttributeValueMemberS{Value: key},
+						"value": &types.AttributeValueMemberN{Value: "1"},
+					},
+				})
+				return err
+			},
+			"INSERT-RETURN-NONE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+					TableName: aws.String("test-table"),
+					Item: map[string]types.AttributeValue{
+						"id":    &types.AttributeValueMemberS{Value: key},
+						"value": &types.AttributeValueMemberN{Value: "1"},
+					},
+					ReturnValues: types.ReturnValueNone,
+				})
+				return err
+			},
+			// INSERT (PutItem) operations that SHOULD be optimized in Write mode
+			"INSERT-CONDITIONAL": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+					TableName: aws.String("test-table"),
+					Item: map[string]types.AttributeValue{
+						"id":    &types.AttributeValueMemberS{Value: key},
+						"value": &types.AttributeValueMemberN{Value: "1"},
+					},
+					ConditionExpression: aws.String("attribute_not_exists(id)"),
+				})
+				return err
+			},
+			"INSERT-WITH-EXPECTED": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+					TableName: aws.String("test-table"),
+					Item: map[string]types.AttributeValue{
+						"id":    &types.AttributeValueMemberS{Value: key},
+						"value": &types.AttributeValueMemberN{Value: "1"},
+					},
+					Expected: map[string]types.ExpectedAttributeValue{
+						"id": {
+							Exists: aws.Bool(false),
+						},
+					},
+				})
+				return err
+			},
+			"INSERT-RETURN-ALL-OLD": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+					TableName: aws.String("test-table"),
+					Item: map[string]types.AttributeValue{
+						"id":    &types.AttributeValueMemberS{Value: key},
+						"value": &types.AttributeValueMemberN{Value: "1"},
+					},
+					ReturnValues: types.ReturnValueAllOld,
+				})
+				return err
+			},
+			"BATCH-GET": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+					RequestItems: map[string]types.KeysAndAttributes{
+						"test-table": {
+							Keys: []map[string]types.AttributeValue{
+								{"id": &types.AttributeValueMemberS{Value: key}},
+								{"id": &types.AttributeValueMemberS{Value: key + "-2"}},
+							},
+						},
+					},
+				})
+				return err
+			},
+			"BATCH-WRITE": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+					RequestItems: map[string][]types.WriteRequest{
+						"test-table": {
+							{
+								PutRequest: &types.PutRequest{
+									Item: map[string]types.AttributeValue{
+										"id":    &types.AttributeValueMemberS{Value: key},
+										"value": &types.AttributeValueMemberN{Value: "1"},
+									},
+								},
+							},
+							{
+								DeleteRequest: &types.DeleteRequest{
+									Key: map[string]types.AttributeValue{
+										"id": &types.AttributeValueMemberS{Value: key + "-del"},
+									},
+								},
+							},
+						},
+					},
+				})
+				return err
+			},
+			"BATCH-EXECUTE-STATEMENT": func(ctx context.Context, client *dynamodb.Client, key string) error {
+				_, err := client.BatchExecuteStatement(ctx, &dynamodb.BatchExecuteStatementInput{
+					Statements: []types.BatchStatementRequest{
+						{
+							Statement: aws.String("INSERT INTO \"test-table\" VALUE {'id':?, 'value':?}"),
+							Parameters: []types.AttributeValue{
+								&types.AttributeValueMemberS{Value: key},
+								&types.AttributeValueMemberN{Value: "1"},
+							},
+						},
+						{
+							Statement: aws.String("DELETE FROM \"test-table\" WHERE id=?"),
+							Parameters: []types.AttributeValue{
+								&types.AttributeValueMemberS{Value: key + "-del"},
+							},
+						},
+					},
+				})
+				return err
+			},
+		}
+
+		testCases := []struct {
+			name         string
+			cfg          func() Option
+			optimizedOps []string
+		}{
+			{
+				name: "KeyRouteAffinityRMW",
+				cfg: func() Option {
+					return WithKeyRouteAffinity(
+						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+							"test-table": "id",
+						}),
+					)
+				},
+				optimizedOps: []string{
+					"BATCH-WRITE",
+					// UPDATE operations that need read-before-write
+					"UPDATE-WITH-UPDATE-EXPRESSION",
+					"UPDATE-CONDITIONAL",
+					"UPDATE-WITH-EXPECTED",
+					"UPDATE-RETURN-ALL-OLD",
+					"UPDATE-RETURN-UPDATED-OLD",
+					"UPDATE-RETURN-ALL-NEW",
+					"UPDATE-ATTRIBUTE-ADD",
+					"UPDATE-ATTRIBUTE-DELETE-WITH-VALUE",
+					// DELETE operations that need read-before-write
+					"DELETE-CONDITIONAL",
+					"DELETE-WITH-EXPECTED",
+					"DELETE-RETURN-ALL-OLD",
+					// INSERT operations that need read-before-write
+					"INSERT-CONDITIONAL",
+					"INSERT-WITH-EXPECTED",
+					"INSERT-RETURN-ALL-OLD",
+				},
+			},
+			{
+				name: "KeyRouteAffinityAnyWrite",
+				cfg: func() Option {
+					return WithKeyRouteAffinity(
+						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
+							"test-table": "id",
+						}),
+					)
+				},
+				optimizedOps: []string{
+					"BATCH-WRITE",
+					// All UPDATE operations
+					"UPDATE",
+					"UPDATE-RETURN-NONE",
+					"UPDATE-RETURN-UPDATED-NEW",
+					"UPDATE-ATTRIBUTE-DELETE-NO-VALUE",
+					"UPDATE-WITH-UPDATE-EXPRESSION",
+					"UPDATE-CONDITIONAL",
+					"UPDATE-WITH-EXPECTED",
+					"UPDATE-RETURN-ALL-OLD",
+					"UPDATE-RETURN-UPDATED-OLD",
+					"UPDATE-RETURN-ALL-NEW",
+					"UPDATE-ATTRIBUTE-ADD",
+					"UPDATE-ATTRIBUTE-DELETE-WITH-VALUE",
+					// All DELETE operations
+					"DELETE",
+					"DELETE-RETURN-NONE",
+					"DELETE-CONDITIONAL",
+					"DELETE-WITH-EXPECTED",
+					"DELETE-RETURN-ALL-OLD",
+					// All INSERT operations
+					"INSERT",
+					"INSERT-RETURN-NONE",
+					"INSERT-CONDITIONAL",
+					"INSERT-WITH-EXPECTED",
+					"INSERT-RETURN-ALL-OLD",
+				},
+			},
+			{
+				name:         "NoOptimization",
+				cfg:          func() Option { return nil },
+				optimizedOps: []string{},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				requestedNodes := map[string][]string{}
+
+				nodes := []string{"node1.local", "node2.local", "node3.local"}
+
+				mockTransport := &mocks.MockRoundTripper{
+					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+						return resp.AlternatorNodesResponse(nodes, req)
+					},
+					NodeHealthRequest: resp.HealthCheckResponse,
+					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+						operation, _ := req.Context().Value(operationCtxKey).(string)
+						if operation == "" {
+							operation = "UNKNOWN"
+						}
+						requestedNodes[operation] = append(requestedNodes[operation], req.URL.Host)
+
+						switch req.Header.Get("X-Amz-Target") {
+						case "DynamoDB_20120810.GetItem":
+							return resp.DynamoDBGetItemResponse(map[string]types.AttributeValue{
+								"id":    &types.AttributeValueMemberS{Value: "test"},
+								"value": &types.AttributeValueMemberS{Value: "data"},
+							}, req)
+						case "DynamoDB_20120810.UpdateItem":
+							return resp.DynamoDBUpdateItemResponse(req)
+						case "DynamoDB_20120810.DeleteItem":
+							return resp.DynamoDBDeleteItemResponse(req)
+						case "DynamoDB_20120810.PutItem":
+							return resp.DynamoDBPutItemResponse(req)
+						case "DynamoDB_20120810.BatchGetItem":
+							return resp.New().
+								OK().
+								ContentType(ct.DynamoDBJSON).
+								JSONBody(map[string]any{
+									"Responses": map[string][]map[string]types.AttributeValue{
+										"test-table": {
+											{"id": &types.AttributeValueMemberS{Value: "v1"}},
+											{"id": &types.AttributeValueMemberS{Value: "v2"}},
+										},
+									},
+									"UnprocessedKeys": map[string]any{},
+								}).
+								Request(req).
+								Build()
+						case "DynamoDB_20120810.BatchWriteItem":
+							return resp.New().
+								OK().
+								ContentType(ct.DynamoDBJSON).
+								Body(`{"UnprocessedItems":{}}`).
+								Request(req).
+								Build()
+						case "DynamoDB_20120810.BatchExecuteStatement":
+							return resp.New().
+								OK().
+								ContentType(ct.DynamoDBJSON).
+								Body(`{"Responses":[{"Item":{}},{"Item":{}}],"UnprocessedStatements":[]}`).
+								Request(req).
+								Build()
+						default:
+							return resp.DynamoDBListTablesResponse([]string{"test-table"}, req)
+						}
+					},
+				}
+
+				opts := []Option{
+					WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+					WithCredentials("test-key", "test-secret"),
+				}
+				if tc.cfg() != nil {
+					opts = append(opts, tc.cfg())
+				}
+
+				h, err := NewHelper([]string{"node1.local"}, opts...)
+				if err != nil {
+					t.Fatalf("NewHelper returned error: %v", err)
+				}
+				defer h.Stop()
+
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes returned error: %v", err)
+				}
+
+				client, err := h.NewDynamoDB()
+				if err != nil {
+					t.Fatalf("NewDynamoDB returned error: %v", err)
+				}
+
+				const requestsPerOperation = 8
+				const testKey = "same-key"
+
+				for opName, opFn := range operations {
+					for i := 0; i < requestsPerOperation; i++ {
+						ctx := context.WithValue(context.Background(), operationCtxKey, opName)
+						if err := opFn(ctx, client, testKey); err != nil {
+							t.Fatalf("%s call failed: %v", opName, err)
+						}
+					}
+				}
+
+				for opName, nodes := range requestedNodes {
+					if len(nodes) != requestsPerOperation {
+						t.Fatalf("expected %d requests for %s, got %d", requestsPerOperation, opName, len(nodes))
+					}
+
+					nodeSet := make(map[string]struct{})
+					for _, node := range nodes {
+						nodeSet[node] = struct{}{}
+					}
+
+					if slices.Contains(tc.optimizedOps, opName) {
+						firstNode := nodes[0]
+						for i, node := range nodes {
+							if node != firstNode {
+								t.Errorf("request %d for %s went to %s, expected %s", i, opName, node, firstNode)
+							}
+						}
+					} else {
+						found := false
+					outer:
+						for _, node := range nodes {
+							for _, other := range nodes {
+								if node != other {
+									found = true
+									break outer
+								}
+							}
+						}
+						if !found {
+							t.Errorf("operation %s is unexpectedly optimized", opName)
+						}
+					}
+				}
+			})
+		}
+	})
 }
 
 func sortNodes(nodes []url.URL) []url.URL {
@@ -545,7 +1151,7 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 	allNodes := append(append([]url.URL{}, liveNodes...), quarantinedNodes...)
 
 	if diff := cmp.Diff(sortNodes(allNodes), sortNodes(nodes.GetNodes())); diff != "" {
-		t.Errorf("GetNodes() returend unexpected result (-want +got):\n%s", diff)
+		t.Errorf("GetNodes() returned unexpected result (-want +got):\n%s", diff)
 	}
 
 	if diff := cmp.Diff(sortNodes(liveNodes), sortNodes(nodes.GetActiveNodes())); diff != "" {
@@ -563,36 +1169,36 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 		t.Parallel()
 
 		testCases := []struct {
-			name           string
-			optimizeOption func() Option
-			shouldOptimize bool
+			name                        string
+			options                     func() Option
+			shouldHaveSameExecutionPlan bool
 		}{
 			{
-				name: "KeyRouteAffinityWrite",
-				optimizeOption: func() Option {
+				name: "KeyRouteAffinityRMW",
+				options: func() Option {
 					return WithKeyRouteAffinity(
 						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
 							"test-table": "id",
 						}),
 					)
 				},
-				shouldOptimize: true,
+				shouldHaveSameExecutionPlan: true,
 			},
 			{
 				name: "KeyRouteAffinityAll",
-				optimizeOption: func() Option {
+				options: func() Option {
 					return WithKeyRouteAffinity(
 						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
 							"test-table": "id",
 						}),
 					)
 				},
-				shouldOptimize: true,
+				shouldHaveSameExecutionPlan: true,
 			},
 			{
-				name:           "NoOptimization",
-				optimizeOption: func() Option { return nil },
-				shouldOptimize: false,
+				name:                        "NoOptimization",
+				options:                     func() Option { return nil },
+				shouldHaveSameExecutionPlan: false,
 			},
 		}
 
@@ -622,8 +1228,8 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 						WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 						WithCredentials("test-key", "test-secret"),
 					}
-					if tc.optimizeOption() != nil {
-						opts = append(opts, tc.optimizeOption())
+					if tc.options() != nil {
+						opts = append(opts, tc.options())
 					}
 
 					h, err := NewHelper([]string{"node1.local"}, opts...)
@@ -644,13 +1250,20 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 					// Make multiple PutItem requests with the same partition key
 					testKey := "same-key"
 					for i := 0; i < 5; i++ {
-						_, err = client.PutItem(context.Background(), &dynamodb.PutItemInput{
+						putInput := &dynamodb.PutItemInput{
 							TableName: aws.String("test-table"),
 							Item: map[string]types.AttributeValue{
 								"id":    &types.AttributeValueMemberS{Value: testKey},
 								"value": &types.AttributeValueMemberN{Value: strconv.Itoa(i)},
 							},
-						})
+						}
+						// For RMW mode, make the operation conditional
+						if tc.name == "KeyRouteAffinityRMW" {
+							putInput.ConditionExpression = aws.String(
+								"attribute_not_exists(id) OR attribute_exists(id)",
+							)
+						}
+						_, err = client.PutItem(context.Background(), putInput)
 						if err != nil {
 							t.Fatalf("PutItem returned error: %v", err)
 						}
@@ -660,7 +1273,7 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 						t.Fatalf("Expected 5 requests, got %d", len(requestedNodes))
 					}
 
-					if tc.shouldOptimize {
+					if tc.shouldHaveSameExecutionPlan {
 						// All requests should go to the same node
 						firstNode := requestedNodes[0]
 						for i, node := range requestedNodes {
@@ -688,7 +1301,7 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 		}
 
 		t.Run("ReadOperationsWithKeyRouteAffinityAll", func(t *testing.T) {
-			t.Parallel()
+			t.Skip("GetItem operations no longer use key route affinity")
 
 			var requestedNodes []string
 
@@ -790,7 +1403,7 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 				WithCredentials("test-key", "test-secret"),
 				WithKeyRouteAffinity(
-					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
 						"test-table": "id",
 					}),
 				),
