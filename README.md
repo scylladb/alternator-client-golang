@@ -133,6 +133,26 @@ _, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String("tbl"), 
 ```
 SDK v1 users can apply the same pattern with the `*WithContext` methods (e.g., `GetItemWithContext`).
 
+### HTTP connection pool settings
+
+The library maintains a pool of idle HTTP connections to Alternator nodes for reuse, reducing latency and overhead. You can tune connection pooling behavior with the following options:
+
+- **`WithMaxIdleHTTPConnections(value int)`**: Controls the maximum total number of idle connections across all hosts. Default is `100`. Set to `0` to disable connection reuse entirely.
+
+- **`WithMaxIdleHTTPConnectionsPerHost(value int)`**: Controls the maximum number of idle connections per host. Default is `http.DefaultMaxIdleConnsPerHost` which is `2`. Increase this value when making many concurrent requests to the same node.
+
+- **`WithIdleHTTPConnectionTimeout(value time.Duration)`**: Controls how long idle connections remain in the pool before being closed. Default is `6 hours`. Shorter timeouts free resources faster but may increase connection setup overhead.
+
+Example:
+```go
+h, _ := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithMaxIdleHTTPConnections(200),
+    helper.WithMaxIdleHTTPConnectionsPerHost(10),
+    helper.WithIdleHTTPConnectionTimeout(30*time.Minute),
+)
+```
+
 ## Distinctive features
 
 ### Headers optimization

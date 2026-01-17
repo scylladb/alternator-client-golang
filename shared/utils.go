@@ -27,6 +27,7 @@ func NewALNHTTPTransport(config ALNConfig) http.RoundTripper {
 func PatchHTTPTransport(config ALNConfig, transport *http.Transport) http.RoundTripper {
 	transport.IdleConnTimeout = config.IdleHTTPConnectionTimeout
 	transport.MaxIdleConns = config.MaxIdleHTTPConnections
+	transport.MaxIdleConnsPerHost = config.MaxIdleHTTPConnectionsPerHost
 
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}

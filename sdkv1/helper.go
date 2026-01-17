@@ -114,6 +114,9 @@ var (
 	//  increases http and server efficiency and reduces latency
 	WithMaxIdleHTTPConnections = shared.WithMaxIdleHTTPConnections
 
+	// WithMaxIdleHTTPConnectionsPerHost controls maximum number of idle http connections per host held by http.Transport
+	WithMaxIdleHTTPConnectionsPerHost = shared.WithMaxIdleHTTPConnectionsPerHost
+
 	// WithIdleHTTPConnectionTimeout controls timeout for idle http connections held by http.Transport
 	WithIdleHTTPConnectionTimeout = shared.WithIdleHTTPConnectionTimeout
 

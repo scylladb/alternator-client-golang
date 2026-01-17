@@ -67,6 +67,8 @@ type ALNConfig struct {
 	// TLS session cache
 	TLSSessionCache        tls.ClientSessionCache
 	MaxIdleHTTPConnections int
+	// Maximum number of idle HTTP connections per host
+	MaxIdleHTTPConnectionsPerHost int
 	// Time to keep idle http connection alive
 	IdleHTTPConnectionTimeout time.Duration
 	// A hook to control http transports
@@ -80,17 +82,18 @@ type ALNConfig struct {
 // NewDefaultALNConfig creates new default ALNConfig
 func NewDefaultALNConfig() ALNConfig {
 	return ALNConfig{
-		Scheme:                    defaultScheme,
-		Port:                      defaultPort,
-		RoutingScope:              rt.NewClusterScope(),
-		UpdatePeriod:              defaultUpdatePeriod,
-		IdleUpdatePeriod:          time.Minute, // Don't update by default
-		TLSSessionCache:           defaultTLSSessionCache,
-		MaxIdleHTTPConnections:    100,
-		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
-		HTTPClientTimeout:         http.DefaultClient.Timeout,
-		Logger:                    logxzap.DefaultLogger(),
-		NodeHealthStoreConfig:     nodeshealth.DefaultNodeHealthStoreConfig(),
+		Scheme:                        defaultScheme,
+		Port:                          defaultPort,
+		RoutingScope:                  rt.NewClusterScope(),
+		UpdatePeriod:                  defaultUpdatePeriod,
+		IdleUpdatePeriod:              time.Minute, // Don't update by default
+		TLSSessionCache:               defaultTLSSessionCache,
+		MaxIdleHTTPConnections:        100,
+		MaxIdleHTTPConnectionsPerHost: http.DefaultMaxIdleConnsPerHost,
+		IdleHTTPConnectionTimeout:     defaultIdleConnectionTimeout,
+		HTTPClientTimeout:             http.DefaultClient.Timeout,
+		Logger:                        logxzap.DefaultLogger(),
+		NodeHealthStoreConfig:         nodeshealth.DefaultNodeHealthStoreConfig(),
 	}
 }
 
@@ -199,6 +202,14 @@ func WithALNTLSSessionCache(cache tls.ClientSessionCache) ALNOption {
 func WithALNMaxIdleHTTPConnections(value int) ALNOption {
 	return func(config *ALNConfig) {
 		config.MaxIdleHTTPConnections = value
+	}
+}
+
+// WithALNMaxIdleHTTPConnectionsPerHost controls maximum number of idle http connections per host held by http.Transport
+// If zero, http.DefaultMaxIdleConnsPerHost is used.
+func WithALNMaxIdleHTTPConnectionsPerHost(value int) ALNOption {
+	return func(config *ALNConfig) {
+		config.MaxIdleHTTPConnectionsPerHost = value
 	}
 }
 
