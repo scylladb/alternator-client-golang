@@ -51,6 +51,8 @@ type Config struct {
 	TLSSessionCache tls.ClientSessionCache
 	// Maximum number of idle HTTP connections
 	MaxIdleHTTPConnections int
+	// Maximum number of idle HTTP connections per host
+	MaxIdleHTTPConnectionsPerHost int
 	// Time to keep idle http connection alive
 	IdleHTTPConnectionTimeout time.Duration
 	// A hook to control http transports
@@ -128,19 +130,20 @@ var defaultTLSSessionCache = tls.NewLRUClientSessionCache(256)
 // NewDefaultConfig creates default `Config`
 func NewDefaultConfig() *Config {
 	return &Config{
-		Port:                      defaultPort,
-		Scheme:                    defaultScheme,
-		AWSRegion:                 defaultAWSRegion,
-		RoutingScope:              rt.NewClusterScope(),
-		NodesListUpdatePeriod:     5 * time.Minute,
-		IdleNodesListUpdatePeriod: 2 * time.Hour,
-		TLSSessionCache:           defaultTLSSessionCache,
-		MaxIdleHTTPConnections:    100,
-		IdleHTTPConnectionTimeout: defaultIdleConnectionTimeout,
-		HTTPClientTimeout:         http.DefaultClient.Timeout,
-		Logger:                    logxzap.DefaultLogger(),
-		AWSConfigOptions:          []any{},
-		NodeHealthStoreConfig:     nodeshealth.DefaultNodeHealthStoreConfig(),
+		Port:                          defaultPort,
+		Scheme:                        defaultScheme,
+		AWSRegion:                     defaultAWSRegion,
+		RoutingScope:                  rt.NewClusterScope(),
+		NodesListUpdatePeriod:         5 * time.Minute,
+		IdleNodesListUpdatePeriod:     2 * time.Hour,
+		TLSSessionCache:               defaultTLSSessionCache,
+		MaxIdleHTTPConnections:        100,
+		MaxIdleHTTPConnectionsPerHost: http.DefaultMaxIdleConnsPerHost,
+		IdleHTTPConnectionTimeout:     defaultIdleConnectionTimeout,
+		HTTPClientTimeout:             http.DefaultClient.Timeout,
+		Logger:                        logxzap.DefaultLogger(),
+		AWSConfigOptions:              []any{},
+		NodeHealthStoreConfig:         nodeshealth.DefaultNodeHealthStoreConfig(),
 	}
 }
 
@@ -161,6 +164,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNUpdatePeriod(c.NodesListUpdatePeriod),
 		WithALNIgnoreServerCertificateError(c.IgnoreServerCertificateError),
 		WithALNMaxIdleHTTPConnections(c.MaxIdleHTTPConnections),
+		WithALNMaxIdleHTTPConnectionsPerHost(c.MaxIdleHTTPConnectionsPerHost),
 		WithALNIdleHTTPConnectionTimeout(c.IdleHTTPConnectionTimeout),
 		WithALNHTTPClientTimeout(c.HTTPClientTimeout),
 		WithALNRoutingScope(c.RoutingScope),
@@ -362,6 +366,14 @@ func WithTLSSessionCache(cache tls.ClientSessionCache) Option {
 func WithMaxIdleHTTPConnections(value int) Option {
 	return func(config *Config) {
 		config.MaxIdleHTTPConnections = value
+	}
+}
+
+// WithMaxIdleHTTPConnectionsPerHost controls maximum number of idle http connections per host held by http.Transport
+// If zero, http.DefaultMaxIdleConnsPerHost is used.
+func WithMaxIdleHTTPConnectionsPerHost(value int) Option {
+	return func(config *Config) {
+		config.MaxIdleHTTPConnectionsPerHost = value
 	}
 }
 
