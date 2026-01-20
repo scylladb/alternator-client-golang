@@ -239,6 +239,11 @@ func (lb *Helper) Stop() {
 	lb.nodes.Stop()
 }
 
+// GetMaxIdleHTTPConnectionsPerHost returns the configured maximum number of idle HTTP connections per host.
+func (lb *Helper) GetMaxIdleHTTPConnectionsPerHost() int {
+	return lb.cfg.MaxIdleHTTPConnectionsPerHost
+}
+
 // awsConfig produces a conf for the AWS SDK that will integrate the alternator loadbalancing with the AWS SDK.
 func (lb *Helper) awsConfig() (aws.Config, error) {
 	cfg := aws.Config{
