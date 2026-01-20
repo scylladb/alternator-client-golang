@@ -361,177 +361,181 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
-}
 
-func TestNodeHealthTracking(t *testing.T) { //nolint: tparallel // these subtests should not be parallel
-	t.Parallel()
+	t.Run("WithNodeHealthStoreConfig", func(t *testing.T) {
+		t.Parallel()
 
-	// Custom config with faster reset interval for testing and disabled update intervals to ensure it does not
-	healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	healthConfig.Scoring.ResetInterval = 1 * time.Second
-	healthConfig.QuarantineReleasePeriod = -1 // Disable automatic release checks
+		t.Run("BasicFunctionality", func(t *testing.T) {
+			t.Parallel()
 
-	connRefusedErr := &net.OpError{Err: syscall.ECONNREFUSED}
+			// Custom config with faster reset interval for testing and disabled update intervals to ensure it does not
+			healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+			healthConfig.Scoring.ResetInterval = 1 * time.Second
+			healthConfig.QuarantineReleasePeriod = -1 // Disable automatic release checks
 
-	// Create URLs for all nodes
-	node1 := url.URL{Scheme: "http", Host: "node1.local:8080"}
-	node2 := url.URL{Scheme: "http", Host: "node2.local:8080"}
-	node3 := url.URL{Scheme: "http", Host: "node3.local:8080"}
-	node4 := url.URL{Scheme: "http", Host: "node4.local:8080"}
+			connRefusedErr := &net.OpError{Err: syscall.ECONNREFUSED}
 
-	// Include all nodes in the mock (even though we'll only discover 3 initially)
-	allMockNodes := []url.URL{node1, node2, node3}
+			// Create URLs for all nodes
+			node1 := url.URL{Scheme: "http", Host: "node1.local:8080"}
+			node2 := url.URL{Scheme: "http", Host: "node2.local:8080"}
+			node3 := url.URL{Scheme: "http", Host: "node3.local:8080"}
+			node4 := url.URL{Scheme: "http", Host: "node4.local:8080"}
 
-	// Default DynamoDB response for healthy nodes
-	defaultDynamoDBResp := func(req *http.Request) (*http.Response, error) {
-		tableNames := []string{"test-table"}
-		return resp.DynamoDBListTablesResponse(tableNames, req)
-	}
+			// Include all nodes in the mock (even though we'll only discover 3 initially)
+			allMockNodes := []url.URL{node1, node2, node3}
 
-	mockTransport := mocks.NewMockClusterRoundTripper(allMockNodes, defaultDynamoDBResp)
-	mockTransport.SetNodeError(node2, connRefusedErr)
+			// Default DynamoDB response for healthy nodes
+			defaultDynamoDBResp := func(req *http.Request) (*http.Response, error) {
+				tableNames := []string{"test-table"}
+				return resp.DynamoDBListTablesResponse(tableNames, req)
+			}
 
-	h, err := NewHelper(
-		[]string{node1.Hostname()},
-		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return mockTransport
-		}),
-		WithScheme("http"),
-		WithPort(8080),
-		WithNodeHealthStoreConfig(healthConfig),
-		WithIdleNodesListUpdatePeriod(0), // Disable automatic node list updates
-		WithAWSConfigOptions(
-			func(cfg *aws.Config) {
-				cfg.RetryMaxAttempts = 3 // Allow some retries to make sure that query does not fail
-			}),
-	)
-	if err != nil {
-		t.Fatalf("NewHelper failed: %v", err)
-	}
-	defer h.Stop()
+			mockTransport := mocks.NewMockClusterRoundTripper(allMockNodes, defaultDynamoDBResp)
+			mockTransport.SetNodeError(node2, connRefusedErr)
 
-	// Enforce seed for reproducibility
-	h.queryPlanSeed = 8
+			h, err := NewHelper(
+				[]string{node1.Hostname()},
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return mockTransport
+				}),
+				WithScheme("http"),
+				WithPort(8080),
+				WithNodeHealthStoreConfig(healthConfig),
+				WithIdleNodesListUpdatePeriod(0), // Disable automatic node list updates
+				WithAWSConfigOptions(
+					func(cfg *aws.Config) {
+						cfg.RetryMaxAttempts = 3 // Allow some retries to make sure that query does not fail
+					}),
+			)
+			if err != nil {
+				t.Fatalf("NewHelper failed: %v", err)
+			}
+			defer h.Stop()
 
-	ddb, err := h.NewDynamoDB(func(options *dynamodb.Options) {
-		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
-			options.MaxAttempts = 3
-			options.MaxBackoff = 0
+			// Enforce seed for reproducibility
+			h.queryPlanSeed = 8
+
+			ddb, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+				options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+					options.MaxAttempts = 3
+					options.MaxBackoff = 0
+				})
+			})
+			if err != nil {
+				t.Fatalf("NewDynamoDB returned error: %s", err.Error())
+			}
+
+			t.Run("Phase-1:Node2-Down", func(t *testing.T) {
+				assertNodesStatus(t, h.nodes, []url.URL{}, []url.URL{node1})
+
+				// Trigger node discovery - mock will return 3 nodes
+				// it will also try to get them out of quarant
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+				}
+
+				mockTransport.GetNodeHealthCounter(node1)
+
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
+			})
+
+			t.Run("Phase2:Node2-UP", func(t *testing.T) {
+				// Node 2 become functional
+				mockTransport.SetNodeHealthy(node2, nil)
+
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+				}
+
+				// Quarantined node should stay in quarantine
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
+
+				// Test if quarantined nodes are up
+				h.nodes.TryReleaseQuarantinedNodes()
+
+				// Quarantined node should become active
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, []url.URL{})
+			})
+
+			t.Run("Phase-3-Node3-DOWN", func(t *testing.T) {
+				// Now node 3 is down
+				mockTransport.SetNodeError(node3, connRefusedErr)
+
+				for range 10 {
+					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+						Limit: aws.Int32(5),
+					})
+					// Error should not happen, because it should hit broken node and retry on next one
+					if err != nil {
+						t.Fatalf("ListTables - failed, while should not: %s", err.Error())
+					}
+				}
+
+				// Node3 should go into quarantine because requests failed to many times on it
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3})
+			})
+
+			t.Run("Phase4:Node4-ADDED", func(t *testing.T) {
+				// Node 4 was provisioned but it fails at start
+				mockTransport.SetNodeError(node4, connRefusedErr)
+
+				// Make client pick it up from alternator
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+				}
+
+				// Node 4 should be added, but stay in quarantine
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3, node4})
+
+				// At this point two nodes down, but MaxAttempts=3, so requests should keep running without failures
+				for range 6 {
+					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+						Limit: aws.Int32(5),
+					})
+					// Error should not happen, because it should hit broken node and retry on next one
+					if err != nil {
+						t.Fatalf("ListTables - failed, while should not: %s", err.Error())
+					}
+				}
+			})
+
+			t.Run("Phase5:Node4-UP", func(t *testing.T) {
+				// Node 4 was provisioned but it fails at start
+				mockTransport.SetNodeHealthy(node4, nil)
+				mockTransport.SetNodeHealthy(node3, nil)
+
+				h.nodes.TryReleaseQuarantinedNodes()
+
+				// Node 4 should be released from quarantine
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
+			})
+
+			t.Run("Phase6:Node1-REMOVED(between UpdateLiveNodes)", func(t *testing.T) {
+				mockTransport.DeleteNode(node1)
+
+				for range 6 {
+					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+						Limit: aws.Int32(5),
+					})
+					// Error should not happen, because it should hit broken node and retry on next one
+					if err != nil {
+						t.Fatalf("ListTables - failed, while should not: %s", err.Error())
+					}
+				}
+
+				// Node 1 was removed from the cluster, but it wasn't discovered yet by `UpdateLiveNodes`
+				// so it should stay in quarantined list.
+				assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{node1})
+
+				err = h.UpdateLiveNodes()
+				if err != nil {
+					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+				}
+
+				// Node 1 is gone completely
+				assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{})
+			})
 		})
-	})
-	if err != nil {
-		t.Fatalf("NewDynamoDB returned error: %s", err.Error())
-	}
-
-	t.Run("Phase-1:Node2-Down", func(t *testing.T) {
-		assertNodesStatus(t, h.nodes, []url.URL{}, []url.URL{node1})
-
-		// Trigger node discovery - mock will return 3 nodes
-		// it will also try to get them out of quarant
-		if err := h.UpdateLiveNodes(); err != nil {
-			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-		}
-
-		mockTransport.GetNodeHealthCounter(node1)
-
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
-	})
-
-	t.Run("Phase2:Node2-UP", func(t *testing.T) {
-		// Node 2 become functional
-		mockTransport.SetNodeHealthy(node2, nil)
-
-		if err := h.UpdateLiveNodes(); err != nil {
-			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-		}
-
-		// Quarantined node should stay in quarantine
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
-
-		// Test if quarantined nodes are up
-		h.nodes.TryReleaseQuarantinedNodes()
-
-		// Quarantined node should become active
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, []url.URL{})
-	})
-
-	t.Run("Phase-3-Node3-DOWN", func(t *testing.T) {
-		// Now node 3 is down
-		mockTransport.SetNodeError(node3, connRefusedErr)
-
-		for range 10 {
-			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
-				Limit: aws.Int32(5),
-			})
-			// Error should not happen, because it should hit broken node and retry on next one
-			if err != nil {
-				t.Fatalf("ListTables - failed, while should not: %s", err.Error())
-			}
-		}
-
-		// Node3 should go into quarantine because requests failed to many times on it
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3})
-	})
-
-	t.Run("Phase4:Node4-ADDED", func(t *testing.T) {
-		// Node 4 was provisioned but it fails at start
-		mockTransport.SetNodeError(node4, connRefusedErr)
-
-		// Make client pick it up from alternator
-		if err := h.UpdateLiveNodes(); err != nil {
-			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-		}
-
-		// Node 4 should be added, but stay in quarantine
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3, node4})
-
-		// At this point two nodes down, but MaxAttempts=3, so requests should keep running without failures
-		for range 6 {
-			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
-				Limit: aws.Int32(5),
-			})
-			// Error should not happen, because it should hit broken node and retry on next one
-			if err != nil {
-				t.Fatalf("ListTables - failed, while should not: %s", err.Error())
-			}
-		}
-	})
-
-	t.Run("Phase5:Node4-UP", func(t *testing.T) {
-		// Node 4 was provisioned but it fails at start
-		mockTransport.SetNodeHealthy(node4, nil)
-		mockTransport.SetNodeHealthy(node3, nil)
-
-		h.nodes.TryReleaseQuarantinedNodes()
-
-		// Node 4 should be released from quarantine
-		assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
-	})
-
-	t.Run("Phase6:Node1-REMOVED(between UpdateLiveNodes)", func(t *testing.T) {
-		mockTransport.DeleteNode(node1)
-
-		for range 6 {
-			_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
-				Limit: aws.Int32(5),
-			})
-			// Error should not happen, because it should hit broken node and retry on next one
-			if err != nil {
-				t.Fatalf("ListTables - failed, while should not: %s", err.Error())
-			}
-		}
-
-		// Node 1 was removed from the cluster, but it wasn't discovered yet by `UpdateLiveNodes`
-		// so it should stay in quarantined list.
-		assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{node1})
-
-		err = h.UpdateLiveNodes()
-		if err != nil {
-			t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-		}
-
-		// Node 1 is gone completely
-		assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{})
 	})
 
 	t.Run("WithKeyRouteAffinity", func(t *testing.T) {
@@ -1164,329 +1168,4 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 	if t.Failed() {
 		t.FailNow()
 	}
-
-	t.Run("WithKeyRouteAffinity", func(t *testing.T) {
-		t.Parallel()
-
-		testCases := []struct {
-			name                        string
-			options                     func() Option
-			shouldHaveSameExecutionPlan bool
-		}{
-			{
-				name: "KeyRouteAffinityRMW",
-				options: func() Option {
-					return WithKeyRouteAffinity(
-						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
-							"test-table": "id",
-						}),
-					)
-				},
-				shouldHaveSameExecutionPlan: true,
-			},
-			{
-				name: "KeyRouteAffinityAll",
-				options: func() Option {
-					return WithKeyRouteAffinity(
-						shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
-							"test-table": "id",
-						}),
-					)
-				},
-				shouldHaveSameExecutionPlan: true,
-			},
-			{
-				name:                        "NoOptimization",
-				options:                     func() Option { return nil },
-				shouldHaveSameExecutionPlan: false,
-			},
-		}
-
-		for _, tc := range testCases {
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-
-				t.Run("SameKeyUseSameNode", func(t *testing.T) {
-					t.Parallel()
-
-					var requestedNodes []string
-
-					nodes := []string{"node1.local", "node2.local", "node3.local"}
-
-					mockTransport := &mocks.MockRoundTripper{
-						AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-							return resp.AlternatorNodesResponse(nodes, req)
-						},
-						NodeHealthRequest: resp.HealthCheckResponse,
-						DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
-							requestedNodes = append(requestedNodes, req.URL.Host)
-							return resp.DynamoDBPutItemResponse(req)
-						},
-					}
-
-					opts := []Option{
-						WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
-						WithCredentials("test-key", "test-secret"),
-					}
-					if tc.options() != nil {
-						opts = append(opts, tc.options())
-					}
-
-					h, err := NewHelper([]string{"node1.local"}, opts...)
-					if err != nil {
-						t.Fatalf("NewHelper returned error: %v", err)
-					}
-					defer h.Stop()
-
-					if err := h.UpdateLiveNodes(); err != nil {
-						t.Fatalf("UpdateLiveNodes returned error: %v", err)
-					}
-
-					client, err := h.NewDynamoDB()
-					if err != nil {
-						t.Fatalf("NewDynamoDB returned error: %v", err)
-					}
-
-					// Make multiple PutItem requests with the same partition key
-					testKey := "same-key"
-					for i := 0; i < 5; i++ {
-						putInput := &dynamodb.PutItemInput{
-							TableName: aws.String("test-table"),
-							Item: map[string]types.AttributeValue{
-								"id":    &types.AttributeValueMemberS{Value: testKey},
-								"value": &types.AttributeValueMemberN{Value: strconv.Itoa(i)},
-							},
-						}
-						// For RMW mode, make the operation conditional
-						if tc.name == "KeyRouteAffinityRMW" {
-							putInput.ConditionExpression = aws.String(
-								"attribute_not_exists(id) OR attribute_exists(id)",
-							)
-						}
-						_, err = client.PutItem(context.Background(), putInput)
-						if err != nil {
-							t.Fatalf("PutItem returned error: %v", err)
-						}
-					}
-
-					if len(requestedNodes) != 5 {
-						t.Fatalf("Expected 5 requests, got %d", len(requestedNodes))
-					}
-
-					if tc.shouldHaveSameExecutionPlan {
-						// All requests should go to the same node
-						firstNode := requestedNodes[0]
-						for i, node := range requestedNodes {
-							if node != firstNode {
-								t.Errorf(
-									"Request %d went to %s, expected %s (all requests should use same node)",
-									i,
-									node,
-									firstNode,
-								)
-							}
-						}
-					} else {
-						// Without optimization, requests might be distributed
-						nodeUsage := make(map[string]int)
-						for _, node := range requestedNodes {
-							nodeUsage[node]++
-						}
-						if len(nodeUsage) < 2 {
-							t.Logf("Info: Without optimization, only %d nodes were used", len(nodeUsage))
-						}
-					}
-				})
-			})
-		}
-
-		t.Run("ReadOperationsWithKeyRouteAffinityAll", func(t *testing.T) {
-			t.Skip("GetItem operations no longer use key route affinity")
-
-			var requestedNodes []string
-
-			nodes := []string{"node1.local", "node2.local", "node3.local"}
-
-			mockTransport := &mocks.MockRoundTripper{
-				AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-					return resp.AlternatorNodesResponse(nodes, req)
-				},
-				NodeHealthRequest: resp.HealthCheckResponse,
-				DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
-					requestedNodes = append(requestedNodes, req.URL.Host)
-					return resp.DynamoDBGetItemResponse(map[string]types.AttributeValue{
-						"id":    &types.AttributeValueMemberS{Value: "test"},
-						"value": &types.AttributeValueMemberS{Value: "data"},
-					}, req)
-				},
-			}
-
-			h, err := NewHelper(
-				[]string{"node1.local"},
-				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
-				WithCredentials("test-key", "test-secret"),
-				WithKeyRouteAffinity(
-					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
-						"test-table": "id",
-					}),
-				),
-			)
-			if err != nil {
-				t.Fatalf("NewHelper returned error: %v", err)
-			}
-			defer h.Stop()
-
-			if err := h.UpdateLiveNodes(); err != nil {
-				t.Fatalf("UpdateLiveNodes returned error: %v", err)
-			}
-
-			client, err := h.NewDynamoDB()
-			if err != nil {
-				t.Fatalf("NewDynamoDB returned error: %v", err)
-			}
-
-			// Test GetItem with optimization enabled for all operations
-			testKey := "read-key"
-			for i := 0; i < 5; i++ {
-				_, err = client.GetItem(context.Background(), &dynamodb.GetItemInput{
-					TableName: aws.String("test-table"),
-					Key: map[string]types.AttributeValue{
-						"id": &types.AttributeValueMemberS{Value: testKey},
-					},
-				})
-				if err != nil {
-					t.Fatalf("GetItem returned error: %v", err)
-				}
-			}
-
-			// All requests should go to the same node
-			if len(requestedNodes) != 5 {
-				t.Fatalf("Expected 5 requests, got %d", len(requestedNodes))
-			}
-
-			firstNode := requestedNodes[0]
-			for i, node := range requestedNodes {
-				if node != firstNode {
-					t.Errorf("Request %d went to %s, expected %s", i, node, firstNode)
-				}
-			}
-		})
-
-		t.Run("UpdateAndDeleteOperations", func(t *testing.T) {
-			t.Parallel()
-
-			var (
-				updateNodes []string
-				deleteNodes []string
-			)
-
-			nodes := []string{"node1.local", "node2.local", "node3.local"}
-
-			mockTransport := &mocks.MockRoundTripper{
-				AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-					return resp.AlternatorNodesResponse(nodes, req)
-				},
-				NodeHealthRequest: resp.HealthCheckResponse,
-				DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
-					// Detect operation type from request body
-					if req.Header.Get("X-Amz-Target") == "DynamoDB_20120810.UpdateItem" {
-						updateNodes = append(updateNodes, req.URL.Host)
-						return resp.DynamoDBUpdateItemResponse(req)
-					}
-					deleteNodes = append(deleteNodes, req.URL.Host)
-					return resp.DynamoDBDeleteItemResponse(req)
-				},
-			}
-
-			h, err := NewHelper(
-				[]string{"node1.local"},
-				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
-				WithCredentials("test-key", "test-secret"),
-				WithKeyRouteAffinity(
-					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).WithPkInfo(map[string]string{
-						"test-table": "id",
-					}),
-				),
-			)
-			if err != nil {
-				t.Fatalf("NewHelper returned error: %v", err)
-			}
-			defer h.Stop()
-
-			if err := h.UpdateLiveNodes(); err != nil {
-				t.Fatalf("UpdateLiveNodes returned error: %v", err)
-			}
-
-			client, err := h.NewDynamoDB()
-			if err != nil {
-				t.Fatalf("NewDynamoDB returned error: %v", err)
-			}
-
-			testKey := "update-delete-key"
-
-			// Test UpdateItem
-			for i := 0; i < 3; i++ {
-				_, err = client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
-					TableName: aws.String("test-table"),
-					Key: map[string]types.AttributeValue{
-						"id": &types.AttributeValueMemberS{Value: testKey},
-					},
-					UpdateExpression: aws.String("SET #v = :val"),
-					ExpressionAttributeNames: map[string]string{
-						"#v": "value",
-					},
-					ExpressionAttributeValues: map[string]types.AttributeValue{
-						":val": &types.AttributeValueMemberN{Value: strconv.Itoa(i)},
-					},
-				})
-				if err != nil {
-					t.Fatalf("UpdateItem returned error: %v", err)
-				}
-			}
-
-			// Test DeleteItem
-			for i := 0; i < 3; i++ {
-				_, err = client.DeleteItem(context.Background(), &dynamodb.DeleteItemInput{
-					TableName: aws.String("test-table"),
-					Key: map[string]types.AttributeValue{
-						"id": &types.AttributeValueMemberS{Value: testKey},
-					},
-				})
-				if err != nil {
-					t.Fatalf("DeleteItem returned error: %v", err)
-				}
-			}
-
-			// All UpdateItem requests should go to the same node
-			if len(updateNodes) != 3 {
-				t.Fatalf("Expected 3 update requests, got %d", len(updateNodes))
-			}
-			firstUpdateNode := updateNodes[0]
-			for i, node := range updateNodes {
-				if node != firstUpdateNode {
-					t.Errorf("Update request %d went to %s, expected %s", i, node, firstUpdateNode)
-				}
-			}
-
-			// All DeleteItem requests should go to the same node
-			if len(deleteNodes) != 3 {
-				t.Fatalf("Expected 3 delete requests, got %d", len(deleteNodes))
-			}
-			firstDeleteNode := deleteNodes[0]
-			for i, node := range deleteNodes {
-				if node != firstDeleteNode {
-					t.Errorf("Delete request %d went to %s, expected %s", i, node, firstDeleteNode)
-				}
-			}
-
-			// Update and Delete for the same key should go to the same node
-			if firstUpdateNode != firstDeleteNode {
-				t.Errorf(
-					"Update and Delete operations for same key went to different nodes: update=%s, delete=%s",
-					firstUpdateNode,
-					firstDeleteNode,
-				)
-			}
-		})
-	})
 }
