@@ -19,8 +19,10 @@ type NodeHealthStoreConfig struct {
 	Scoring HealthScoring
 	// QuarantineReleaseConcurrency caps how many release callbacks run simultaneously.
 	QuarantineReleaseConcurrency int
-	// QuarantineReleasePeriod makes .
+	// QuarantineReleasePeriod makes it release quarantined nodes at some point
 	QuarantineReleasePeriod time.Duration
+	// Disabled makes it store all known nodes into Active bucket, no health tracking is going on when it is true
+	Disabled bool
 }
 
 // Validate normalizes configuration values and ensures sane defaults are applied.
@@ -58,8 +60,33 @@ func DefaultNodeHealthStoreConfig() NodeHealthStoreConfig {
 	}
 }
 
+// NodeHealthStoreInterface defines the interface for tracking node health and managing quarantined nodes.
+type NodeHealthStoreInterface interface {
+	GetActiveNodes() []url.URL
+	GetQuarantinedNodes() []url.URL
+	TryReleaseQuarantinedNodes() []url.URL
+	Start()
+	Stop()
+	AddNode(url.URL)
+	RemoveNode(url.URL)
+	ReportNodeError(node url.URL, err error)
+}
+
 // NewNodeHealthStore builds a new NodeHealthStore with the provided configuration.
+// When cfg.Disabled is true, it returns a no-op implementation that does not track node health.
 func NewNodeHealthStore(
+	cfg NodeHealthStoreConfig,
+	releaseFunc QuarantineReleaseFunc,
+	initialNodes []url.URL,
+) (NodeHealthStoreInterface, error) {
+	if cfg.Disabled {
+		return NewNodeHealthNoop(initialNodes), nil
+	}
+	return NewNodeHealthStoreBasic(cfg, releaseFunc, initialNodes)
+}
+
+// NewNodeHealthStoreBasic builds a new NodeHealthStore with the provided configuration.
+func NewNodeHealthStoreBasic(
 	cfg NodeHealthStoreConfig,
 	releaseFunc QuarantineReleaseFunc,
 	initialNodes []url.URL,

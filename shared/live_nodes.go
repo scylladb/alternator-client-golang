@@ -24,6 +24,18 @@ const (
 	defaultIdleConnectionTimeout = 6 * time.Hour
 )
 
+// NodeHealthStoreInterface defines the interface for tracking node health and managing quarantined nodes.
+type NodeHealthStoreInterface interface {
+	GetActiveNodes() []url.URL
+	GetQuarantinedNodes() []url.URL
+	TryReleaseQuarantinedNodes() []url.URL
+	Start()
+	Stop()
+	AddNode(url.URL)
+	RemoveNode(url.URL)
+	ReportNodeError(node url.URL, err error)
+}
+
 // AlternatorLiveNodes holds logic that allows to read and remember alternator nodes
 type AlternatorLiveNodes struct {
 	liveNodes          atomic.Pointer[[]url.URL]
@@ -36,7 +48,7 @@ type AlternatorLiveNodes struct {
 	stopFn             context.CancelFunc
 	httpClient         *http.Client
 	updateSignal       chan struct{}
-	nodeHealthStore    *nodeshealth.NodeHealthStore
+	nodeHealthStore    NodeHealthStoreInterface
 }
 
 // GetActiveNodes returns nodes that are currently considered healthy.

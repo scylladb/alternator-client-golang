@@ -365,6 +365,118 @@ func TestOptions(t *testing.T) {
 	t.Run("WithNodeHealthStoreConfig", func(t *testing.T) {
 		t.Parallel()
 
+		t.Run("Disabled", func(t *testing.T) {
+			t.Parallel()
+
+			healthConfig := nodeshealth.NodeHealthStoreConfig{
+				Disabled: true,
+			}
+
+			connRefusedErr := &net.OpError{Err: syscall.ECONNREFUSED}
+
+			// Create URLs for all nodes
+			node1 := url.URL{Scheme: "http", Host: "node1.local:8080"}
+			node2 := url.URL{Scheme: "http", Host: "node2.local:8080"}
+			node3 := url.URL{Scheme: "http", Host: "node3.local:8080"}
+
+			allMockNodes := []url.URL{node1, node2, node3}
+
+			defaultDynamoDBResp := func(req *http.Request) (*http.Response, error) {
+				tableNames := []string{"test-table"}
+				return resp.DynamoDBListTablesResponse(tableNames, req)
+			}
+
+			mockTransport := mocks.NewMockClusterRoundTripper(allMockNodes, defaultDynamoDBResp)
+			// Set node2 as failing - this would normally quarantine it
+			mockTransport.SetNodeError(node2, connRefusedErr)
+
+			h, err := NewHelper(
+				[]string{node1.Hostname()},
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return mockTransport
+				}),
+				WithScheme("http"),
+				WithPort(8080),
+				WithNodeHealthStoreConfig(healthConfig),
+				WithIdleNodesListUpdatePeriod(0),
+				WithAWSConfigOptions(
+					func(cfg *aws.Config) {
+						cfg.RetryMaxAttempts = 3
+					}),
+			)
+			if err != nil {
+				t.Fatalf("NewHelper failed: %v", err)
+			}
+			defer h.Stop()
+
+			// Enforce seed for reproducibility
+			h.queryPlanSeed = 8
+
+			ddb, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+				options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+					options.MaxAttempts = 3
+					options.MaxBackoff = 0
+				})
+			})
+			if err != nil {
+				t.Fatalf("NewDynamoDB returned error: %s", err.Error())
+			}
+
+			t.Run("NodesNeverQuarantined", func(t *testing.T) {
+				// Initially only node1 is known - with disabled tracking it should be active
+				assertNodesStatus(t, h.nodes, []url.URL{node1}, nil)
+
+				// Trigger node discovery - mock will return 3 nodes
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+				}
+
+				// With disabled health tracking, all nodes should be active, none quarantined
+				// Even node2 which is set to fail should not be quarantined
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, nil)
+			})
+
+			t.Run("ErrorsDontCauseQuarantine", func(t *testing.T) {
+				// Make multiple requests - some will hit the failing node2
+				for range 10 {
+					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
+						Limit: aws.Int32(5),
+					})
+					// Request should succeed due to retries
+					if err != nil {
+						t.Fatalf("ListTables failed: %s", err.Error())
+					}
+				}
+
+				// Even after many errors, no nodes should be quarantined
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, nil)
+			})
+
+			t.Run("TryReleaseQuarantinedNodesIsNoop", func(t *testing.T) {
+				// This should be a no-op and return nil
+				released := h.nodes.TryReleaseQuarantinedNodes()
+				if released != nil {
+					t.Errorf("Expected TryReleaseQuarantinedNodes to return nil, got %v", released)
+				}
+
+				// Status should remain unchanged
+				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, nil)
+			})
+
+			t.Run("NodeAddRemoveStillWorks", func(t *testing.T) {
+				// Remove node1 from the mock cluster
+				mockTransport.DeleteNode(node1)
+
+				// Update should pick up the change - use node2 or node3 which are still in mock
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
+				}
+
+				// node1 should be removed, but still no quarantined nodes
+				assertNodesStatus(t, h.nodes, []url.URL{node2, node3}, nil)
+			})
+		})
+
 		t.Run("BasicFunctionality", func(t *testing.T) {
 			t.Parallel()
 
