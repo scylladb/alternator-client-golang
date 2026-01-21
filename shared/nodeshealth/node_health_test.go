@@ -50,7 +50,7 @@ func TestNodeHealthStoreScoreAdjustments(t *testing.T) {
 	) + DefaultNodeEventScore(
 		&net.DNSError{IsTimeout: true},
 	)
-	store, err := NewNodeHealthStore(cfg, nil, []url.URL{node})
+	store, err := NewNodeHealthStoreBasic(cfg, nil, []url.URL{node})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestNodeHealthStoreResetsScoreAfterInterval(t *testing.T) {
 	cfg.Scoring.ResetInterval = 5 * time.Millisecond
 	cfg.Scoring.QuarantineScoreCutOff = 9
 	cfg.Scoring.QuarantineReleaseScore = 0
-	store, err := NewNodeHealthStore(cfg, nil, []url.URL{node})
+	store, err := NewNodeHealthStoreBasic(cfg, nil, []url.URL{node})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestNodeHealthStoreTryReleaseQuarantinedNodes(t *testing.T) {
 		return u == idleNode && status.Quarantined()
 	}
 	initial := []url.URL{idleNode}
-	store, err := NewNodeHealthStore(cfg, releaseFunc, initial)
+	store, err := NewNodeHealthStoreBasic(cfg, releaseFunc, initial)
 	if err != nil {
 		t.Fatal(err)
 	}

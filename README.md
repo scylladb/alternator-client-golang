@@ -194,6 +194,30 @@ For now only Gzip compression is supported in the future there is a possiblity t
 
 To create a new Gzip configuration, use `NewGzipConfig()`. You can also set compression level via `WithLevel()` option to control the trade-off between compression speed and compression ratio.
 
+### Disabling Node Health Tracking
+
+By default, the library tracks node health and temporarily quarantines nodes that experience connection errors. This helps route traffic away from unhealthy nodes. However, in some scenarios you may want to disable this behavior:
+
+- When using an external load balancer that already handles node health
+- In testing environments where you want predictable round-robin behavior
+- When you prefer to let AWS SDK retries handle transient failures
+
+To disable node health tracking:
+```go
+h, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{
+        Disabled: true,
+    }),
+)
+```
+
+When disabled:
+- All discovered nodes remain active regardless of errors
+- No nodes are ever quarantined
+- Node discovery (add/remove) continues to work normally
+- AWS SDK retry mechanisms still handle transient failures
+
 ### KeyRouteAffinity
 
 When using Lightweight Transactions (LWT) in ScyllaDB/Alternator, routing requests for the same partition key to the same coordinator node can significantly improve performance.
