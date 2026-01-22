@@ -321,6 +321,11 @@ func (lb *Helper) Stop() {
 	lb.nodes.Stop()
 }
 
+// GetMaxIdleHTTPConnectionsPerHost returns the configured maximum number of idle HTTP connections per host.
+func (lb *Helper) GetMaxIdleHTTPConnectionsPerHost() int {
+	return lb.cfg.MaxIdleHTTPConnectionsPerHost
+}
+
 func (lb *Helper) endpointResolverV2() dynamodb.EndpointResolverV2 {
 	return &EndpointResolverV2{lb: lb}
 }
