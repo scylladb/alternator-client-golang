@@ -293,6 +293,17 @@ func (lb *Helper) NextNode() url.URL {
 	return lb.nodes.NextNode()
 }
 
+// GetNodes returns a copy of the complete list of live Alternator nodes.
+// If no live nodes are available, it returns the initial nodes list.
+func (lb *Helper) GetNodes() []url.URL {
+	return lb.nodes.GetNodes()
+}
+
+// GetActiveNodes returns the list of currently active Alternator node URLs.
+func (lb *Helper) GetActiveNodes() []url.URL {
+	return lb.nodes.GetActiveNodes()
+}
+
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (lb *Helper) UpdateLiveNodes() error {
 	return lb.nodes.UpdateLiveNodes()
@@ -319,6 +330,11 @@ func (lb *Helper) Start() {
 // Stop stops background routines used for periodic node discovery and updates.
 func (lb *Helper) Stop() {
 	lb.nodes.Stop()
+}
+
+// GetMaxIdleHTTPConnectionsPerHost returns the configured maximum number of idle HTTP connections per host.
+func (lb *Helper) GetMaxIdleHTTPConnectionsPerHost() int {
+	return lb.cfg.MaxIdleHTTPConnectionsPerHost
 }
 
 func (lb *Helper) endpointResolverV2() dynamodb.EndpointResolverV2 {
