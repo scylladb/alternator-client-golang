@@ -52,26 +52,70 @@ Connections to every node will be kept alive even if no requests are being sent.
 
 ### Rack and Datacenter awareness
 
-You can configure load balancer to target particular datacenter (region) or rack (availability zone) via `WithRack` and `WithDatacenter` options, like so:
+You can configure the load balancer to target a particular datacenter (region) or rack (availability zone) using the `WithRoutingScope` option with routing scope types from the `rt` package.
+
+#### Routing Scopes
+
+Three scope types are available:
+
+- **`rt.NewClusterScope()`** - Target all nodes in the cluster (default behavior)
+- **`rt.NewDCScope(datacenter, fallback)`** - Target nodes in a specific datacenter
+- **`rt.NewRackScope(datacenter, rack, fallback)`** - Target nodes in a specific rack within a datacenter
+
+Scopes can be chained with fallbacks. For example, to try a specific rack first, then fall back to the datacenter, then the entire cluster:
+
 ```golang
-    lb, err := alb.NewHelper([]string{"x.x.x.x"}, alb.WithRack("someRack"), alb.WithDatacenter("someDc1"))
+import (
+    helper "github.com/scylladb/alternator-client-golang/sdkv2"
+    "github.com/scylladb/alternator-client-golang/shared/rt"
+)
+
+// Target rack "rack1" in "dc1", fall back to any node in "dc1", then any node in the cluster
+lb, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithRoutingScope(
+        rt.NewRackScope("dc1", "rack1",
+            rt.NewDCScope("dc1",
+                rt.NewClusterScope())),
+    ),
+)
+
+// Target only datacenter "dc1", no fallback (nil means no fallback)
+lb, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithRoutingScope(rt.NewDCScope("dc1", nil)),
+)
 ```
 
-Additionally, you can check if alternator cluster know targeted rack/datacenter:
+#### Deprecated Options
+
+The `WithRack` and `WithDatacenter` options are deprecated. Use `WithRoutingScope` instead:
+
+```golang
+// Deprecated:
+lb, err := helper.NewHelper([]string{"x.x.x.x"}, helper.WithDatacenter("dc1"), helper.WithRack("rack1"))
+
+// Use instead:
+lb, err := helper.NewHelper([]string{"x.x.x.x"}, helper.WithRoutingScope(rt.NewRackScope("dc1", "rack1", nil)))
+```
+
+#### Validation
+
+You can check if the alternator cluster knows about the targeted rack/datacenter:
 ```golang
 	if err := lb.CheckIfRackAndDatacenterSetCorrectly(); err != nil {
 		return fmt.Errorf("CheckIfRackAndDatacenterSetCorrectly() unexpectedly returned an error: %v", err)
 	}
 ```
 
-To check if cluster support datacenter/rack feature supported you can call `CheckIfRackDatacenterFeatureIsSupported`:
+To check if the cluster supports the datacenter/rack feature:
 ```golang
     supported, err := lb.CheckIfRackDatacenterFeatureIsSupported()
 	if err != nil {
 		return fmt.Errorf("failed to check if rack/dc feature is supported: %v", err)
 	}
 	if !supported {
-        return fmt.Errorf("dc/rack feature is not supporte")
+        return fmt.Errorf("dc/rack feature is not supported")
     }
 ```
 
