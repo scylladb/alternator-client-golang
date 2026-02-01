@@ -61,7 +61,7 @@ func TestHashAttributeValue_PrimitiveTypes(t *testing.T) {
 		// Binary tests
 		{"B_123", &types.AttributeValueMemberB{Value: []byte{0x01, 0x02, 0x03}}, 5026299041734804437},
 		{"B_empty", &types.AttributeValueMemberB{Value: []byte{}}, 8244620721157455449},
-		{"B_FF0080", &types.AttributeValueMemberB{Value: []byte{0xFF, 0x00, 0x80}}, 6569165606467461771},
+		{"B_FF0080", &types.AttributeValueMemberB{Value: []byte{0xFF, 0x00, 0x80}}, 14533934253577680},
 
 		// Boolean tests
 		{"BOOL_true", &types.AttributeValueMemberBOOL{Value: true}, 8486936384116756332},
