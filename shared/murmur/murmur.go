@@ -49,7 +49,7 @@ func fmix(n int64) int64 {
 }
 
 func block(p byte) int64 {
-	return int64(int8(p))
+	return int64(p) // Treat byte as unsigned (0-255) per cross-language spec
 }
 
 func rotl(x int64, r uint8) int64 {

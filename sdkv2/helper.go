@@ -32,10 +32,8 @@ package sdkv2
 import (
 	"context"
 	"fmt"
-	"hash"
 	"net/http"
 	"net/url"
-	"sort"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -45,7 +43,6 @@ import (
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
 	"github.com/scylladb/alternator-client-golang/shared/logx"
-	"github.com/scylladb/alternator-client-golang/shared/murmur"
 
 	"github.com/scylladb/alternator-client-golang/shared"
 
@@ -543,110 +540,17 @@ func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, table
 		return 0, fmt.Errorf("request does not have partition key value %s", tableName)
 	}
 
-	h := murmur.New()
-
 	val, ok := values[keyName]
 	if !ok {
 		return 0, fmt.Errorf("value for key %s not found", keyName)
 	}
-	if err := writeToHash(h, val); err != nil {
+
+	hash, err := HashAttributeValue(val)
+	if err != nil {
 		return 0, fmt.Errorf("failed to hash value for key %s: %w", keyName, err)
 	}
 
-	return int64(h.Sum64()), nil
-}
-
-func writeToHash(h hash.Hash64, val types.AttributeValue) error {
-	switch v := val.(type) {
-	case *types.AttributeValueMemberS:
-		_, err := h.Write([]byte(v.Value))
-		if err != nil {
-			return fmt.Errorf("failed to hash string: %w", err)
-		}
-	case *types.AttributeValueMemberSS:
-		for id, chunk := range v.Value {
-			_, err := h.Write([]byte(chunk))
-			if err != nil {
-				return fmt.Errorf("failed to hash string set value %d: %w", id, err)
-			}
-		}
-	case *types.AttributeValueMemberBS:
-		for id, chunk := range v.Value {
-			_, err := h.Write(chunk)
-			if err != nil {
-				return fmt.Errorf("failed to hash binary set value %d: %w", id, err)
-			}
-		}
-	case *types.AttributeValueMemberBOOL:
-		if v.Value {
-			_, err := h.Write([]byte{1})
-			if err != nil {
-				return fmt.Errorf("failed to hash boolean value: %w", err)
-			}
-		} else {
-			_, err := h.Write([]byte{0})
-			if err != nil {
-				return fmt.Errorf("failed to hash boolean value: %w", err)
-			}
-		}
-	case *types.AttributeValueMemberL:
-		for n, el := range v.Value {
-			if err := writeToHash(h, el); err != nil {
-				return fmt.Errorf("failed to hash list value %d: %w", n, err)
-			}
-		}
-	case *types.AttributeValueMemberM:
-		keys := make([]string, 0, len(v.Value))
-		for key := range v.Value {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			if _, err := h.Write([]byte(key)); err != nil {
-				return fmt.Errorf("failed to hash map value for key %q: %w", key, err)
-			}
-			if err := writeToHash(h, v.Value[key]); err != nil {
-				return fmt.Errorf("failed to hash map value for key %q: %w", key, err)
-			}
-		}
-	case *types.AttributeValueMemberN:
-		_, err := h.Write([]byte(v.Value))
-		if err != nil {
-			return fmt.Errorf("failed to hash list value: %w", err)
-		}
-	case *types.AttributeValueMemberNS:
-		for id, el := range v.Value {
-			_, err := h.Write([]byte(el))
-			if err != nil {
-				return fmt.Errorf("failed to hash number set value %d: %w", id, err)
-			}
-		}
-	case *types.AttributeValueMemberNULL:
-		if v.Value {
-			_, err := h.Write([]byte{1})
-			if err != nil {
-				return fmt.Errorf("failed to hash null value: %w", err)
-			}
-		} else {
-			_, err := h.Write([]byte{0})
-			if err != nil {
-				return fmt.Errorf("failed to hash null value: %w", err)
-			}
-		}
-	case *types.AttributeValueMemberB:
-		_, err := h.Write(v.Value)
-		if err != nil {
-			return fmt.Errorf("failed to hash boolean value: %w", err)
-		}
-	case *types.UnknownUnionMember:
-		_, err := h.Write(v.Value)
-		if err != nil {
-			return fmt.Errorf("failed to hash union value: %w", err)
-		}
-	default:
-		return fmt.Errorf("unknown type %T", v)
-	}
-	return nil
+	return hash, nil
 }
 
 func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {

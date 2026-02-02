@@ -234,6 +234,40 @@ func TestKnownHashes(t *testing.T) {
 	}
 }
 
+// TestMurmur3CrossLanguageVectors tests the MurmurHash3 test vectors from the
+// cross-language specification: https://github.com/scylladb/alternator-load-balancing/issues/165
+func TestMurmur3CrossLanguageVectors(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    []byte
+		expected int64
+	}{
+		{"empty", []byte{}, 0},
+		{"single_byte_01", []byte{0x01}, 8849112093580131862},
+		{"hello_utf8", []byte("hello"), -3758069500696749310},
+		{"type_prefix_plus_hello", []byte{0x01, 0x68, 0x65, 0x6C, 0x6C, 0x6F}, 8815023923555918238},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Murmur3H1(tc.input)
+			if got != tc.expected {
+				t.Errorf("Hash mismatch: got=%d (0x%X), want=%d (0x%X)",
+					got, uint64(got), tc.expected, uint64(tc.expected))
+			}
+
+			// Also verify hash.Hash interface produces same result
+			h := New()
+			h.Write(tc.input)
+			writerGot := int64(h.Sum64())
+			if writerGot != tc.expected {
+				t.Errorf("Writer hash mismatch: got=%d (0x%X), want=%d (0x%X)",
+					writerGot, uint64(writerGot), tc.expected, uint64(tc.expected))
+			}
+		})
+	}
+}
+
 func TestPartialBlockHandling(t *testing.T) {
 	testCases := []struct {
 		name string
