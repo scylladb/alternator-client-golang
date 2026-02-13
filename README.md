@@ -299,6 +299,21 @@ The driver automatically discovers the partition key.
 It periodically runs DescribeTable in the background to retrieve the partition key name.
 Until the partition key is discovered, operations run without partition-key optimizations.
 
+#### Simple Configuration with Automatic Discovery
+
+The simplest way to enable KeyRouteAffinity is to let the driver automatically discover partition keys via `DescribeTable`:
+```go
+h, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithPort(9999),
+    helper.WithCredentials("whatever", "secret"),
+    helper.WithKeyRouteAffinity(
+        helper.NewKeyRouteAffinityConfig(helper.KeyRouteAffinityRMW),
+    ),
+)
+```
+Until the partition key is discovered, requests are routed without optimization. Once discovered, requests for the same partition key are pinned to the same coordinator node.
+
 #### Pre-Configuring Partition Keys with WithPkInfo
 
 If you don't want to wait till driver automatically discovers partition key you can use `WithPkInfo` to pre-configure the 
