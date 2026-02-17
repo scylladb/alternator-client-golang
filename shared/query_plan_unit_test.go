@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"fmt"
+	"math"
 	"math/rand"
 	"net/url"
 	"testing"
@@ -119,4 +121,160 @@ func TestLazyQueryPlan(t *testing.T) {
 			t.Fatalf("expected quarantined nodes fetched once, got %d", source.quarantinedCalls)
 		}
 	})
+}
+
+func makeTestNodes(prefix string, count int) []url.URL {
+	nodes := make([]url.URL, count)
+	for i := 0; i < count; i++ {
+		nodes[i] = url.URL{Host: fmt.Sprintf("%s%d.example.com:8043", prefix, i+1)}
+	}
+	return nodes
+}
+
+// TestLazyQueryPlanCrossLanguageVectors verifies that LazyQueryPlan produces identical
+// node selection sequences for given seeds across all language implementations.
+// These test vectors are defined in DRIVER-446 and must be kept in sync with the
+// Java (and future) implementations to ensure cross-language key route affinity.
+//
+// The PRNG is Go's math/rand (Lagged Fibonacci Generator) with pick-and-remove selection.
+// See: https://scylladb.atlassian.net/browse/DRIVER-446
+func TestLazyQueryPlanCrossLanguageVectors(t *testing.T) {
+	tests := []struct {
+		name       string
+		seed       int64
+		numActive  int
+		numQuarant int
+		wantFirst6 []string
+	}{
+		{
+			name:       "seed=42, 10 active",
+			seed:       42,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node6.example.com:8043",
+				"node9.example.com:8043",
+				"node5.example.com:8043",
+				"node2.example.com:8043",
+				"node7.example.com:8043",
+				"node1.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=123, 10 active",
+			seed:       123,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node6.example.com:8043",
+				"node1.example.com:8043",
+				"node4.example.com:8043",
+				"node3.example.com:8043",
+				"node10.example.com:8043",
+				"node5.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=999, 10 active",
+			seed:       999,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node5.example.com:8043",
+				"node10.example.com:8043",
+				"node4.example.com:8043",
+				"node1.example.com:8043",
+				"node2.example.com:8043",
+				"node3.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=0, 10 active",
+			seed:       0,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node5.example.com:8043",
+				"node1.example.com:8043",
+				"node2.example.com:8043",
+				"node10.example.com:8043",
+				"node6.example.com:8043",
+				"node8.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=-1, 10 active",
+			seed:       -1,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node2.example.com:8043",
+				"node5.example.com:8043",
+				"node1.example.com:8043",
+				"node3.example.com:8043",
+				"node6.example.com:8043",
+				"node10.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=42, 6 active + 4 quarantined",
+			seed:       42,
+			numActive:  6,
+			numQuarant: 4,
+			wantFirst6: []string{
+				"node6.example.com:8043",
+				"node3.example.com:8043",
+				"node1.example.com:8043",
+				"node4.example.com:8043",
+				"node2.example.com:8043",
+				"node5.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=12345, 10 active",
+			seed:       12345,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node4.example.com:8043",
+				"node5.example.com:8043",
+				"node1.example.com:8043",
+				"node7.example.com:8043",
+				"node6.example.com:8043",
+				"node8.example.com:8043",
+			},
+		},
+		{
+			name:       "seed=MaxInt64, 10 active",
+			seed:       math.MaxInt64,
+			numActive:  10,
+			numQuarant: 0,
+			wantFirst6: []string{
+				"node2.example.com:8043",
+				"node7.example.com:8043",
+				"node8.example.com:8043",
+				"node1.example.com:8043",
+				"node10.example.com:8043",
+				"node4.example.com:8043",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := &fakeNodesSource{
+				activeNodes:      makeTestNodes("node", tt.numActive),
+				quarantinedNodes: makeTestNodes("quarantined", tt.numQuarant),
+			}
+
+			plan := NewLazyQueryPlanWithSeed(source, tt.seed)
+
+			for i, want := range tt.wantFirst6 {
+				got := plan.Next()
+				if got.Host != want {
+					t.Errorf("Next()[%d]: got %q, want %q", i, got.Host, want)
+				}
+			}
+		})
+	}
 }
