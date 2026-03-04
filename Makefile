@@ -141,7 +141,16 @@ upgrade-all-deps:
 
 .PHONY: create-release-commits
 create-release-commits:
-	@if [ -z "$(version)" ]; then echo "Usage: make create-release-commits version=vX.Y.Z"; exit 1; fi
+	@LATEST=$$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1); \
+	if [ -z "$(version)" ]; then \
+		echo "Usage: make create-release-commits version=vX.Y.Z"; \
+		if [ -n "$$LATEST" ]; then echo "Latest release: $$LATEST"; fi; \
+		exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Error: working tree has uncommitted changes"; \
+		exit 1; \
+	fi
 	@$(MAKE) update-go-mod
 	VERSION="$(version)"; \
 	for module in sdkv1 sdkv2; do \
