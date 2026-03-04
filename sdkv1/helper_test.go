@@ -5,6 +5,7 @@ package sdkv1_test
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net/url"
 	"slices"
@@ -209,6 +210,70 @@ func TestKeyLogWriter(t *testing.T) {
 
 		if len(keyWriter.keyData) == 0 {
 			t.Fatalf("keyData should not be empty")
+		}
+	})
+}
+
+func TestServerCACertificate(t *testing.T) {
+	t.Run("Trusted", func(t *testing.T) {
+		h, err := helper.NewHelper(
+			knownNodes,
+			helper.WithScheme("https"),
+			helper.WithPort(httpsPort),
+			helper.WithServerCACertificateFile("../test/scylla/db.crt"),
+			helper.WithCredentials("whatever", "secret"),
+		)
+		if err != nil {
+			t.Fatalf("failed to create alternator helper: %v", err)
+		}
+		defer h.Stop()
+
+		err = h.UpdateLiveNodes()
+		if err != nil {
+			t.Fatalf("UpdateLiveNodes() unexpectedly returned an error: %v", err)
+		}
+
+		ddb, err := h.NewDynamoDB()
+		if err != nil {
+			t.Fatalf("failed to create DynamoDB client: %v", err)
+		}
+
+		_, err = ddb.DeleteTable(&dynamodb.DeleteTableInput{
+			TableName: aws.String("table-that-does-not-exist"),
+		})
+		if err != nil && !errors.As(err, notFoundErr) {
+			t.Fatalf("unexpected operation error: %v", err)
+		}
+	})
+
+	t.Run("Untrusted", func(t *testing.T) {
+		h, err := helper.NewHelper(
+			knownNodes,
+			helper.WithScheme("https"),
+			helper.WithPort(httpsPort),
+			helper.WithServerCACertificatePool(x509.NewCertPool()),
+			helper.WithCredentials("whatever", "secret"),
+		)
+		if err != nil {
+			t.Fatalf("failed to create alternator helper: %v", err)
+		}
+		defer h.Stop()
+
+		err = h.UpdateLiveNodes()
+		if err == nil {
+			t.Fatalf("UpdateLiveNodes() should have returned a TLS error")
+		}
+
+		ddb, err := h.NewDynamoDB()
+		if err != nil {
+			t.Fatalf("failed to create DynamoDB client: %v", err)
+		}
+
+		_, err = ddb.DeleteTable(&dynamodb.DeleteTableInput{
+			TableName: aws.String("table-that-does-not-exist"),
+		})
+		if err == nil {
+			t.Fatalf("DynamoDB request should have returned a TLS error")
 		}
 	})
 }

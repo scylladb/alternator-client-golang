@@ -4,9 +4,11 @@ package shared
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"reflect"
 	"time"
 
@@ -40,6 +42,8 @@ type Config struct {
 	ClientCertificateSource CertSource
 	// Makes it ignore server certificate errors
 	IgnoreServerCertificateError bool
+	// ServerCACertificatePool provides custom CA certificates for verifying the server's TLS certificate
+	ServerCACertificatePool *x509.CertPool
 	// OptimizeHeaders - when true removes unnecessary http headers reducing network footprint
 	OptimizeHeaders func(Config) []string
 	// Update node list when no requests are running
@@ -176,6 +180,10 @@ func (c *Config) ToALNOptions() []ALNOption {
 		out = append(out, WithALNIdleUpdatePeriod(c.IdleNodesListUpdatePeriod))
 	}
 
+	if c.ServerCACertificatePool != nil {
+		out = append(out, WithALNServerCACertificatePool(c.ServerCACertificatePool))
+	}
+
 	if c.ClientCertificateSource != nil {
 		out = append(out, WithALNClientCertificateSource(c.ClientCertificateSource))
 	}
@@ -302,6 +310,28 @@ func WithNodeHealthStoreConfig(storeCfg nodeshealth.NodeHealthStoreConfig) Optio
 func WithIgnoreServerCertificateError(value bool) Option {
 	return func(config *Config) {
 		config.IgnoreServerCertificateError = value
+	}
+}
+
+// WithServerCACertificateFile provides a custom CA certificate PEM file for verifying the server's TLS certificate
+func WithServerCACertificateFile(caFile string) Option {
+	pemData, err := os.ReadFile(caFile)
+	if err != nil {
+		panic(fmt.Sprintf("failed to read CA certificate file: %v", err))
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemData) {
+		panic("failed to parse CA certificate PEM data")
+	}
+	return func(config *Config) {
+		config.ServerCACertificatePool = pool
+	}
+}
+
+// WithServerCACertificatePool provides a pre-built x509.CertPool for verifying the server's TLS certificate
+func WithServerCACertificatePool(pool *x509.CertPool) Option {
+	return func(config *Config) {
+		config.ServerCACertificatePool = pool
 	}
 }
 
