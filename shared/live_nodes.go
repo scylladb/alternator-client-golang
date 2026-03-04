@@ -3,12 +3,14 @@ package shared
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -71,6 +73,8 @@ type ALNConfig struct {
 	IdleUpdatePeriod time.Duration
 	// Makes it ignore server certificate errors
 	IgnoreServerCertificateError bool
+	// ServerCACertificatePool provides custom CA certificates for verifying the server's TLS certificate
+	ServerCACertificatePool *x509.CertPool
 	// ClientCertificateSource a certificate store to supplies client certificate to the http client
 	ClientCertificateSource CertSource
 	Logger                  logx.Logger
@@ -159,6 +163,28 @@ func WithALNIdleUpdatePeriod(period time.Duration) ALNOption {
 func WithALNIgnoreServerCertificateError(value bool) ALNOption {
 	return func(config *ALNConfig) {
 		config.IgnoreServerCertificateError = value
+	}
+}
+
+// WithALNServerCACertificateFile provides a custom CA certificate PEM file for verifying the server's TLS certificate
+func WithALNServerCACertificateFile(caFile string) ALNOption {
+	pemData, err := os.ReadFile(caFile)
+	if err != nil {
+		panic(fmt.Sprintf("failed to read CA certificate file: %v", err))
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemData) {
+		panic("failed to parse CA certificate PEM data")
+	}
+	return func(config *ALNConfig) {
+		config.ServerCACertificatePool = pool
+	}
+}
+
+// WithALNServerCACertificatePool provides a pre-built x509.CertPool for verifying the server's TLS certificate
+func WithALNServerCACertificatePool(pool *x509.CertPool) ALNOption {
+	return func(config *ALNConfig) {
+		config.ServerCACertificatePool = pool
 	}
 }
 

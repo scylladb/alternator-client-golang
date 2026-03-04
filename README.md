@@ -332,6 +332,27 @@ h, err := helper.NewHelper(
 )
 ```
 
+### TLS configuration
+
+The library provides several options for configuring TLS:
+
+- `WithServerCACertificateFile(caFile)` — provide a custom CA certificate PEM file for verifying the server's TLS certificate. Useful when the server uses a self-signed certificate or a private CA.
+- `WithServerCACertificatePool(pool)` — provide a pre-built `*x509.CertPool` for verifying the server's TLS certificate.
+- `WithIgnoreServerCertificateError(true)` — skip all server certificate verification (insecure, use only for development/testing).
+- `WithClientCertificateFile(certFile, keyFile)` — provide a client certificate for mutual TLS (mTLS) authentication.
+
+Example using HTTPS with a custom CA certificate:
+
+```go
+h, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithScheme("https"),
+    helper.WithPort(9999),
+    helper.WithServerCACertificateFile("/path/to/ca.crt"),
+    helper.WithCredentials("whatever", "secret"),
+)
+```
+
 ### Decrypting TLS
 
 Read wireshark wiki regarding decrypting TLS traffic: https://wiki.wireshark.org/TLS#using-the-pre-master-secret

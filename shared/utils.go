@@ -37,6 +37,10 @@ func PatchHTTPTransport(config ALNConfig, transport *http.Transport) http.RoundT
 		transport.TLSClientConfig.KeyLogWriter = config.KeyLogWriter
 	}
 
+	if config.ServerCACertificatePool != nil {
+		transport.TLSClientConfig.RootCAs = config.ServerCACertificatePool
+	}
+
 	if config.IgnoreServerCertificateError {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 		transport.TLSClientConfig.VerifyPeerCertificate = func(_ [][]byte, _ [][]*x509.Certificate) error {

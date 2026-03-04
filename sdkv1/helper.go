@@ -101,6 +101,12 @@ var (
 	// WithIgnoreServerCertificateError makes both http clients ignore tls error when value is true
 	WithIgnoreServerCertificateError = shared.WithIgnoreServerCertificateError
 
+	// WithServerCACertificateFile provides a custom CA certificate PEM file for verifying the server's TLS certificate
+	WithServerCACertificateFile = shared.WithServerCACertificateFile
+
+	// WithServerCACertificatePool provides a pre-built x509.CertPool for verifying the server's TLS certificate
+	WithServerCACertificatePool = shared.WithServerCACertificatePool
+
 	// WithKeyLogWriter makes both (DynamoDB and Alternator) clients to write TLS master key into a file
 	// It helps to debug issues by looking at decoded HTTPS traffic between Alternator and client
 	WithKeyLogWriter = shared.WithKeyLogWriter
