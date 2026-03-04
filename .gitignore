@@ -4,6 +4,8 @@ test/scylla/db.crt
 test/scylla/db.key
 vendor/
 
+TODO*.md
+
 # Codex - AI assistant metadata
 .codex/
 .codex-cache/
