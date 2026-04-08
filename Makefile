@@ -186,4 +186,5 @@ push-release-commits:
 		if ! git rev-parse --verify "$$tag" >/dev/null 2>&1; then echo "Missing tag $$tag"; exit 1; fi; \
 	done; \
 	git push origin HEAD; \
-	git push origin "$$VERSION" "shared/$$VERSION" "sdkv1/$$VERSION" "sdkv2/$$VERSION"
+	git push origin "shared/$$VERSION" "sdkv1/$$VERSION" "sdkv2/$$VERSION"; \
+	git push origin "$$VERSION"
