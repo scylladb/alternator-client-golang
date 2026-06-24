@@ -31,9 +31,12 @@ package sdkv2
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -605,21 +608,7 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 		case KeyRouteAffinityAnyWrite:
 			// In the case of multi table batch alternator makes it LWT if any table involved is configured to do so.
 			// Here we apply session-wide configuration to all requests for simplicity.
-			shouldGetHash = true
-		outer:
-			for table, req := range params.RequestItems {
-				tableName = table
-				for _, op := range req {
-					if op.DeleteRequest != nil {
-						partitionKey = op.DeleteRequest.Key
-						break outer
-					}
-					if op.PutRequest != nil {
-						partitionKey = op.PutRequest.Item
-						break outer
-					}
-				}
-			}
+			return lb.hashBatchWritePartitionKey(params.RequestItems)
 		default:
 			shouldGetHash = false
 		}
@@ -632,6 +621,220 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	}
 
 	return 0, fmt.Errorf("could not get a proper hash")
+}
+
+type batchWriteRoutingTarget struct {
+	tableName           string
+	values              map[string]types.AttributeValue
+	operation           string
+	canonicalAttributes string
+}
+
+func (lb *Helper) hashBatchWritePartitionKey(requestItems map[string][]types.WriteRequest) (int64, error) {
+	targets := selectBatchWriteRoutingTargets(requestItems)
+	if len(targets) == 0 {
+		return 0, fmt.Errorf("batch write request does not have a routing target")
+	}
+
+	for _, target := range targets {
+		keyName := lb.keyAffinity.GetPartitionKeyName(target.tableName)
+		if keyName == "" {
+			lb.triggerUpdateTablePKInformation(target.tableName)
+			return 0, fmt.Errorf("partition key information not found for table %s", target.tableName)
+		}
+
+		val, ok := target.values[keyName]
+		if !ok {
+			continue
+		}
+
+		hash, err := HashAttributeValue(val)
+		if err != nil {
+			continue
+		}
+
+		return hash, nil
+	}
+
+	return 0, fmt.Errorf("batch write request does not have a usable partition key value")
+}
+
+func selectBatchWriteRoutingTargets(requestItems map[string][]types.WriteRequest) []batchWriteRoutingTarget {
+	if len(requestItems) == 0 {
+		return nil
+	}
+
+	targets := make([]batchWriteRoutingTarget, 0)
+	for tableName, writes := range requestItems {
+		for _, write := range writes {
+			if write.PutRequest != nil {
+				targets = append(targets, batchWriteRoutingTarget{
+					tableName:           tableName,
+					values:              write.PutRequest.Item,
+					operation:           "PutRequest",
+					canonicalAttributes: canonicalAttributeValues(write.PutRequest.Item),
+				})
+			}
+			if write.DeleteRequest != nil {
+				targets = append(targets, batchWriteRoutingTarget{
+					tableName:           tableName,
+					values:              write.DeleteRequest.Key,
+					operation:           "DeleteRequest",
+					canonicalAttributes: canonicalAttributeValues(write.DeleteRequest.Key),
+				})
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		return nil
+	}
+
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].tableName != targets[j].tableName {
+			return targets[i].tableName < targets[j].tableName
+		}
+		if targets[i].canonicalAttributes != targets[j].canonicalAttributes {
+			return targets[i].canonicalAttributes < targets[j].canonicalAttributes
+		}
+		return targets[i].operation < targets[j].operation
+	})
+
+	return targets
+}
+
+func canonicalAttributeValues(values map[string]types.AttributeValue) string {
+	if len(values) == 0 {
+		return "{}"
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var builder strings.Builder
+	builder.WriteByte('{')
+	for i, key := range keys {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		writeJSONString(&builder, key)
+		builder.WriteByte(':')
+		writeCanonicalAttributeValue(&builder, values[key])
+	}
+	builder.WriteByte('}')
+	return builder.String()
+}
+
+func writeCanonicalAttributeValue(builder *strings.Builder, value types.AttributeValue) {
+	switch value := value.(type) {
+	case *types.AttributeValueMemberS:
+		writeTaggedJSONString(builder, "S", value.Value)
+	case *types.AttributeValueMemberN:
+		writeTaggedJSONString(builder, "N", value.Value)
+	case *types.AttributeValueMemberB:
+		builder.WriteString(`{"B":{"__bytes__":"`)
+		builder.WriteString(hex.EncodeToString(value.Value))
+		builder.WriteString(`"}}`)
+	case *types.AttributeValueMemberBOOL:
+		builder.WriteString(`{"BOOL":`)
+		writeJSONBool(builder, value.Value)
+		builder.WriteByte('}')
+	case *types.AttributeValueMemberNULL:
+		builder.WriteString(`{"NULL":`)
+		writeJSONBool(builder, value.Value)
+		builder.WriteByte('}')
+	case *types.AttributeValueMemberSS:
+		writeTaggedJSONStringList(builder, "SS", value.Value)
+	case *types.AttributeValueMemberNS:
+		writeTaggedJSONStringList(builder, "NS", value.Value)
+	case *types.AttributeValueMemberBS:
+		builder.WriteString(`{"BS":[`)
+		for i, bytes := range value.Value {
+			if i > 0 {
+				builder.WriteByte(',')
+			}
+			builder.WriteString(`{"__bytes__":"`)
+			builder.WriteString(hex.EncodeToString(bytes))
+			builder.WriteString(`"}`)
+		}
+		builder.WriteString(`]}`)
+	case *types.AttributeValueMemberL:
+		builder.WriteString(`{"L":[`)
+		for i, item := range value.Value {
+			if i > 0 {
+				builder.WriteByte(',')
+			}
+			writeCanonicalAttributeValue(builder, item)
+		}
+		builder.WriteString(`]}`)
+	case *types.AttributeValueMemberM:
+		builder.WriteString(`{"M":`)
+		builder.WriteString(canonicalAttributeValues(value.Value))
+		builder.WriteByte('}')
+	default:
+		builder.WriteString(`{"UNKNOWN":true}`)
+	}
+}
+
+func writeTaggedJSONString(builder *strings.Builder, tag, value string) {
+	builder.WriteString(`{"`)
+	builder.WriteString(tag)
+	builder.WriteString(`":`)
+	writeJSONString(builder, value)
+	builder.WriteByte('}')
+}
+
+func writeTaggedJSONStringList(builder *strings.Builder, tag string, values []string) {
+	builder.WriteString(`{"`)
+	builder.WriteString(tag)
+	builder.WriteString(`":[`)
+	for i, value := range values {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		writeJSONString(builder, value)
+	}
+	builder.WriteString(`]}`)
+}
+
+func writeJSONBool(builder *strings.Builder, value bool) {
+	if value {
+		builder.WriteString("true")
+		return
+	}
+	builder.WriteString("false")
+}
+
+func writeJSONString(builder *strings.Builder, value string) {
+	builder.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '"':
+			builder.WriteString(`\"`)
+		case '\\':
+			builder.WriteString(`\\`)
+		case '\b':
+			builder.WriteString(`\b`)
+		case '\f':
+			builder.WriteString(`\f`)
+		case '\n':
+			builder.WriteString(`\n`)
+		case '\r':
+			builder.WriteString(`\r`)
+		case '\t':
+			builder.WriteString(`\t`)
+		default:
+			if r <= 0x1f {
+				_, _ = fmt.Fprintf(builder, `\u%04x`, r)
+			} else {
+				builder.WriteRune(r)
+			}
+		}
+	}
+	builder.WriteByte('"')
 }
 
 type keyAffinity struct {
