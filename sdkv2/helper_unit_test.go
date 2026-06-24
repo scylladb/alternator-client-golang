@@ -2,6 +2,7 @@ package sdkv2
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -19,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/klauspost/compress/gzip"
 
 	"github.com/scylladb/alternator-client-golang/shared"
@@ -1251,6 +1254,407 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestBatchWriteItemKeyRouteAffinityDeterministicHashForReorderedWrites(t *testing.T) {
+	t.Parallel()
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+	first := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: keyWithID("z-route"),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID("a-route"),
+					},
+				},
+			},
+		},
+	}
+	second := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID("a-route"),
+					},
+				},
+				{
+					PutRequest: &types.PutRequest{
+						Item: keyWithID("z-route"),
+					},
+				},
+			},
+		},
+	}
+
+	firstHash := mustBatchWriteHash(t, h, first)
+	secondHash := mustBatchWriteHash(t, h, second)
+	expectedHash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: "a-route"})
+	if err != nil {
+		t.Fatalf("HashAttributeValue returned error: %v", err)
+	}
+
+	if firstHash != expectedHash {
+		t.Fatalf("expected first request to use hash %d, got %d", expectedHash, firstHash)
+	}
+	if secondHash != expectedHash {
+		t.Fatalf("expected second request to use hash %d, got %d", expectedHash, secondHash)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityDeterministicHashForTableOrder(t *testing.T) {
+	t.Parallel()
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{
+		"audit":  "id",
+		"orders": "id",
+	})
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID("orders-key"),
+					},
+				},
+			},
+			"audit": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID("audit-key"),
+					},
+				},
+			},
+		},
+	}
+
+	expectedHash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: "audit-key"})
+	if err != nil {
+		t.Fatalf("HashAttributeValue returned error: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		if hash := mustBatchWriteHash(t, h, input); hash != expectedHash {
+			t.Fatalf("iteration %d: expected hash %d, got %d", i, expectedHash, hash)
+		}
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityCrossLanguageVectors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		input         *dynamodb.BatchWriteItemInput
+		pkInfo        map[string]string
+		tableName     string
+		operation     string
+		pkLabel       string
+		canonical     string
+		hashSigned    int64
+		hashUnsigned  uint64
+		firstSixNodes []string
+	}{
+		{
+			name: "same_table_write_order",
+			input: &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					"orders": {
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberS{Value: "order456"},
+								},
+							},
+						},
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberS{Value: "order123"},
+								},
+							},
+						},
+					},
+				},
+			},
+			pkInfo:        map[string]string{"orders": "pk"},
+			tableName:     "orders",
+			operation:     "PutRequest",
+			pkLabel:       "S:order123",
+			canonical:     `{"pk":{"S":"order123"}}`,
+			hashSigned:    -2126891002421145093,
+			hashUnsigned:  16319853071288406523,
+			firstSixNodes: []string{"node9", "node2", "node10", "node8", "node7", "node5"},
+		},
+		{
+			name: "multi_table_order",
+			input: &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					"sessions": {
+						{
+							DeleteRequest: &types.DeleteRequest{
+								Key: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberS{Value: "session123"},
+								},
+							},
+						},
+					},
+					"orders": {
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"data": &types.AttributeValueMemberS{Value: "value"},
+									"pk":   &types.AttributeValueMemberS{Value: "order456"},
+								},
+							},
+						},
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk":   &types.AttributeValueMemberS{Value: "order123"},
+									"data": &types.AttributeValueMemberS{Value: "value"},
+								},
+							},
+						},
+					},
+				},
+			},
+			pkInfo:        map[string]string{"orders": "pk", "sessions": "pk"},
+			tableName:     "orders",
+			operation:     "PutRequest",
+			pkLabel:       "S:order123",
+			canonical:     `{"data":{"S":"value"},"pk":{"S":"order123"}}`,
+			hashSigned:    -2126891002421145093,
+			hashUnsigned:  16319853071288406523,
+			firstSixNodes: []string{"node9", "node2", "node10", "node8", "node7", "node5"},
+		},
+		{
+			name: "delete_put_same_attributes",
+			input: &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					"orders": {
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberS{Value: "same"},
+								},
+							},
+						},
+						{
+							DeleteRequest: &types.DeleteRequest{
+								Key: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberS{Value: "same"},
+								},
+							},
+						},
+					},
+				},
+			},
+			pkInfo:        map[string]string{"orders": "pk"},
+			tableName:     "orders",
+			operation:     "DeleteRequest",
+			pkLabel:       "S:same",
+			canonical:     `{"pk":{"S":"same"}}`,
+			hashSigned:    -4879317772220196571,
+			hashUnsigned:  13567426301489355045,
+			firstSixNodes: []string{"node1", "node3", "node10", "node7", "node4", "node5"},
+		},
+		{
+			name: "number_partition_key",
+			input: &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					"accounts": {
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberN{Value: "7"},
+								},
+							},
+						},
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberN{Value: "42"},
+								},
+							},
+						},
+					},
+				},
+			},
+			pkInfo:        map[string]string{"accounts": "pk"},
+			tableName:     "accounts",
+			operation:     "PutRequest",
+			pkLabel:       "N:42",
+			canonical:     `{"pk":{"N":"42"}}`,
+			hashSigned:    -5061732451827723051,
+			hashUnsigned:  13385011621881828565,
+			firstSixNodes: []string{"node3", "node7", "node1", "node10", "node2", "node5"},
+		},
+		{
+			name: "binary_partition_key",
+			input: &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					"blobs": {
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberB{Value: []byte{0x01, 0x02, 0x03}},
+								},
+							},
+						},
+						{
+							DeleteRequest: &types.DeleteRequest{
+								Key: map[string]types.AttributeValue{
+									"pk": &types.AttributeValueMemberB{Value: []byte{0x00, 0xff}},
+								},
+							},
+						},
+					},
+				},
+			},
+			pkInfo:        map[string]string{"blobs": "pk"},
+			tableName:     "blobs",
+			operation:     "DeleteRequest",
+			pkLabel:       "B:00ff",
+			canonical:     `{"pk":{"B":{"__bytes__":"00ff"}}}`,
+			hashSigned:    -4376945693382523102,
+			hashUnsigned:  14069798380327028514,
+			firstSixNodes: []string{"node7", "node2", "node5", "node1", "node6", "node9"},
+		},
+	}
+
+	for _, tt := range testCases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			targets := selectBatchWriteRoutingTargets(tt.input.RequestItems)
+			if len(targets) == 0 {
+				t.Fatal("expected at least one batch write routing target")
+			}
+
+			target := targets[0]
+			if target.tableName != tt.tableName {
+				t.Fatalf("expected table %q, got %q", tt.tableName, target.tableName)
+			}
+			if target.operation != tt.operation {
+				t.Fatalf("expected operation %q, got %q", tt.operation, target.operation)
+			}
+			if target.canonicalAttributes != tt.canonical {
+				t.Fatalf("expected canonical attributes %s, got %s", tt.canonical, target.canonicalAttributes)
+			}
+
+			pkName := tt.pkInfo[target.tableName]
+			pkValue, ok := target.values[pkName]
+			if !ok {
+				t.Fatalf("target does not contain partition key %q", pkName)
+			}
+			if label := batchWriteAttributeLabel(pkValue); label != tt.pkLabel {
+				t.Fatalf("expected pk %q, got %q", tt.pkLabel, label)
+			}
+
+			hash := mustBatchWriteHash(t, newBatchWriteAffinityTestHelper(tt.pkInfo), tt.input)
+			if hash != tt.hashSigned {
+				t.Fatalf("expected signed hash %d, got %d", tt.hashSigned, hash)
+			}
+			if unsigned := uint64(hash); unsigned != tt.hashUnsigned {
+				t.Fatalf("expected unsigned hash %d, got %d", tt.hashUnsigned, unsigned)
+			}
+
+			if diff := cmp.Diff(tt.firstSixNodes, batchWriteAffinityNodeSequence(hash, 6)); diff != "" {
+				t.Fatalf("unexpected node sequence (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func newBatchWriteAffinityTestHelper(pkInfo map[string]string) *Helper {
+	cfg := shared.NewDefaultConfig()
+	cfg.KeyRouteAffinity = shared.NewKeyRouteAffinityConfig(shared.KeyRouteAffinityAnyWrite).WithPkInfo(pkInfo)
+
+	return &Helper{
+		cfg: *cfg,
+		keyAffinity: keyAffinity{
+			pkInfoPerTable: pkInfo,
+		},
+	}
+}
+
+func mustBatchWriteHash(t *testing.T, h *Helper, input *dynamodb.BatchWriteItemInput) int64 {
+	t.Helper()
+
+	hash, err := h.getPkHash(middleware.InitializeInput{Parameters: input})
+	if err != nil {
+		t.Fatalf("getPkHash returned error: %v", err)
+	}
+	return hash
+}
+
+func batchWriteAttributeLabel(value types.AttributeValue) string {
+	switch value := value.(type) {
+	case *types.AttributeValueMemberS:
+		return "S:" + value.Value
+	case *types.AttributeValueMemberN:
+		return "N:" + value.Value
+	case *types.AttributeValueMemberB:
+		return "B:" + hex.EncodeToString(value.Value)
+	default:
+		return fmt.Sprintf("%T", value)
+	}
+}
+
+type batchWriteAffinityNodeSource struct {
+	activeNodes []url.URL
+}
+
+func (s batchWriteAffinityNodeSource) GetActiveNodes() []url.URL {
+	return append([]url.URL(nil), s.activeNodes...)
+}
+
+func (s batchWriteAffinityNodeSource) GetQuarantinedNodes() []url.URL {
+	return nil
+}
+
+func batchWriteAffinityNodeSequence(seed int64, count int) []string {
+	source := batchWriteAffinityNodeSource{
+		activeNodes: make([]url.URL, 0, 10),
+	}
+	for i := 1; i <= 10; i++ {
+		source.activeNodes = append(source.activeNodes, url.URL{
+			Scheme: "http",
+			Host:   fmt.Sprintf("node%d.example.com:8000", i),
+		})
+	}
+
+	plan := shared.NewLazyQueryPlanWithSeed(source, seed)
+	nodes := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		node := plan.Next()
+		if node.Host == "" {
+			break
+		}
+		host, _, _ := strings.Cut(node.Hostname(), ".")
+		nodes = append(nodes, host)
+	}
+	return nodes
+}
+
+func itemWithID(value string) map[string]types.AttributeValue {
+	item := keyWithID(value)
+	item["data"] = &types.AttributeValueMemberS{Value: "payload"}
+	return item
+}
+
+func keyWithID(value string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		"id": &types.AttributeValueMemberS{Value: value},
+	}
 }
 
 func sortNodes(nodes []url.URL) []url.URL {
