@@ -602,9 +602,9 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 
 	case *dynamodb.BatchWriteItemInput:
 		switch lb.cfg.KeyRouteAffinity.Type {
-		case KeyRouteAffinityRMW, KeyRouteAffinityAnyWrite:
-			// In the case of multi table batch alternator makes it LWT if any table involved is configured to do so
-			// But here for sake of simplicity we apply session-wide configuration to all requests
+		case KeyRouteAffinityAnyWrite:
+			// In the case of multi table batch alternator makes it LWT if any table involved is configured to do so.
+			// Here we apply session-wide configuration to all requests for simplicity.
 			shouldGetHash = true
 		outer:
 			for table, req := range params.RequestItems {

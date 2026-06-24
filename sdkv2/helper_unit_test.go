@@ -1049,7 +1049,6 @@ func TestOptions(t *testing.T) {
 					)
 				},
 				optimizedOps: []string{
-					"BATCH-WRITE",
 					// UPDATE operations that need read-before-write
 					"UPDATE-WITH-UPDATE-EXPRESSION",
 					"UPDATE-CONDITIONAL",
