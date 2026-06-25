@@ -1253,6 +1253,149 @@ func TestOptions(t *testing.T) {
 	})
 }
 
+func TestBatchWriteItemKeyRouteAffinityRoutingCandidates(t *testing.T) {
+	t.Parallel()
+
+	t.Run("single_table_put", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk":    &types.AttributeValueMemberS{Value: "put_key"},
+							"other": &types.AttributeValueMemberS{Value: "x"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 1 {
+			t.Fatalf("expected 1 candidate, got %d", len(candidates))
+		}
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "put_key")
+	})
+
+	t.Run("single_table_delete", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "delete_key"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 1 {
+			t.Fatalf("expected 1 candidate, got %d", len(candidates))
+		}
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "delete_key")
+	})
+
+	t.Run("requests_without_pk_stay_candidates", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"other": &types.AttributeValueMemberS{Value: "x"},
+						},
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "delete_key"},
+						},
+					},
+				},
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "put_key"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 3 {
+			t.Fatalf("expected 3 candidates, got %d", len(candidates))
+		}
+		requireBatchWriteCandidateWithoutPK(t, candidates, "t", "pk")
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "delete_key")
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "put_key")
+	})
+
+	t.Run("multiple_tables", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"z_table": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "z_key"},
+						},
+					},
+				},
+			},
+			"a_table": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "a_key"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 2 {
+			t.Fatalf("expected 2 candidates, got %d", len(candidates))
+		}
+		requireBatchWriteCandidate(t, candidates, "a_table", "pk", "a_key")
+		requireBatchWriteCandidate(t, candidates, "z_table", "pk", "z_key")
+	})
+
+	t.Run("empty_and_invalid_requests_ignored", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{},
+				{PutRequest: &types.PutRequest{}},
+				{DeleteRequest: &types.DeleteRequest{}},
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "invalid"},
+						},
+					},
+					DeleteRequest: &types.DeleteRequest{
+						Key: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "invalid"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 0 {
+			t.Fatalf("expected no candidates, got %d", len(candidates))
+		}
+	})
+}
+
 func TestBatchWriteItemKeyRouteAffinityVotingSelectsPreferredNode(t *testing.T) {
 	t.Parallel()
 
@@ -1293,6 +1436,43 @@ func TestBatchWriteItemKeyRouteAffinityVotingSelectsPreferredNode(t *testing.T) 
 	want := append([]string{target.Host}, batchWriteSortedTestNodeHostsExcept(target)...)
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("unexpected batch write query plan (-want +got):\n%s", diff)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityVotingDeleteMajoritySelectsPreferredNode(t *testing.T) {
+	t.Parallel()
+
+	target := batchWriteSortedTestNodes()[0]
+	other := batchWriteSortedTestNodes()[1]
+	targetKeys := batchWriteStringKeysForNode(t, target, 2)
+	otherKey := batchWriteStringKeysForNode(t, other, 1)[0]
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(targetKeys[0]),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(otherKey),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(targetKeys[1]),
+					},
+				},
+			},
+		},
+	}
+
+	node := mustBatchWriteFirstNode(t, h, input)
+	if node != target {
+		t.Fatalf("expected delete majority to select %s, got %s", target.Host, node.Host)
 	}
 }
 
@@ -1556,6 +1736,42 @@ func keyWithID(value string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		"id": &types.AttributeValueMemberS{Value: value},
 	}
+}
+
+func requireBatchWriteCandidate(
+	t *testing.T,
+	candidates []batchWriteRoutingCandidate,
+	tableName, pkName, value string,
+) {
+	t.Helper()
+
+	for _, candidate := range candidates {
+		if candidate.tableName != tableName {
+			continue
+		}
+		if got, ok := candidate.values[pkName].(*types.AttributeValueMemberS); ok && got.Value == value {
+			return
+		}
+	}
+	t.Fatalf("candidate with table %q and %s=%q not found in %#v", tableName, pkName, value, candidates)
+}
+
+func requireBatchWriteCandidateWithoutPK(
+	t *testing.T,
+	candidates []batchWriteRoutingCandidate,
+	tableName, pkName string,
+) {
+	t.Helper()
+
+	for _, candidate := range candidates {
+		if candidate.tableName != tableName {
+			continue
+		}
+		if _, ok := candidate.values[pkName]; !ok {
+			return
+		}
+	}
+	t.Fatalf("candidate with table %q and no %q not found in %#v", tableName, pkName, candidates)
 }
 
 func batchWriteNodeForValue(t *testing.T, value types.AttributeValue) url.URL {
