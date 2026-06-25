@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"net/url"
+	"sort"
 	"testing"
 )
 
@@ -121,6 +122,110 @@ func TestLazyQueryPlan(t *testing.T) {
 			t.Fatalf("expected quarantined nodes fetched once, got %d", source.quarantinedCalls)
 		}
 	})
+
+	t.Run("PreferredNodeFirstThenSortedRemaining", func(t *testing.T) {
+		preferred := url.URL{Host: "b"}
+		source := &fakeNodesSource{
+			activeNodes:      []url.URL{{Host: "c"}, preferred, {Host: "a"}},
+			quarantinedNodes: []url.URL{{Host: "q2"}, {Host: "q1"}},
+		}
+
+		plan := NewLazyQueryPlanWithPreferredNode(source, preferred)
+		got := []string{
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+		}
+		want := []string{"b", "a", "c", "q1", "q2"}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
+			}
+		}
+	})
+
+	t.Run("PreferredNodeMissingUsesSortedActiveNodes", func(t *testing.T) {
+		source := &fakeNodesSource{
+			activeNodes: []url.URL{{Host: "c"}, {Host: "a"}, {Host: "b"}},
+		}
+
+		plan := NewLazyQueryPlanWithPreferredNode(source, url.URL{Host: "missing"})
+		got := []string{
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+		}
+		want := []string{"a", "b", "c"}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
+			}
+		}
+	})
+}
+
+func TestFirstNodeWithSeedUsesSortedNodeAddresses(t *testing.T) {
+	nodes := []url.URL{
+		{Scheme: "http", Host: "node2.example.com:8043"},
+		{Scheme: "http", Host: "node10.example.com:8043"},
+		{Scheme: "http", Host: "node1.example.com:8043"},
+	}
+	original := append([]url.URL(nil), nodes...)
+
+	const seed = int64(42)
+	sorted := append([]url.URL(nil), nodes...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].String() < sorted[j].String()
+	})
+	want := sorted[rand.New(rand.NewSource(seed)).Intn(len(sorted))]
+
+	got := FirstNodeWithSeed(nodes, seed)
+	if got != want {
+		t.Fatalf("FirstNodeWithSeed got %s, want %s", got.Host, want.Host)
+	}
+	for i := range nodes {
+		if nodes[i] != original[i] {
+			t.Fatalf("FirstNodeWithSeed modified input: got %v, want %v", nodes, original)
+		}
+	}
+}
+
+func TestLazyQueryPlanWithSortedSeedUsesSortedNodeAddresses(t *testing.T) {
+	nodes := []url.URL{
+		{Scheme: "http", Host: "node2.example.com:8043"},
+		{Scheme: "http", Host: "node10.example.com:8043"},
+		{Scheme: "http", Host: "node1.example.com:8043"},
+		{Scheme: "http", Host: "node3.example.com:8043"},
+	}
+	source := &fakeNodesSource{activeNodes: nodes}
+
+	const seed = int64(42)
+	sorted := append([]url.URL(nil), nodes...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].String() < sorted[j].String()
+	})
+
+	rnd := rand.New(rand.NewSource(seed))
+	want := make([]string, 0, len(sorted))
+	for len(sorted) > 0 {
+		idx := rnd.Intn(len(sorted))
+		want = append(want, sorted[idx].Host)
+		sorted[idx] = sorted[len(sorted)-1]
+		sorted = sorted[:len(sorted)-1]
+	}
+
+	plan := NewLazyQueryPlanWithSortedSeed(source, seed)
+	got := make([]string, 0, len(nodes))
+	for node := plan.Next(); node.Host != ""; node = plan.Next() {
+		got = append(got, node.Host)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
+		}
+	}
 }
 
 func makeTestNodes(prefix string, count int) []url.URL {
@@ -131,10 +236,11 @@ func makeTestNodes(prefix string, count int) []url.URL {
 	return nodes
 }
 
-// TestLazyQueryPlanCrossLanguageVectors verifies that LazyQueryPlan produces identical
-// node selection sequences for given seeds across all language implementations.
+// TestLazyQueryPlanCrossLanguageVectors verifies that the raw seeded plan produces
+// identical node selection sequences for given seeds across all language implementations.
 // These test vectors are defined in DRIVER-446 and must be kept in sync with the
-// Java (and future) implementations to ensure cross-language key route affinity.
+// Java (and future) implementations. Affinity callers use NewLazyQueryPlanWithSortedSeed
+// so node ordering is normalized before this raw algorithm is applied.
 //
 // The PRNG is Go's math/rand (Lagged Fibonacci Generator) with pick-and-remove selection.
 // See: https://scylladb.atlassian.net/browse/DRIVER-446
