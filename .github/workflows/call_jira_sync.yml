@@ -12,30 +12,30 @@ permissions:
 jobs:
   jira-sync-pr-opened:
     if: github.event.action == 'opened' || github.event.action == 'edited'
-    uses: scylladb/github-automation/.github/workflows/main_jira_sync_pr_opened.yml@47138e9130250ee1a35166cff7dd0e94c8897196 # main 2026-06-01
+    uses: scylladb/github-automation/.github/workflows/main_jira_sync_pr_opened.yml@9cb06b4c28233ca6b922ed8d26b9ba2da1dedb48 # main 2026-06-23
     secrets:
       caller_jira_auth: ${{ secrets.USER_AND_KEY_FOR_JIRA_AUTOMATION }}
 
   jira-sync-in-review:
     if: github.event.action == 'ready_for_review' || github.event.action == 'review_requested'
-    uses: scylladb/github-automation/.github/workflows/main_jira_sync_in_review.yml@47138e9130250ee1a35166cff7dd0e94c8897196 # main 2026-06-01
+    uses: scylladb/github-automation/.github/workflows/main_jira_sync_in_review.yml@9cb06b4c28233ca6b922ed8d26b9ba2da1dedb48 # main 2026-06-23
     secrets:
       caller_jira_auth: ${{ secrets.USER_AND_KEY_FOR_JIRA_AUTOMATION }}
 
   jira-sync-add-label:
     if: github.event.action == 'labeled'
-    uses: scylladb/github-automation/.github/workflows/main_jira_sync_add_label.yml@47138e9130250ee1a35166cff7dd0e94c8897196 # main 2026-06-01
+    uses: scylladb/github-automation/.github/workflows/main_jira_sync_add_label.yml@9cb06b4c28233ca6b922ed8d26b9ba2da1dedb48 # main 2026-06-23
     secrets:
       caller_jira_auth: ${{ secrets.USER_AND_KEY_FOR_JIRA_AUTOMATION }}
 
   jira-sync-remove-label:
     if: github.event.action == 'unlabeled'
-    uses: scylladb/github-automation/.github/workflows/main_jira_sync_remove_label.yml@47138e9130250ee1a35166cff7dd0e94c8897196 # main 2026-06-01
+    uses: scylladb/github-automation/.github/workflows/main_jira_sync_remove_label.yml@9cb06b4c28233ca6b922ed8d26b9ba2da1dedb48 # main 2026-06-23
     secrets:
       caller_jira_auth: ${{ secrets.USER_AND_KEY_FOR_JIRA_AUTOMATION }}
 
   jira-sync-pr-closed:
     if: github.event.action == 'closed'
-    uses: scylladb/github-automation/.github/workflows/main_jira_sync_pr_closed.yml@47138e9130250ee1a35166cff7dd0e94c8897196 # main 2026-06-01
+    uses: scylladb/github-automation/.github/workflows/main_jira_sync_pr_closed.yml@9cb06b4c28233ca6b922ed8d26b9ba2da1dedb48 # main 2026-06-23
     secrets:
       caller_jira_auth: ${{ secrets.USER_AND_KEY_FOR_JIRA_AUTOMATION }}

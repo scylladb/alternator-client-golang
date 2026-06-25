@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -306,6 +307,7 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 		}
 		nodes[i] = *parsed
 	}
+	sortNodesByAddress(nodes)
 
 	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
 		cfg.NodeHealthStoreConfig,
@@ -423,7 +425,7 @@ func (aln *AlternatorLiveNodes) GetNodes() []url.URL {
 	// Return a copy to prevent external modifications
 	result := make([]url.URL, len(nodes))
 	copy(result, nodes)
-	return result
+	return sortNodesByAddress(result)
 }
 
 func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
@@ -489,6 +491,7 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 			aln.nodeHealthStore.RemoveNode(node)
 		}
 	}
+	sortNodesByAddress(newNodes)
 	aln.liveNodes.Store(&newNodes)
 	if hasNewNodes {
 		aln.nodeHealthStore.TryReleaseQuarantinedNodes()
@@ -524,7 +527,14 @@ func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
 		}
 		uris = append(uris, *nodeURL)
 	}
-	return uris, nil
+	return sortNodesByAddress(uris), nil
+}
+
+func sortNodesByAddress(nodes []url.URL) []url.URL {
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].String() < nodes[j].String()
+	})
+	return nodes
 }
 
 // CheckIfRackAndDatacenterSetCorrectly verifies that the rack and datacenter

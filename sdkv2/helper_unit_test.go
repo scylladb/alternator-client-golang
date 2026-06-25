@@ -2,7 +2,6 @@ package sdkv2
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -11,7 +10,6 @@ import (
 	"slices"
 	"sort"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -21,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/smithy-go/middleware"
 	"github.com/klauspost/compress/gzip"
 
 	"github.com/scylladb/alternator-client-golang/shared"
@@ -1006,7 +1003,7 @@ func TestOptions(t *testing.T) {
 							{
 								DeleteRequest: &types.DeleteRequest{
 									Key: map[string]types.AttributeValue{
-										"id": &types.AttributeValueMemberS{Value: key + "-del"},
+										"id": &types.AttributeValueMemberS{Value: key},
 									},
 								},
 							},
@@ -1256,60 +1253,156 @@ func TestOptions(t *testing.T) {
 	})
 }
 
-func TestBatchWriteItemKeyRouteAffinityDeterministicHashForReorderedWrites(t *testing.T) {
+func TestBatchWriteItemKeyRouteAffinityRoutingCandidates(t *testing.T) {
 	t.Parallel()
 
-	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
-	first := &dynamodb.BatchWriteItemInput{
-		RequestItems: map[string][]types.WriteRequest{
-			"orders": {
+	t.Run("single_table_put", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
 				{
 					PutRequest: &types.PutRequest{
-						Item: keyWithID("z-route"),
+						Item: map[string]types.AttributeValue{
+							"pk":    &types.AttributeValueMemberS{Value: "put_key"},
+							"other": &types.AttributeValueMemberS{Value: "x"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 1 {
+			t.Fatalf("expected 1 candidate, got %d", len(candidates))
+		}
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "put_key")
+	})
+
+	t.Run("single_table_delete", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "delete_key"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 1 {
+			t.Fatalf("expected 1 candidate, got %d", len(candidates))
+		}
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "delete_key")
+	})
+
+	t.Run("requests_without_pk_stay_candidates", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"other": &types.AttributeValueMemberS{Value: "x"},
+						},
 					},
 				},
 				{
 					DeleteRequest: &types.DeleteRequest{
-						Key: keyWithID("a-route"),
-					},
-				},
-			},
-		},
-	}
-	second := &dynamodb.BatchWriteItemInput{
-		RequestItems: map[string][]types.WriteRequest{
-			"orders": {
-				{
-					DeleteRequest: &types.DeleteRequest{
-						Key: keyWithID("a-route"),
+						Key: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "delete_key"},
+						},
 					},
 				},
 				{
 					PutRequest: &types.PutRequest{
-						Item: keyWithID("z-route"),
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "put_key"},
+						},
 					},
 				},
 			},
-		},
-	}
+		})
 
-	firstHash := mustBatchWriteHash(t, h, first)
-	secondHash := mustBatchWriteHash(t, h, second)
-	expectedHash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: "a-route"})
-	if err != nil {
-		t.Fatalf("HashAttributeValue returned error: %v", err)
-	}
+		if len(candidates) != 3 {
+			t.Fatalf("expected 3 candidates, got %d", len(candidates))
+		}
+		requireBatchWriteCandidateWithoutPK(t, candidates, "t", "pk")
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "delete_key")
+		requireBatchWriteCandidate(t, candidates, "t", "pk", "put_key")
+	})
 
-	if firstHash != expectedHash {
-		t.Fatalf("expected first request to use hash %d, got %d", expectedHash, firstHash)
-	}
-	if secondHash != expectedHash {
-		t.Fatalf("expected second request to use hash %d, got %d", expectedHash, secondHash)
-	}
+	t.Run("multiple_tables", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"z_table": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "z_key"},
+						},
+					},
+				},
+			},
+			"a_table": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "a_key"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 2 {
+			t.Fatalf("expected 2 candidates, got %d", len(candidates))
+		}
+		requireBatchWriteCandidate(t, candidates, "a_table", "pk", "a_key")
+		requireBatchWriteCandidate(t, candidates, "z_table", "pk", "z_key")
+	})
+
+	t.Run("empty_and_invalid_requests_ignored", func(t *testing.T) {
+		t.Parallel()
+
+		candidates := selectBatchWriteRoutingCandidates(map[string][]types.WriteRequest{
+			"t": {
+				{},
+				{PutRequest: &types.PutRequest{}},
+				{DeleteRequest: &types.DeleteRequest{}},
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "invalid"},
+						},
+					},
+					DeleteRequest: &types.DeleteRequest{
+						Key: map[string]types.AttributeValue{
+							"pk": &types.AttributeValueMemberS{Value: "invalid"},
+						},
+					},
+				},
+			},
+		})
+
+		if len(candidates) != 0 {
+			t.Fatalf("expected no candidates, got %d", len(candidates))
+		}
+	})
 }
 
-func TestBatchWriteItemKeyRouteAffinityDeterministicHashForTableOrder(t *testing.T) {
+func TestBatchWriteItemKeyRouteAffinityVotingSelectsPreferredNode(t *testing.T) {
 	t.Parallel()
+
+	target := batchWriteSortedTestNodes()[0]
+	other := batchWriteSortedTestNodes()[1]
+	targetKeys := batchWriteStringKeysForNode(t, target, 2)
+	otherKey := batchWriteStringKeysForNode(t, other, 1)[0]
 
 	h := newBatchWriteAffinityTestHelper(map[string]string{
 		"audit":  "id",
@@ -1320,212 +1413,240 @@ func TestBatchWriteItemKeyRouteAffinityDeterministicHashForTableOrder(t *testing
 			"orders": {
 				{
 					PutRequest: &types.PutRequest{
-						Item: itemWithID("orders-key"),
+						Item: itemWithID(targetKeys[0], "orders-payload"),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(otherKey),
 					},
 				},
 			},
 			"audit": {
 				{
 					PutRequest: &types.PutRequest{
-						Item: itemWithID("audit-key"),
+						Item: itemWithID(targetKeys[1], "audit-payload"),
 					},
 				},
 			},
 		},
 	}
 
-	expectedHash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: "audit-key"})
-	if err != nil {
-		t.Fatalf("HashAttributeValue returned error: %v", err)
-	}
-
-	for i := 0; i < 50; i++ {
-		if hash := mustBatchWriteHash(t, h, input); hash != expectedHash {
-			t.Fatalf("iteration %d: expected hash %d, got %d", i, expectedHash, hash)
-		}
+	got := mustBatchWritePlanNodes(t, h, input, len(batchWriteTestNodes()))
+	want := append([]string{target.Host}, batchWriteSortedTestNodeHostsExcept(target)...)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("unexpected batch write query plan (-want +got):\n%s", diff)
 	}
 }
 
-func TestBatchWriteItemKeyRouteAffinityCrossLanguageVectors(t *testing.T) {
+func TestBatchWriteItemKeyRouteAffinityVotingDeleteMajoritySelectsPreferredNode(t *testing.T) {
+	t.Parallel()
+
+	target := batchWriteSortedTestNodes()[0]
+	other := batchWriteSortedTestNodes()[1]
+	targetKeys := batchWriteStringKeysForNode(t, target, 2)
+	otherKey := batchWriteStringKeysForNode(t, other, 1)[0]
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(targetKeys[0]),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(otherKey),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(targetKeys[1]),
+					},
+				},
+			},
+		},
+	}
+
+	node := mustBatchWriteFirstNode(t, h, input)
+	if node != target {
+		t.Fatalf("expected delete majority to select %s, got %s", target.Host, node.Host)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityVotingStableForEquivalentBatches(t *testing.T) {
+	t.Parallel()
+
+	target := batchWriteSortedTestNodes()[0]
+	other := batchWriteSortedTestNodes()[1]
+	targetKeys := batchWriteStringKeysForNode(t, target, 2)
+	otherKey := batchWriteStringKeysForNode(t, other, 1)[0]
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{
+		"audit":  "id",
+		"orders": "id",
+	})
+	first := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKeys[0], "payload-a"),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(otherKey),
+					},
+				},
+			},
+			"audit": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKeys[1], "payload-b"),
+					},
+				},
+			},
+		},
+	}
+	second := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"audit": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKeys[1], "changed-audit-payload"),
+					},
+				},
+			},
+			"orders": {
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(otherKey),
+					},
+				},
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKeys[0], "changed-orders-payload"),
+					},
+				},
+			},
+		},
+	}
+
+	firstNode := mustBatchWriteFirstNode(t, h, first)
+	secondNode := mustBatchWriteFirstNode(t, h, second)
+	if firstNode != target {
+		t.Fatalf("expected first request to select %s, got %s", target.Host, firstNode.Host)
+	}
+	if secondNode != firstNode {
+		t.Fatalf("expected equivalent reordered request to select %s, got %s", firstNode.Host, secondNode.Host)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityVotingFallsBackOnTie(t *testing.T) {
+	t.Parallel()
+
+	nodes := batchWriteSortedTestNodes()
+	leftKey := batchWriteStringKeysForNode(t, nodes[0], 1)[0]
+	rightKey := batchWriteStringKeysForNode(t, nodes[1], 1)[0]
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(leftKey, "left"),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(rightKey),
+					},
+				},
+			},
+		},
+	}
+
+	if _, err := h.batchWriteQueryPlan(input.RequestItems); err == nil {
+		t.Fatal("expected tied top vote count to fall back to non-affinity routing")
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityVotingSkipsUnusableCandidates(t *testing.T) {
+	t.Parallel()
+
+	target := batchWriteSortedTestNodes()[0]
+	targetKey := batchWriteStringKeysForNode(t, target, 1)[0]
+	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+	h.keyAffinity.pkInfoUpdateInProgress = map[string]struct{}{"unknown": {}}
+
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"unknown": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID("missing-metadata", "ignored"),
+					},
+				},
+			},
+			"orders": {
+				{},
+				{
+					PutRequest: &types.PutRequest{},
+				},
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"id": &types.AttributeValueMemberS{Value: "invalid"},
+						},
+					},
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID("invalid"),
+					},
+				},
+				{
+					PutRequest: &types.PutRequest{
+						Item: map[string]types.AttributeValue{
+							"id": &types.AttributeValueMemberBOOL{Value: true},
+						},
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(targetKey),
+					},
+				},
+			},
+		},
+	}
+
+	node := mustBatchWriteFirstNode(t, h, input)
+	if node != target {
+		t.Fatalf("expected valid candidate to select %s, got %s", target.Host, node.Host)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityVotingSupportsPartitionKeyTypes(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name          string
-		input         *dynamodb.BatchWriteItemInput
-		pkInfo        map[string]string
-		tableName     string
-		operation     string
-		pkLabel       string
-		canonical     string
-		hashSigned    int64
-		hashUnsigned  uint64
-		firstSixNodes []string
+		name  string
+		value types.AttributeValue
 	}{
 		{
-			name: "same_table_write_order",
-			input: &dynamodb.BatchWriteItemInput{
-				RequestItems: map[string][]types.WriteRequest{
-					"orders": {
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberS{Value: "order456"},
-								},
-							},
-						},
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberS{Value: "order123"},
-								},
-							},
-						},
-					},
-				},
-			},
-			pkInfo:        map[string]string{"orders": "pk"},
-			tableName:     "orders",
-			operation:     "PutRequest",
-			pkLabel:       "S:order123",
-			canonical:     `{"pk":{"S":"order123"}}`,
-			hashSigned:    -2126891002421145093,
-			hashUnsigned:  16319853071288406523,
-			firstSixNodes: []string{"node9", "node2", "node10", "node8", "node7", "node5"},
+			name:  "string_partition_key",
+			value: &types.AttributeValueMemberS{Value: "string-key"},
 		},
 		{
-			name: "multi_table_order",
-			input: &dynamodb.BatchWriteItemInput{
-				RequestItems: map[string][]types.WriteRequest{
-					"sessions": {
-						{
-							DeleteRequest: &types.DeleteRequest{
-								Key: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberS{Value: "session123"},
-								},
-							},
-						},
-					},
-					"orders": {
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"data": &types.AttributeValueMemberS{Value: "value"},
-									"pk":   &types.AttributeValueMemberS{Value: "order456"},
-								},
-							},
-						},
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk":   &types.AttributeValueMemberS{Value: "order123"},
-									"data": &types.AttributeValueMemberS{Value: "value"},
-								},
-							},
-						},
-					},
-				},
-			},
-			pkInfo:        map[string]string{"orders": "pk", "sessions": "pk"},
-			tableName:     "orders",
-			operation:     "PutRequest",
-			pkLabel:       "S:order123",
-			canonical:     `{"data":{"S":"value"},"pk":{"S":"order123"}}`,
-			hashSigned:    -2126891002421145093,
-			hashUnsigned:  16319853071288406523,
-			firstSixNodes: []string{"node9", "node2", "node10", "node8", "node7", "node5"},
+			name:  "number_partition_key",
+			value: &types.AttributeValueMemberN{Value: "42"},
 		},
 		{
-			name: "delete_put_same_attributes",
-			input: &dynamodb.BatchWriteItemInput{
-				RequestItems: map[string][]types.WriteRequest{
-					"orders": {
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberS{Value: "same"},
-								},
-							},
-						},
-						{
-							DeleteRequest: &types.DeleteRequest{
-								Key: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberS{Value: "same"},
-								},
-							},
-						},
-					},
-				},
-			},
-			pkInfo:        map[string]string{"orders": "pk"},
-			tableName:     "orders",
-			operation:     "DeleteRequest",
-			pkLabel:       "S:same",
-			canonical:     `{"pk":{"S":"same"}}`,
-			hashSigned:    -4879317772220196571,
-			hashUnsigned:  13567426301489355045,
-			firstSixNodes: []string{"node1", "node3", "node10", "node7", "node4", "node5"},
-		},
-		{
-			name: "number_partition_key",
-			input: &dynamodb.BatchWriteItemInput{
-				RequestItems: map[string][]types.WriteRequest{
-					"accounts": {
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberN{Value: "7"},
-								},
-							},
-						},
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberN{Value: "42"},
-								},
-							},
-						},
-					},
-				},
-			},
-			pkInfo:        map[string]string{"accounts": "pk"},
-			tableName:     "accounts",
-			operation:     "PutRequest",
-			pkLabel:       "N:42",
-			canonical:     `{"pk":{"N":"42"}}`,
-			hashSigned:    -5061732451827723051,
-			hashUnsigned:  13385011621881828565,
-			firstSixNodes: []string{"node3", "node7", "node1", "node10", "node2", "node5"},
-		},
-		{
-			name: "binary_partition_key",
-			input: &dynamodb.BatchWriteItemInput{
-				RequestItems: map[string][]types.WriteRequest{
-					"blobs": {
-						{
-							PutRequest: &types.PutRequest{
-								Item: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberB{Value: []byte{0x01, 0x02, 0x03}},
-								},
-							},
-						},
-						{
-							DeleteRequest: &types.DeleteRequest{
-								Key: map[string]types.AttributeValue{
-									"pk": &types.AttributeValueMemberB{Value: []byte{0x00, 0xff}},
-								},
-							},
-						},
-					},
-				},
-			},
-			pkInfo:        map[string]string{"blobs": "pk"},
-			tableName:     "blobs",
-			operation:     "DeleteRequest",
-			pkLabel:       "B:00ff",
-			canonical:     `{"pk":{"B":{"__bytes__":"00ff"}}}`,
-			hashSigned:    -4376945693382523102,
-			hashUnsigned:  14069798380327028514,
-			firstSixNodes: []string{"node7", "node2", "node5", "node1", "node6", "node9"},
+			name:  "binary_partition_key",
+			value: &types.AttributeValueMemberB{Value: []byte{0x00, 0xff}},
 		},
 	}
 
@@ -1534,41 +1655,25 @@ func TestBatchWriteItemKeyRouteAffinityCrossLanguageVectors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			targets := selectBatchWriteRoutingTargets(tt.input.RequestItems)
-			if len(targets) == 0 {
-				t.Fatal("expected at least one batch write routing target")
+			h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+			input := &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					"orders": {
+						{
+							PutRequest: &types.PutRequest{
+								Item: map[string]types.AttributeValue{
+									"id": tt.value,
+								},
+							},
+						},
+					},
+				},
 			}
 
-			target := targets[0]
-			if target.tableName != tt.tableName {
-				t.Fatalf("expected table %q, got %q", tt.tableName, target.tableName)
-			}
-			if target.operation != tt.operation {
-				t.Fatalf("expected operation %q, got %q", tt.operation, target.operation)
-			}
-			if target.canonicalAttributes != tt.canonical {
-				t.Fatalf("expected canonical attributes %s, got %s", tt.canonical, target.canonicalAttributes)
-			}
-
-			pkName := tt.pkInfo[target.tableName]
-			pkValue, ok := target.values[pkName]
-			if !ok {
-				t.Fatalf("target does not contain partition key %q", pkName)
-			}
-			if label := batchWriteAttributeLabel(pkValue); label != tt.pkLabel {
-				t.Fatalf("expected pk %q, got %q", tt.pkLabel, label)
-			}
-
-			hash := mustBatchWriteHash(t, newBatchWriteAffinityTestHelper(tt.pkInfo), tt.input)
-			if hash != tt.hashSigned {
-				t.Fatalf("expected signed hash %d, got %d", tt.hashSigned, hash)
-			}
-			if unsigned := uint64(hash); unsigned != tt.hashUnsigned {
-				t.Fatalf("expected unsigned hash %d, got %d", tt.hashUnsigned, unsigned)
-			}
-
-			if diff := cmp.Diff(tt.firstSixNodes, batchWriteAffinityNodeSequence(hash, 6)); diff != "" {
-				t.Fatalf("unexpected node sequence (-want +got):\n%s", diff)
+			want := batchWriteNodeForValue(t, tt.value)
+			got := mustBatchWriteFirstNode(t, h, input)
+			if got != want {
+				t.Fatalf("expected %s, got %s", want.Host, got.Host)
 			}
 		})
 	}
@@ -1579,75 +1684,51 @@ func newBatchWriteAffinityTestHelper(pkInfo map[string]string) *Helper {
 	cfg.KeyRouteAffinity = shared.NewKeyRouteAffinityConfig(shared.KeyRouteAffinityAnyWrite).WithPkInfo(pkInfo)
 
 	return &Helper{
-		cfg: *cfg,
+		cfg:   *cfg,
+		nodes: batchWriteAffinityNodeSource{activeNodes: batchWriteTestNodes()},
 		keyAffinity: keyAffinity{
 			pkInfoPerTable: pkInfo,
 		},
 	}
 }
 
-func mustBatchWriteHash(t *testing.T, h *Helper, input *dynamodb.BatchWriteItemInput) int64 {
+func mustBatchWriteFirstNode(t *testing.T, h *Helper, input *dynamodb.BatchWriteItemInput) url.URL {
 	t.Helper()
 
-	hash, err := h.getPkHash(middleware.InitializeInput{Parameters: input})
+	plan, err := h.batchWriteQueryPlan(input.RequestItems)
 	if err != nil {
-		t.Fatalf("getPkHash returned error: %v", err)
+		t.Fatalf("batchWriteQueryPlan returned error: %v", err)
 	}
-	return hash
-}
-
-func batchWriteAttributeLabel(value types.AttributeValue) string {
-	switch value := value.(type) {
-	case *types.AttributeValueMemberS:
-		return "S:" + value.Value
-	case *types.AttributeValueMemberN:
-		return "N:" + value.Value
-	case *types.AttributeValueMemberB:
-		return "B:" + hex.EncodeToString(value.Value)
-	default:
-		return fmt.Sprintf("%T", value)
+	node := plan.Next()
+	if node.Host == "" {
+		t.Fatal("batch write query plan returned no first node")
 	}
+	return node
 }
 
-type batchWriteAffinityNodeSource struct {
-	activeNodes []url.URL
-}
+func mustBatchWritePlanNodes(t *testing.T, h *Helper, input *dynamodb.BatchWriteItemInput, count int) []string {
+	t.Helper()
 
-func (s batchWriteAffinityNodeSource) GetActiveNodes() []url.URL {
-	return append([]url.URL(nil), s.activeNodes...)
-}
-
-func (s batchWriteAffinityNodeSource) GetQuarantinedNodes() []url.URL {
-	return nil
-}
-
-func batchWriteAffinityNodeSequence(seed int64, count int) []string {
-	source := batchWriteAffinityNodeSource{
-		activeNodes: make([]url.URL, 0, 10),
-	}
-	for i := 1; i <= 10; i++ {
-		source.activeNodes = append(source.activeNodes, url.URL{
-			Scheme: "http",
-			Host:   fmt.Sprintf("node%d.example.com:8000", i),
-		})
+	plan, err := h.batchWriteQueryPlan(input.RequestItems)
+	if err != nil {
+		t.Fatalf("batchWriteQueryPlan returned error: %v", err)
 	}
 
-	plan := shared.NewLazyQueryPlanWithSeed(source, seed)
 	nodes := make([]string, 0, count)
 	for i := 0; i < count; i++ {
 		node := plan.Next()
 		if node.Host == "" {
 			break
 		}
-		host, _, _ := strings.Cut(node.Hostname(), ".")
-		nodes = append(nodes, host)
+		nodes = append(nodes, node.Host)
 	}
 	return nodes
 }
 
-func itemWithID(value string) map[string]types.AttributeValue {
-	item := keyWithID(value)
+func itemWithID(id, payload string) map[string]types.AttributeValue {
+	item := keyWithID(id)
 	item["data"] = &types.AttributeValueMemberS{Value: "payload"}
+	item["payload"] = &types.AttributeValueMemberS{Value: payload}
 	return item
 }
 
@@ -1655,6 +1736,145 @@ func keyWithID(value string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		"id": &types.AttributeValueMemberS{Value: value},
 	}
+}
+
+func requireBatchWriteCandidate(
+	t *testing.T,
+	candidates []batchWriteRoutingCandidate,
+	tableName, pkName, value string,
+) {
+	t.Helper()
+
+	for _, candidate := range candidates {
+		if candidate.tableName != tableName {
+			continue
+		}
+		if got, ok := candidate.values[pkName].(*types.AttributeValueMemberS); ok && got.Value == value {
+			return
+		}
+	}
+	t.Fatalf("candidate with table %q and %s=%q not found in %#v", tableName, pkName, value, candidates)
+}
+
+func requireBatchWriteCandidateWithoutPK(
+	t *testing.T,
+	candidates []batchWriteRoutingCandidate,
+	tableName, pkName string,
+) {
+	t.Helper()
+
+	for _, candidate := range candidates {
+		if candidate.tableName != tableName {
+			continue
+		}
+		if _, ok := candidate.values[pkName]; !ok {
+			return
+		}
+	}
+	t.Fatalf("candidate with table %q and no %q not found in %#v", tableName, pkName, candidates)
+}
+
+func batchWriteNodeForValue(t *testing.T, value types.AttributeValue) url.URL {
+	t.Helper()
+
+	hash, err := HashAttributeValue(value)
+	if err != nil {
+		t.Fatalf("HashAttributeValue returned error: %v", err)
+	}
+	return shared.FirstNodeWithSeed(batchWriteTestNodes(), hash)
+}
+
+func batchWriteStringKeysForNode(t *testing.T, target url.URL, count int) []string {
+	t.Helper()
+
+	keys := make([]string, 0, count)
+	for i := 0; i < 10000 && len(keys) < count; i++ {
+		key := fmt.Sprintf("%s-key-%d", target.Hostname(), i)
+		node := batchWriteNodeForValue(t, &types.AttributeValueMemberS{Value: key})
+		if node == target {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) != count {
+		t.Fatalf("found %d keys for %s, want %d", len(keys), target.Host, count)
+	}
+	return keys
+}
+
+type batchWriteAffinityNodeSource struct {
+	activeNodes      []url.URL
+	quarantinedNodes []url.URL
+}
+
+func (s batchWriteAffinityNodeSource) NextNode() url.URL {
+	return s.activeNodes[0]
+}
+
+func (s batchWriteAffinityNodeSource) GetNodes() []url.URL {
+	nodes := append([]url.URL(nil), s.activeNodes...)
+	nodes = append(nodes, s.quarantinedNodes...)
+	return nodes
+}
+
+func (s batchWriteAffinityNodeSource) GetActiveNodes() []url.URL {
+	return append([]url.URL(nil), s.activeNodes...)
+}
+
+func (s batchWriteAffinityNodeSource) GetQuarantinedNodes() []url.URL {
+	return append([]url.URL(nil), s.quarantinedNodes...)
+}
+
+func (s batchWriteAffinityNodeSource) UpdateLiveNodes() error {
+	return nil
+}
+
+func (s batchWriteAffinityNodeSource) ReportNodeError(url.URL, error) {
+}
+
+func (s batchWriteAffinityNodeSource) TryReleaseQuarantinedNodes() []url.URL {
+	return nil
+}
+
+func (s batchWriteAffinityNodeSource) CheckIfRackAndDatacenterSetCorrectly() error {
+	return nil
+}
+
+func (s batchWriteAffinityNodeSource) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
+	return true, nil
+}
+
+func (s batchWriteAffinityNodeSource) Start() {
+}
+
+func (s batchWriteAffinityNodeSource) Stop() {
+}
+
+func batchWriteTestNodes() []url.URL {
+	return []url.URL{
+		{Scheme: "http", Host: "node2.example.com:8000"},
+		{Scheme: "http", Host: "node10.example.com:8000"},
+		{Scheme: "http", Host: "node1.example.com:8000"},
+		{Scheme: "http", Host: "node3.example.com:8000"},
+	}
+}
+
+func batchWriteSortedTestNodes() []url.URL {
+	nodes := batchWriteTestNodes()
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].String() < nodes[j].String()
+	})
+	return nodes
+}
+
+func batchWriteSortedTestNodeHostsExcept(except url.URL) []string {
+	nodes := batchWriteSortedTestNodes()
+	hosts := make([]string, 0, len(nodes)-1)
+	for _, node := range nodes {
+		if node != except {
+			hosts = append(hosts, node.Host)
+		}
+	}
+	return hosts
 }
 
 func sortNodes(nodes []url.URL) []url.URL {
