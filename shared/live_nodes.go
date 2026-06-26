@@ -438,8 +438,8 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 	return &newURL
 }
 
-// UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
-func (aln *AlternatorLiveNodes) getLiveNodesNodes() ([]url.URL, error) {
+// fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
+func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 	scope := aln.cfg.RoutingScope
 
 	for scope != nil {
@@ -469,7 +469,7 @@ func (aln *AlternatorLiveNodes) getLiveNodesNodes() ([]url.URL, error) {
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
-	newNodes, err := aln.getLiveNodesNodes()
+	newNodes, err := aln.fetchLiveNodes()
 	if err != nil {
 		return err
 	}
