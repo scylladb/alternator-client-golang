@@ -199,6 +199,24 @@ h, _ := helper.NewHelper(
 
 ## Distinctive features
 
+### User-Agent
+
+The SDK helpers set the DynamoDB request User-Agent so Alternator can identify the Go client driver and
+version, for example `scylladb-alternator-client-golang/v1.2.3`.
+
+You can override, suppress, or transform the User-Agent:
+```go
+h, _ := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithUserAgentFunc(func(current string) string {
+        return current + " my-app/1.0.0"
+    }),
+)
+```
+
+Use `helper.WithUserAgent("my-app/1.0.0")` to set an exact value, or `helper.WithoutUserAgent()` to suppress it.
+When headers optimization is enabled, the configured User-Agent is kept in the optimized header allowlist.
+
 ### Headers optimization
 
 Alternator does not use all the headers that are normally used by DynamoDB.

@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -222,6 +223,109 @@ func TestOptions(t *testing.T) {
 		})
 	})
 
+	t.Run("WithUserAgentAndOptimizedHeaders", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			options     []Option
+			want        string
+			wantPresent bool
+		}{
+			{
+				name:        "Default",
+				want:        sdkv1UserAgentProduct + "/devel",
+				wantPresent: true,
+			},
+			{
+				name:        "Set",
+				options:     []Option{WithUserAgent("custom-client/1.2.3")},
+				want:        "custom-client/1.2.3",
+				wantPresent: true,
+			},
+			{
+				name: "Transform",
+				options: []Option{WithUserAgentFunc(func(current string) string {
+					return current + " app/4.5.6"
+				})},
+				want:        sdkv1UserAgentProduct + "/devel app/4.5.6",
+				wantPresent: true,
+			},
+			{
+				name:        "Remove",
+				options:     []Option{WithoutUserAgent()},
+				want:        "",
+				wantPresent: true,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				var (
+					alternatorRequests atomic.Int32
+					capturedHeaders    atomic.Pointer[http.Header]
+				)
+
+				nodes := []string{"node1.local"}
+				mockTransport := &mocks.MockRoundTripper{
+					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+						alternatorRequests.Add(1)
+						return resp.AlternatorNodesResponse(nodes, req)
+					},
+					NodeHealthRequest: resp.HealthCheckResponse,
+					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+						headers := req.Header.Clone()
+						capturedHeaders.Store(&headers)
+						return resp.DynamoDBListTablesResponse([]string{"test-table"}, req)
+					},
+				}
+
+				options := []Option{
+					WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+					WithCredentials("test-key", "test-secret"),
+					WithOptimizeHeaders(true),
+				}
+				options = append(options, tc.options...)
+
+				h, err := NewHelper([]string{"node1.local"}, options...)
+				if err != nil {
+					t.Fatalf("NewHelper returned error: %v", err)
+				}
+				defer h.Stop()
+
+				if err := h.UpdateLiveNodes(); err != nil {
+					t.Fatalf("UpdateLiveNodes returned error: %v", err)
+				}
+
+				client, err := h.NewDynamoDB()
+				if err != nil {
+					t.Fatalf("NewDynamoDB returned error: %v", err)
+				}
+
+				_, err = client.ListTables(&dynamodb.ListTablesInput{
+					Limit: aws.Int64(10),
+				})
+				if err != nil {
+					t.Fatalf("ListTables returned error: %v", err)
+				}
+
+				if alternatorRequests.Load() == 0 {
+					t.Fatal("expected Alternator discovery call to happen")
+				}
+
+				headers := capturedHeaders.Load()
+				if headers == nil {
+					t.Fatal("expected headers to be captured")
+				}
+				got := headers.Get("User-Agent")
+				if got != tc.want {
+					t.Fatalf("User-Agent = %q, want %q", got, tc.want)
+				}
+				if _, ok := (*headers)["User-Agent"]; ok != tc.wantPresent {
+					t.Fatalf("User-Agent presence = %t, want %t", ok, tc.wantPresent)
+				}
+			})
+		}
+	})
+
 	t.Run("WithGzipRequestCompression", func(t *testing.T) {
 		t.Parallel()
 
@@ -345,8 +449,9 @@ func TestOptions(t *testing.T) {
 				}
 
 				if tc.optimizeHeaders {
-					if headers.Get("User-Agent") != "" {
-						t.Error("User-Agent header should be removed with header optimization")
+					userAgent := headers.Get("User-Agent")
+					if !strings.Contains(userAgent, sdkv1UserAgentProduct+"/devel") {
+						t.Errorf("User-Agent header should be retained with header optimization, got %q", userAgent)
 					}
 					if headers.Get("SignedHeaders") != "" {
 						t.Error("SignedHeaders header should be removed with header optimization")

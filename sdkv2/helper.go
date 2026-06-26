@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -127,6 +128,15 @@ var (
 	// WithCustomOptimizeHeaders makes DynamoDB client remove headers not used by Alternator reducing outgoing traffic
 	WithCustomOptimizeHeaders = shared.WithCustomOptimizeHeaders
 
+	// WithUserAgent sets an exact User-Agent header value for DynamoDB requests
+	WithUserAgent = shared.WithUserAgent
+
+	// WithoutUserAgent suppresses the User-Agent header for DynamoDB requests
+	WithoutUserAgent = shared.WithoutUserAgent
+
+	// WithUserAgentFunc updates the User-Agent header for DynamoDB requests
+	WithUserAgentFunc = shared.WithUserAgentFunc
+
 	// WithKeyLogWriter makes both (DynamoDB and Alternator) clients to write TLS master key into a file
 	// It helps to debug issues by looking at decoded HTTPS traffic between Alternator and client
 	WithKeyLogWriter = shared.WithKeyLogWriter
@@ -180,6 +190,11 @@ const (
 	KeyRouteAffinityAnyWrite = shared.KeyRouteAffinityAnyWrite
 )
 
+const (
+	sdkv2ModulePath       = "github.com/scylladb/alternator-client-golang/sdkv2"
+	sdkv2UserAgentProduct = "scylladb-alternator-client-golang"
+)
+
 // AlternatorNodesSource an interface for nodes list provider
 type AlternatorNodesSource interface {
 	NextNode() url.URL
@@ -221,6 +236,7 @@ type Helper struct {
 // and optional functional configuration options (e.g., AWS region, credentials, TLS).
 func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error) {
 	cfg := shared.NewDefaultConfig()
+	shared.WithUserAgentFunc(defaultUserAgent)(cfg)
 	for _, opt := range options {
 		opt(cfg)
 	}
@@ -347,6 +363,33 @@ func (lb *Helper) endpointResolverV2() dynamodb.EndpointResolverV2 {
 // GetPartitionKeyName retrieves partition key information for a table in a thread-safe manner.
 func (lb *Helper) GetPartitionKeyName(tableName string) string {
 	return lb.keyAffinity.GetPartitionKeyName(tableName)
+}
+
+func defaultUserAgent(string) string {
+	return sdkv2UserAgentProduct + "/" + moduleVersion(sdkv2ModulePath)
+}
+
+func moduleVersion(modulePath string) string {
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "devel"
+	}
+	if buildInfo.Main.Path == modulePath {
+		return normalizeModuleVersion(buildInfo.Main.Version)
+	}
+	for _, dep := range buildInfo.Deps {
+		if dep.Path == modulePath {
+			return normalizeModuleVersion(dep.Version)
+		}
+	}
+	return "devel"
+}
+
+func normalizeModuleVersion(version string) string {
+	if version == "" || version == "(devel)" {
+		return "devel"
+	}
+	return version
 }
 
 // NewDynamoDB creates a new DynamoDB client preconfigured to route requests to Alternator nodes
