@@ -30,7 +30,7 @@ type Config struct {
 	Datacenter string
 	// RoutingScope is a scope of alternator nodes to target
 	RoutingScope rt.Scope
-	// AWSRegion a region that will be handed over to AWS SDK to forge requests
+	// AWSRegion is handed to the AWS SDK for request signing and SDK-visible metadata.
 	AWSRegion string
 	// AccessKeyID from AWS credentials
 	AccessKeyID string
@@ -254,8 +254,8 @@ func WithRoutingScope(routingScope rt.Scope) Option {
 	}
 }
 
-// WithAWSRegion inject region into DynamoDB client, this region does not play any role
-// One way you can use it - to have this region in the logs, CloudWatch.
+// WithAWSRegion sets the AWS SDK region used for request signing and SDK-visible metadata.
+// Alternator does not validate this region, but logs, tracing, metrics, and debugging tools may inspect it.
 func WithAWSRegion(region string) Option {
 	return func(config *Config) {
 		config.AWSRegion = region
