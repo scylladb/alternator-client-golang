@@ -72,6 +72,38 @@ func TestNodeHealthStoreScoreAdjustments(t *testing.T) {
 	}
 }
 
+func TestNodeHealthStoreGetNodeStatusReturnsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node-snapshot:8080"}
+	store, err := NewNodeHealthStoreBasic(DefaultNodeHealthStoreConfig(), nil, []url.URL{node})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status := store.GetNodeStatus(node)
+	if status == nil {
+		t.Fatalf("expected status for %v", node)
+	}
+	status.score = 999
+	status.quarantined = false
+	status.updated = time.Time{}
+
+	after := store.GetNodeStatus(node)
+	if after == nil {
+		t.Fatalf("expected status for %v", node)
+	}
+	if after.Score() != 0 {
+		t.Fatalf("expected stored score to stay unchanged, got %d", after.Score())
+	}
+	if !after.Quarantined() {
+		t.Fatalf("expected stored quarantine status to stay unchanged")
+	}
+	if after.Updated().IsZero() {
+		t.Fatalf("expected stored update timestamp to stay unchanged")
+	}
+}
+
 func TestNodeHealthStoreResetsScoreAfterInterval(t *testing.T) {
 	t.Parallel()
 

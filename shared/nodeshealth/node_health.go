@@ -267,12 +267,16 @@ func (e *NodeHealthStore) TryReleaseQuarantinedNodes() []url.URL {
 	return released
 }
 
-// GetNodeStatus retrieves the health status of the given node if present.
+// GetNodeStatus retrieves a snapshot of the health status of the given node if present.
 func (e *NodeHealthStore) GetNodeStatus(node url.URL) *NodeHealthStatus {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	status := e.nodesStatuses[node]
-	return status
+	if status == nil {
+		return nil
+	}
+	snapshot := *status
+	return &snapshot
 }
 
 // ReleaseNode released node from quarantine
