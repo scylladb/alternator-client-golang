@@ -442,8 +442,8 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 func (aln *AlternatorLiveNodes) getLiveNodesNodes() ([]url.URL, error) {
 	scope := aln.cfg.RoutingScope
 
-	plan := NewLazyQueryPlan(aln)
 	for scope != nil {
+		plan := NewLazyQueryPlan(aln)
 		var lastErr error
 		for node := plan.Next(); node.Host != ""; node = plan.Next() {
 			endpoint := node
