@@ -13,7 +13,7 @@ The primary entry point is the Helper type, which manages Alternator nodes and p
 
 Example usage:
 
-	h, err := sdkv1.NewHelper([]string{"host1", "host2"}, sdkv1.WithAWSRegion("us-east-1"))
+	h, err := sdkv2.NewHelper([]string{"host1", "host2"}, sdkv2.WithAWSRegion("us-east-1"))
 	if err != nil {
 	    log.Fatal(err)
 	}

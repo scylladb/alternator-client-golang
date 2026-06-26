@@ -3,6 +3,10 @@ Package sdkv1 provides a lightweight integration layer between AWS SDK V1 client
 ScyllaDB's Alternator, a DynamoDB-compatible API. It wraps dynamic node discovery, rack/datacenter-aware
 routing, and secure configuration options to transparently load balance requests across Alternator nodes.
 
+Deprecated: use package github.com/scylladb/alternator-client-golang/sdkv2 instead.
+AWS SDK for Go v1 support is retained only for legacy users. New features are developed for SDK v2,
+which is the more feature-rich helper for new applications.
+
 Key Features:
   - Rack/datacenter-aware load balancing via AlternatorLiveNodes.
   - Transparent AWS SDK integration through generated aws.Config and session.Session.
@@ -11,7 +15,7 @@ Key Features:
 
 The primary entry point is the Helper type, which manages Alternator nodes and produces AWS-compatible configurations.
 
-Example usage:
+Legacy usage:
 
 	h, err := sdkv1.NewHelper([]string{"host1", "host2"}, sdkv1.WithAWSRegion("us-east-1"))
 	if err != nil {
@@ -24,6 +28,8 @@ Example usage:
 	}
 
 	// Use db to interact with Alternator as if it were AWS DynamoDB
+
+New code should use github.com/scylladb/alternator-client-golang/sdkv2.
 
 This package depends on the shared submodule, which contains reusable configuration and node-discovery logic.
 */
@@ -197,6 +203,8 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 //
 // It internally relies on the shared.AlternatorLiveNodes component for tracking
 // and routing to healthy nodes.
+//
+// Deprecated: use github.com/scylladb/alternator-client-golang/sdkv2.Helper instead.
 type Helper struct {
 	nodes AlternatorNodesSource
 	cfg   shared.Config
@@ -204,6 +212,8 @@ type Helper struct {
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
 // and optional functional configuration options (e.g., AWS region, credentials, TLS).
+//
+// Deprecated: use github.com/scylladb/alternator-client-golang/sdkv2.NewHelper instead.
 func NewHelper(initialNodes []string, options ...Option) (*Helper, error) {
 	cfg := shared.NewDefaultConfig()
 	shared.WithUserAgentFunc(defaultUserAgent)(cfg)
