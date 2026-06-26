@@ -1,8 +1,6 @@
 package shared
 
-import (
-	"net/http"
-)
+import "net/http"
 
 // CompressionTransport wraps an http.RoundTripper to compress request bodies
 type CompressionTransport struct {

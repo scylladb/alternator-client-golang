@@ -56,6 +56,9 @@ import (
 // Option is option for the `NewHelper`
 type Option = shared.Option
 
+// ResponseCompression is an HTTP response compression encoding supported by the client.
+type ResponseCompression = shared.ResponseCompression
+
 var (
 	// WithScheme changes schema (http/https) for both dynamodb and alternator requests
 	WithScheme = shared.WithScheme
@@ -153,11 +156,24 @@ var (
 	// Currently supported algorithms: "gzip"
 	WithRequestCompression = shared.WithRequestCompression
 
+	// WithResponseCompression enables response body compression with the accepted encodings.
+	WithResponseCompression = shared.WithResponseCompression
+
+	// WithoutResponseCompression disables response body compression.
+	WithoutResponseCompression = shared.WithoutResponseCompression
+
 	// NewGzipConfig creates a new GzipConfig for configuring gzip request compression
 	NewGzipConfig = shared.NewGzipConfig
 
 	// WithHTTPClientTimeout controls timeout for HTTP requests
 	WithHTTPClientTimeout = shared.WithHTTPClientTimeout
+)
+
+const (
+	// ResponseCompressionGzip accepts gzip-compressed responses.
+	ResponseCompressionGzip = shared.ResponseCompressionGzip
+	// ResponseCompressionDeflate accepts deflate-compressed responses.
+	ResponseCompressionDeflate = shared.ResponseCompressionDeflate
 )
 
 const (

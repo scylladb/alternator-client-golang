@@ -7,8 +7,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -150,6 +152,31 @@ func TestDynamoDBOperations(t *testing.T) {
 			helper.WithIgnoreServerCertificateError(true),
 		)
 	})
+}
+
+func TestResponseCompression(t *testing.T) {
+	tests := []struct {
+		name      string
+		encoding  helper.ResponseCompression
+		tableName string
+	}{
+		{
+			name:      "Gzip",
+			encoding:  helper.ResponseCompressionGzip,
+			tableName: "sdkv1_response_compression_gzip",
+		},
+		{
+			name:      "Deflate",
+			encoding:  helper.ResponseCompressionDeflate,
+			tableName: "sdkv1_response_compression_deflate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testResponseCompression(t, tt.encoding, tt.tableName)
+		})
+	}
 }
 
 type KeyWriter struct {
@@ -477,5 +504,137 @@ func testDynamoDBOperations(t *testing.T, opts ...helper.Option) {
 		})
 	if err != nil {
 		t.Fatalf("failed to delete record: %v", err)
+	}
+}
+
+type responseEncodingCapture struct {
+	requestAcceptEncoding atomic.Value
+	responseEncoding      atomic.Value
+}
+
+func (c *responseEncodingCapture) StoreRequestAcceptEncoding(acceptEncoding string) {
+	c.requestAcceptEncoding.Store(acceptEncoding)
+}
+
+func (c *responseEncodingCapture) LoadRequestAcceptEncoding() string {
+	value, _ := c.requestAcceptEncoding.Load().(string)
+	return value
+}
+
+func (c *responseEncodingCapture) StoreResponseEncoding(contentEncoding string) {
+	c.responseEncoding.Store(contentEncoding)
+}
+
+func (c *responseEncodingCapture) LoadResponseEncoding() string {
+	value, _ := c.responseEncoding.Load().(string)
+	return value
+}
+
+type responseEncodingCaptureTransport struct {
+	original http.RoundTripper
+	capture  *responseEncodingCapture
+}
+
+func (t *responseEncodingCaptureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.original.RoundTrip(req)
+	if err == nil && resp != nil && req.Header.Get("X-Amz-Target") == "DynamoDB_20120810.GetItem" {
+		t.capture.StoreRequestAcceptEncoding(req.Header.Get("Accept-Encoding"))
+		t.capture.StoreResponseEncoding(resp.Header.Get("Content-Encoding"))
+	}
+	return resp, err
+}
+
+func testResponseCompression(t *testing.T, encoding helper.ResponseCompression, tableName string) {
+	t.Helper()
+
+	capture := &responseEncodingCapture{}
+	h, err := helper.NewHelper(
+		knownNodes,
+		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
+		helper.WithResponseCompression(encoding),
+		helper.WithHTTPTransportWrapper(func(rt http.RoundTripper) http.RoundTripper {
+			return &responseEncodingCaptureTransport{
+				original: rt,
+				capture:  capture,
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("failed to create alternator helper: %v", err)
+	}
+	defer h.Stop()
+
+	ddb, err := h.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("failed to create DynamoDB client: %v", err)
+	}
+
+	_, _ = ddb.DeleteTable(&dynamodb.DeleteTableInput{
+		TableName: aws.String(tableName),
+	})
+	_, err = ddb.CreateTable(
+		&dynamodb.CreateTableInput{
+			TableName: aws.String(tableName),
+			KeySchema: []*dynamodb.KeySchemaElement{
+				{
+					AttributeName: aws.String("ID"),
+					KeyType:       aws.String("HASH"),
+				},
+			},
+			AttributeDefinitions: []*dynamodb.AttributeDefinition{
+				{
+					AttributeName: aws.String("ID"),
+					AttributeType: aws.String("S"),
+				},
+			},
+			BillingMode: aws.String("PAY_PER_REQUEST"),
+		})
+	if err != nil {
+		t.Fatalf("Error creating a table: %v", err)
+	}
+	defer func() {
+		_, _ = ddb.DeleteTable(&dynamodb.DeleteTableInput{
+			TableName: aws.String(tableName),
+		})
+	}()
+
+	_, err = ddb.PutItem(&dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]*dynamodb.AttributeValue{
+			"ID": {
+				S: aws.String("123"),
+			},
+			"Data": {
+				S: aws.String(strings.Repeat("response-compression-payload-", 4096)),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Error creating table record: %v", err)
+	}
+
+	result, err := ddb.GetItem(&dynamodb.GetItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]*dynamodb.AttributeValue{
+			"ID": {
+				S: aws.String("123"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to read record: %v", err)
+	}
+	if result.Item == nil {
+		t.Fatal("no item found")
+	}
+
+	if got := capture.LoadRequestAcceptEncoding(); got != string(encoding) {
+		t.Fatalf("Accept-Encoding = %q, want %q", got, encoding)
+	}
+
+	got := capture.LoadResponseEncoding()
+	if got != string(encoding) {
+		t.Fatalf("Content-Encoding = %q, want %q", got, encoding)
 	}
 }

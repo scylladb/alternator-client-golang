@@ -104,7 +104,7 @@ func NewDefaultALNConfig() ALNConfig {
 		RoutingScope:                  rt.NewClusterScope(),
 		UpdatePeriod:                  defaultUpdatePeriod,
 		IdleUpdatePeriod:              time.Minute, // Don't update by default
-		TLSSessionCache:               defaultTLSSessionCache,
+		TLSSessionCache:               newDefaultTLSSessionCache(),
 		MaxIdleHTTPConnections:        100,
 		MaxIdleHTTPConnectionsPerHost: http.DefaultMaxIdleConnsPerHost,
 		IdleHTTPConnectionTimeout:     defaultIdleConnectionTimeout,
