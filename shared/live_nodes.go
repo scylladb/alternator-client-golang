@@ -443,35 +443,46 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 	scope := aln.cfg.RoutingScope
 
 	for scope != nil {
-		clusterScope := rt.IsClusterScope(scope)
-		plan := NewLazyQueryPlan(aln)
-		var discoveredNodes []url.URL
-		var lastErr error
-		for node := plan.Next(); node.Host != ""; node = plan.Next() {
-			endpoint := node
-			endpoint.Path = "/localnodes"
-			endpoint.RawQuery = scope.GetLocalNodesQuery()
-
-			newNodes, err := aln.getNodes(&endpoint)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			if len(newNodes) != 0 {
-				if clusterScope {
-					discoveredNodes = append(discoveredNodes, newNodes...)
-					continue
-				}
-				return newNodes, nil
-			}
+		newNodes, err := aln.getNodesForScope(scope)
+		if err != nil {
+			return nil, err
 		}
-		if len(discoveredNodes) != 0 {
-			return cloneAndDedupeNodes(discoveredNodes), nil
-		}
-		if lastErr != nil {
-			return nil, lastErr
+		if len(newNodes) != 0 {
+			return newNodes, nil
 		}
 		scope = scope.Fallback()
+	}
+	return nil, nil
+}
+
+func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, error) {
+	clusterScope := rt.IsClusterScope(scope)
+	plan := NewLazyQueryPlan(aln)
+	var discoveredNodes []url.URL
+	var lastErr error
+	for node := plan.Next(); node.Host != ""; node = plan.Next() {
+		endpoint := node
+		endpoint.Path = "/localnodes"
+		endpoint.RawQuery = scope.GetLocalNodesQuery()
+
+		newNodes, err := aln.getNodes(&endpoint)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(newNodes) == 0 {
+			continue
+		}
+		if !clusterScope {
+			return newNodes, nil
+		}
+		discoveredNodes = append(discoveredNodes, newNodes...)
+	}
+	if len(discoveredNodes) != 0 {
+		return cloneAndDedupeNodes(discoveredNodes), nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, nil
 }
@@ -577,7 +588,7 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 			// Cluster scope does not require validation
 			return nil
 		}
-		newNodes, err := aln.getNodes(aln.nextAsURLWithPath("/localnodes", scope.GetLocalNodesQuery()))
+		newNodes, err := aln.getNodesForScope(scope)
 		if err != nil {
 			return fmt.Errorf("failed to read list of nodes: %w", err)
 		}

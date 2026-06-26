@@ -116,6 +116,76 @@ func TestAlternatorLiveNodes_ClusterScopeMergesSeedNodes(t *testing.T) {
 	}
 }
 
+func TestAlternatorLiveNodes_CheckIfRackAndDatacenterSetCorrectlyRetriesSeedNodes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		scope rt.Scope
+		query string
+	}{
+		{
+			name:  "datacenter",
+			scope: rt.NewDCScope("dc1", nil),
+			query: "dc=dc1",
+		},
+		{
+			name:  "rack",
+			scope: rt.NewRackScope("dc1", "rack1", nil),
+			query: "dc=dc1&rack=rack1",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var targetRequests atomic.Int32
+
+			aln, err := NewAlternatorLiveNodes(
+				[]string{"dc1-node.local", "dc2-node.local"},
+				WithALNPort(8080),
+				WithALNRoutingScope(tt.scope),
+				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						if req.URL.Path == "" || req.URL.Path == "/" {
+							return resp.HealthCheckResponse(req)
+						}
+						if req.URL.Path != "/localnodes" {
+							t.Fatalf("unexpected request path %q", req.URL.Path)
+						}
+						if req.URL.RawQuery != tt.query {
+							t.Fatalf("unexpected /localnodes query %q, want %q", req.URL.RawQuery, tt.query)
+						}
+						switch req.URL.Hostname() {
+						case "dc1-node.local":
+							targetRequests.Add(1)
+							return resp.AlternatorNodesResponse([]string{"dc1-node.local"}, req)
+						case "dc2-node.local":
+							return resp.AlternatorNodesResponse(nil, req)
+						default:
+							t.Fatalf("unexpected validation host %q", req.URL.Hostname())
+							return nil, nil
+						}
+					})
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+			}
+			defer aln.Stop()
+
+			if err := aln.CheckIfRackAndDatacenterSetCorrectly(); err != nil {
+				t.Fatalf("CheckIfRackAndDatacenterSetCorrectly returned error: %v", err)
+			}
+			if targetRequests.Load() == 0 {
+				t.Fatalf("expected validation request for target seed")
+			}
+		})
+	}
+}
+
 type liveNodesRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f liveNodesRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
