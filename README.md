@@ -16,7 +16,8 @@ A managed NoSQL database service by AWS, typically accessed via a single regiona
 
 - AWS Golang SDK.
 The official AWS SDK for the Go programming language, used to interact with AWS services like DynamoDB.
-Have two versions: [v1](https://github.com/aws/aws-sdk-go) and [v2](https://github.com/aws/aws-sdk-go-v2)
+Have two versions: [v1](https://github.com/aws/aws-sdk-go) and [v2](https://github.com/aws/aws-sdk-go-v2).
+AWS SDK for Go v1 support in this repository is deprecated; use AWS SDK for Go v2 for new work.
 
 - DynamoDB/Alternator Endpoint.
 The base URL a client connects to.
@@ -34,9 +35,18 @@ On Scylla Cloud in regular setup it represents cloud provider availability zone 
 ## Introduction
 
 This repo is a simple helper for AWS SDK, that allows seamlessly create a DynamoDB client that balance load across Alternator nodes.
-There is a separate library every AWS SDK version:
-- For [v1](https://github.com/aws/aws-sdk-go) - [sdkv1](sdkv1)
-- For [v2](https://github.com/aws/aws-sdk-go-v2) - [sdkv2](sdkv2)
+There is a separate library for each AWS SDK version:
+- Recommended: [sdkv2](sdkv2) for [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2).
+- Deprecated legacy support: [sdkv1](sdkv1) for [AWS SDK for Go v1](https://github.com/aws/aws-sdk-go).
+
+New applications should use `sdkv2`. It is the more feature-rich helper and is where new feature development happens.
+The `sdkv1` module is kept for existing users that cannot migrate yet, but it is deprecated and no longer receives new features.
+
+### Migrating from SDK v1
+
+Move new and actively maintained applications to `sdkv2`. In most cases, migration starts by changing imports from
+`github.com/scylladb/alternator-client-golang/sdkv1` to `github.com/scylladb/alternator-client-golang/sdkv2`,
+then updating call sites to the AWS SDK for Go v2 API shape.
 
 ## Using the library
 
@@ -134,7 +144,7 @@ import (
 )
 
 func main() {
-    h, err := helper.NewHelper([]string{"x.x.x.x"}, helper.WithPort(9999), helper.WithCredentials("whatever", "secret"))
+    h, err := helper.NewHelper([]string{"x.x.x.x"}, helper.WithPort(9999))
     if err != nil {
         panic(fmt.Sprintf("failed to create alternator helper: %v", err))
     }
@@ -157,7 +167,7 @@ h, _ := helper.NewHelper(
     }),
 )
 ```
-For AWS SDK v1, call the same option but the callback receives `*aws.Config` from SDK v1.
+The deprecated SDK v1 module has the same option, but its callback receives `*aws.Config` from AWS SDK for Go v1. Prefer moving new configuration work to `sdkv2`.
 
 ### HTTP timeouts and retries
 
@@ -175,7 +185,7 @@ h, _ := helper.NewHelper(
 ddb, _ := h.NewDynamoDB()
 _, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String("tbl"), Key: key})
 ```
-SDK v1 users can apply the same pattern with the `*WithContext` methods (e.g., `GetItemWithContext`).
+Deprecated SDK v1 users can apply the same pattern with the `*WithContext` methods (e.g., `GetItemWithContext`), but new code should use `sdkv2`.
 
 ### HTTP connection pool settings
 
@@ -223,14 +233,13 @@ Alternator does not use all the headers that are normally used by DynamoDB.
 So, it is possible to instruct client to delete unused http headers from the request to reduce network footprint.
 Artificial testing showed that this technic can reduce outgoing traffic up to 56%, depending on workload and encryption.
 
-It is supported only for AWS SDKv2, example how to enable it:
+It is supported only for AWS SDK v2, example how to enable it:
 ```go
     h, err := helper.NewHelper(
-		[]string{"x.x.x.x"},
-	    helper.WithPort(9999),
-		helper.WithCredentials("whatever", "secret"),
-		helper.WithOptimizeHeaders(true),
-	)
+        []string{"x.x.x.x"},
+        helper.WithPort(9999),
+        helper.WithOptimizeHeaders(true),
+    )
     if err != nil {
         panic(fmt.Sprintf("failed to create alternator helper: %v", err))
     }
@@ -241,11 +250,10 @@ It is supported only for AWS SDKv2, example how to enable it:
 It is possible to enable request compression with:
 ```go
     h, err := helper.NewHelper(
-		[]string{"x.x.x.x"},
-	    helper.WithPort(9999),
-		helper.WithCredentials("whatever", "secret"),
-		helper.WithRequestCompression(NewGzipConfig().GzipRequestCompressor()),
-	)
+        []string{"x.x.x.x"},
+        helper.WithPort(9999),
+        helper.WithRequestCompression(helper.NewGzipConfig().GzipRequestCompressor()),
+    )
     if err != nil {
         panic(fmt.Sprintf("failed to create alternator helper: %v", err))
     }
@@ -324,7 +332,6 @@ The simplest way to enable KeyRouteAffinity is to let the driver automatically d
 h, err := helper.NewHelper(
     []string{"x.x.x.x"},
     helper.WithPort(9999),
-    helper.WithCredentials("whatever", "secret"),
     helper.WithKeyRouteAffinity(
         helper.NewKeyRouteAffinityConfig(helper.KeyRouteAffinityRMW),
     ),
@@ -340,9 +347,8 @@ partition key column name for tables you are working with:
 h, err := helper.NewHelper(
     []string{"x.x.x.x"},
     helper.WithPort(9999),
-    helper.WithCredentials("whatever", "secret"),
     helper.WithKeyRouteAffinity(
-        helper.NewKeyRouteAffinityConfig(helper.KeyRouteAffinityWrite).
+        helper.NewKeyRouteAffinityConfig(helper.KeyRouteAffinityRMW).
             WithPkInfo(map[string]string{
                 "users":  "userId",
             }),
@@ -367,7 +373,6 @@ h, err := helper.NewHelper(
     helper.WithScheme("https"),
     helper.WithPort(9999),
     helper.WithServerCACertificateFile("/path/to/ca.crt"),
-    helper.WithCredentials("whatever", "secret"),
 )
 ```
 
@@ -389,4 +394,4 @@ Then you need to configure your traffic analyzer to read pre master key secrets 
 
 ## Examples
 
-You can find examples in [sdkv1/helper_test.go](sdkv1/helper_test.go) and [sdkv2/helper_test.go](sdkv2/helper_test.go)
+Use [sdkv2/helper_test.go](sdkv2/helper_test.go) for current examples. [sdkv1/helper_test.go](sdkv1/helper_test.go) remains only as legacy coverage for the deprecated SDK v1 module.
