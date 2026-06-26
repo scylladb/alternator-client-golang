@@ -131,6 +131,16 @@ func NewClusterScope() *ClusterScope {
 	return &ClusterScope{}
 }
 
+// IsClusterScope reports whether scope targets the whole cluster.
+func IsClusterScope(scope Scope) bool {
+	switch scope.(type) {
+	case ClusterScope, *ClusterScope:
+		return true
+	default:
+		return false
+	}
+}
+
 // Name implements Scope.
 func (w ClusterScope) Name() string {
 	return "Cluster"

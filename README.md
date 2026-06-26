@@ -97,6 +97,17 @@ lb, err := helper.NewHelper(
 )
 ```
 
+For cluster-wide routing, the helper queries the seed nodes passed to `NewHelper` and merges the returned node lists.
+Some Scylla versions return only the contacted node's datacenter from `/localnodes`, even with cluster scope. In that
+case, the seed list is assumed to contain working nodes from the datacenters that should be included:
+
+```golang
+lb, err := helper.NewHelper(
+    []string{"dc1-node.example.com", "dc2-node.example.com", "dc3-node.example.com"},
+    helper.WithRoutingScope(rt.NewClusterScope()),
+)
+```
+
 #### Deprecated Options
 
 The `WithRack` and `WithDatacenter` options are deprecated. Use `WithRoutingScope` instead:

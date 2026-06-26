@@ -443,7 +443,9 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 	scope := aln.cfg.RoutingScope
 
 	for scope != nil {
+		clusterScope := rt.IsClusterScope(scope)
 		plan := NewLazyQueryPlan(aln)
+		var discoveredNodes []url.URL
 		var lastErr error
 		for node := plan.Next(); node.Host != ""; node = plan.Next() {
 			endpoint := node
@@ -456,8 +458,15 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 				continue
 			}
 			if len(newNodes) != 0 {
+				if clusterScope {
+					discoveredNodes = append(discoveredNodes, newNodes...)
+					continue
+				}
 				return newNodes, nil
 			}
+		}
+		if len(discoveredNodes) != 0 {
+			return cloneAndDedupeNodes(discoveredNodes), nil
 		}
 		if lastErr != nil {
 			return nil, lastErr
@@ -537,6 +546,20 @@ func sortNodesByAddress(nodes []url.URL) []url.URL {
 	return nodes
 }
 
+func cloneAndDedupeNodes(nodes []url.URL) []url.URL {
+	out := make([]url.URL, 0, len(nodes))
+	seen := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		key := node.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, node)
+	}
+	return sortNodesByAddress(out)
+}
+
 // CheckIfRackAndDatacenterSetCorrectly verifies that the rack and datacenter
 // settings are correctly configured and recognized by the Alternator cluster.
 func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err error) {
@@ -550,7 +573,7 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 	}()
 	scope := aln.cfg.RoutingScope
 	for scope != nil {
-		if _, ok := scope.(rt.ClusterScope); ok {
+		if rt.IsClusterScope(scope) {
 			// Cluster scope does not require validation
 			return nil
 		}
