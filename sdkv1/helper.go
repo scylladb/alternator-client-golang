@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -133,6 +134,15 @@ var (
 	// WithOptimizeHeaders makes DynamoDB client remove headers not used by Alternator reducing outgoing traffic
 	WithOptimizeHeaders = shared.WithOptimizeHeaders
 
+	// WithUserAgent sets an exact User-Agent header value for DynamoDB requests
+	WithUserAgent = shared.WithUserAgent
+
+	// WithoutUserAgent suppresses the User-Agent header for DynamoDB requests
+	WithoutUserAgent = shared.WithoutUserAgent
+
+	// WithUserAgentFunc updates the User-Agent header for DynamoDB requests
+	WithUserAgentFunc = shared.WithUserAgentFunc
+
 	// WithRequestCompression enables request body compression with the specified algorithm.
 	// Currently supported algorithms: "gzip"
 	WithRequestCompression = shared.WithRequestCompression
@@ -142,6 +152,11 @@ var (
 
 	// WithHTTPClientTimeout controls timeout for HTTP requests
 	WithHTTPClientTimeout = shared.WithHTTPClientTimeout
+)
+
+const (
+	sdkv1ModulePath       = "github.com/scylladb/alternator-client-golang/sdkv1"
+	sdkv1UserAgentProduct = "scylladb-alternator-client-golang"
 )
 
 // WithAWSConfigOptions lets callers mutate the generated aws.Config before it is used by the SDK.
@@ -191,6 +206,7 @@ type Helper struct {
 // and optional functional configuration options (e.g., AWS region, credentials, TLS).
 func NewHelper(initialNodes []string, options ...Option) (*Helper, error) {
 	cfg := shared.NewDefaultConfig()
+	shared.WithUserAgentFunc(defaultUserAgent)(cfg)
 	for _, opt := range options {
 		opt(cfg)
 	}
@@ -321,6 +337,33 @@ func (lb *Helper) NewDynamoDB() (*dynamodb.DynamoDB, error) {
 	client := dynamodb.New(sess)
 	lb.injectQueryPlan(client)
 	return client, nil
+}
+
+func defaultUserAgent(string) string {
+	return sdkv1UserAgentProduct + "/" + moduleVersion(sdkv1ModulePath)
+}
+
+func moduleVersion(modulePath string) string {
+	buildInfo, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "devel"
+	}
+	if buildInfo.Main.Path == modulePath {
+		return normalizeModuleVersion(buildInfo.Main.Version)
+	}
+	for _, dep := range buildInfo.Deps {
+		if dep.Path == modulePath {
+			return normalizeModuleVersion(dep.Version)
+		}
+	}
+	return "devel"
+}
+
+func normalizeModuleVersion(version string) string {
+	if version == "" || version == "(devel)" {
+		return "devel"
+	}
+	return version
 }
 
 type roundTripper struct {

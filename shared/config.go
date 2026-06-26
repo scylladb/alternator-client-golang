@@ -65,6 +65,8 @@ type Config struct {
 	HTTPClientTimeout time.Duration
 	// AWSConfigOptions holds []func(*aws.Config) where the aws.Config type differs for each SDK version (v1 vs v2)
 	AWSConfigOptions []any
+	// UserAgent updates the DynamoDB request User-Agent header.
+	UserAgent UserAgentFunc
 	// RequestCompression configures compression for request bodies
 	RequestCompression RequestCompressionFunc
 	// NodeHealthStoreConfig controls node health tracking logic
@@ -344,6 +346,9 @@ func WithOptimizeHeaders(enabled bool) Option {
 			if config.AccessKeyID != "" {
 				allowedHeaders = append(allowedHeaders, "Authorization", "X-Amz-Date")
 			}
+			if config.UserAgent != nil {
+				allowedHeaders = append(allowedHeaders, userAgentHeader)
+			}
 			return allowedHeaders
 		}
 	}
@@ -356,6 +361,39 @@ func WithOptimizeHeaders(enabled bool) Option {
 func WithCustomOptimizeHeaders(fn func(config Config) []string) Option {
 	return func(config *Config) {
 		config.OptimizeHeaders = fn
+	}
+}
+
+// WithUserAgent sets an exact User-Agent header value for DynamoDB requests.
+// An empty value suppresses the User-Agent header.
+func WithUserAgent(userAgent string) Option {
+	return func(config *Config) {
+		config.UserAgent = func(string) string {
+			return userAgent
+		}
+	}
+}
+
+// WithoutUserAgent suppresses the User-Agent header for DynamoDB requests.
+func WithoutUserAgent() Option {
+	return WithUserAgent("")
+}
+
+// WithUserAgentFunc updates the User-Agent header for DynamoDB requests.
+// The function receives the current value after earlier User-Agent options and may return an empty string to
+// suppress it.
+func WithUserAgentFunc(fn UserAgentFunc) Option {
+	if fn == nil {
+		panic("userAgentFunc can't be nil")
+	}
+	return func(config *Config) {
+		previous := config.UserAgent
+		config.UserAgent = func(current string) string {
+			if previous != nil {
+				current = previous(current)
+			}
+			return fn(current)
+		}
 	}
 }
 
@@ -508,6 +546,10 @@ func NewHTTPTransport(config Config) http.RoundTripper {
 			transport,
 			config.RequestCompression,
 		)
+	}
+
+	if config.UserAgent != nil {
+		transport = newUserAgentTransport(transport, config.UserAgent)
 	}
 
 	return transport
