@@ -82,8 +82,8 @@ var (
 	// WithRoutingScope makes DynamoDB client target only nodes from particular scope (dc, rack, cluster)
 	WithRoutingScope = shared.WithRoutingScope
 
-	// WithAWSRegion inject region into DynamoDB client, this region does not play any role
-	// One way you can use it - to have this region in the logs, CloudWatch.
+	// WithAWSRegion sets the AWS SDK region used for request signing and SDK-visible metadata.
+	// Alternator does not validate this region, but logs, tracing, metrics, and debugging tools may inspect it.
 	WithAWSRegion = shared.WithAWSRegion
 
 	// WithLogger sets logger

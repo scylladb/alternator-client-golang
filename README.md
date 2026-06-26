@@ -169,6 +169,23 @@ func main() {
 
 ### Customizing AWS SDK config
 
+#### AWS region
+
+The helpers set the AWS SDK region to `default-alb-region` by default. The AWS SDK requires a region and includes it in
+request signing, logs, tracing, and other SDK-visible configuration. Alternator does not use AWS regional endpoints and
+does not validate the signing region, so the default is only a placeholder that lets the client work without AWS-specific
+configuration.
+
+If your application, tracing, logging, metrics, or debugging tools inspect the AWS region, set it explicitly to the real
+deployment region or another value that is meaningful in your environment:
+
+```go
+h, _ := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithAWSRegion("us-east-1"),
+)
+```
+
 Use `WithAWSConfigOptions` to tweak the generated `aws.Config` before building the DynamoDB client (e.g., adjust retryers or log mode). For AWS SDK v2:
 ```go
 h, _ := helper.NewHelper(
