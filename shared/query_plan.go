@@ -16,14 +16,12 @@ type nodesSource interface {
 // It defers fetching active and quarantined nodes from the source until the first
 // time they are needed by Next().
 type LazyQueryPlan struct {
-	nodes              nodesSource
-	activeNodes        []url.URL
-	quarantinedNodes   []url.URL
-	rnd                *rand.Rand
-	preferredNode      url.URL
-	hasPreferredNode   bool
-	deterministicOrder bool
-	sortNodes          bool
+	nodes            nodesSource
+	activeNodes      []url.URL
+	quarantinedNodes []url.URL
+	rnd              *rand.Rand
+	preferredNodes   []url.URL
+	sortNodes        bool
 }
 
 // NewLazyQueryPlan constructs a plan bound to the provided nodes source.
@@ -52,17 +50,15 @@ func NewLazyQueryPlanWithSortedSeed(nodes nodesSource, seed int64) *LazyQueryPla
 	}
 }
 
-// NewLazyQueryPlanWithPreferredNode constructs a deterministic plan that tries
-// preferredNode first when it is still active, then the remaining nodes in
-// lexicographic address order.
-func NewLazyQueryPlanWithPreferredNode(nodes nodesSource, preferredNode url.URL) *LazyQueryPlan {
+// NewLazyQueryPlanWithPreferredNodes constructs a seeded plan that tries
+// preferredNodes first when they are still active, then applies the seeded
+// selection algorithm to the remaining lexicographically sorted nodes.
+func NewLazyQueryPlanWithPreferredNodes(nodes nodesSource, preferredNodes []url.URL, seed int64) *LazyQueryPlan {
 	return &LazyQueryPlan{
-		nodes:              nodes,
-		rnd:                rand.New(rand.NewSource(0)),
-		preferredNode:      preferredNode,
-		hasPreferredNode:   preferredNode.Host != "",
-		deterministicOrder: true,
-		sortNodes:          true,
+		nodes:          nodes,
+		rnd:            rand.New(rand.NewSource(seed)),
+		preferredNodes: append([]url.URL(nil), preferredNodes...),
+		sortNodes:      true,
 	}
 }
 
@@ -83,9 +79,13 @@ func (p *LazyQueryPlan) Next() url.URL {
 	if p.activeNodes == nil {
 		p.activeNodes = p.prepareNodes(p.nodes.GetActiveNodes())
 	}
-	if p.hasPreferredNode {
-		p.hasPreferredNode = false
-		if node, ok := popNode(&p.activeNodes, p.preferredNode); ok {
+	for len(p.preferredNodes) > 0 {
+		preferredNode := p.preferredNodes[0]
+		p.preferredNodes = p.preferredNodes[1:]
+		if preferredNode.Host == "" {
+			continue
+		}
+		if node, ok := popNode(&p.activeNodes, preferredNode); ok {
 			return node
 		}
 	}
@@ -104,12 +104,6 @@ func (p *LazyQueryPlan) Next() url.URL {
 }
 
 func (p *LazyQueryPlan) pickAndRemove(nodes *[]url.URL) url.URL {
-	if p.deterministicOrder {
-		node := (*nodes)[0]
-		*nodes = (*nodes)[1:]
-		return node
-	}
-
 	idx := p.rnd.Intn(len(*nodes))
 	node := (*nodes)[idx]
 	(*nodes)[idx] = (*nodes)[len(*nodes)-1]

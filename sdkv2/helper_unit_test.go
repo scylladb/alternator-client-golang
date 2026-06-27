@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -1538,7 +1539,11 @@ func TestBatchWriteItemKeyRouteAffinityVotingSelectsPreferredNode(t *testing.T) 
 	}
 
 	got := mustBatchWritePlanNodes(t, h, input, len(batchWriteTestNodes()))
-	want := append([]string{target.Host}, batchWriteSortedTestNodeHostsExcept(target)...)
+	want := batchWriteExpectedPlanHosts(t, []url.URL{target, other}, []string{
+		targetKeys[0],
+		otherKey,
+		targetKeys[1],
+	})
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("unexpected batch write query plan (-want +got):\n%s", diff)
 	}
@@ -1578,6 +1583,49 @@ func TestBatchWriteItemKeyRouteAffinityVotingDeleteMajoritySelectsPreferredNode(
 	node := mustBatchWriteFirstNode(t, h, input)
 	if node != target {
 		t.Fatalf("expected delete majority to select %s, got %s", target.Host, node.Host)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityVotingOrdersAllVotedNodesBeforeUnvoted(t *testing.T) {
+	t.Parallel()
+
+	sortedNodes := batchWriteSortedTestNodes()
+	target := sortedNodes[3]
+	other := sortedNodes[2]
+	targetKeys := batchWriteStringKeysForNode(t, target, 2)
+	otherKey := batchWriteStringKeysForNode(t, other, 1)[0]
+
+	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKeys[0], "target-a"),
+					},
+				},
+				{
+					DeleteRequest: &types.DeleteRequest{
+						Key: keyWithID(otherKey),
+					},
+				},
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKeys[1], "target-b"),
+					},
+				},
+			},
+		},
+	}
+
+	got := mustBatchWritePlanNodes(t, h, input, len(batchWriteTestNodes()))
+	want := batchWriteExpectedPlanHosts(t, []url.URL{target, other}, []string{
+		targetKeys[0],
+		otherKey,
+		targetKeys[1],
+	})
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("unexpected batch write query plan (-want +got):\n%s", diff)
 	}
 }
 
@@ -1640,22 +1688,24 @@ func TestBatchWriteItemKeyRouteAffinityVotingStableForEquivalentBatches(t *testi
 		},
 	}
 
-	firstNode := mustBatchWriteFirstNode(t, h, first)
-	secondNode := mustBatchWriteFirstNode(t, h, second)
-	if firstNode != target {
-		t.Fatalf("expected first request to select %s, got %s", target.Host, firstNode.Host)
+	firstNodes := mustBatchWritePlanNodes(t, h, first, len(batchWriteTestNodes()))
+	secondNodes := mustBatchWritePlanNodes(t, h, second, len(batchWriteTestNodes()))
+	if firstNodes[0] != target.Host {
+		t.Fatalf("expected first request to select %s, got %s", target.Host, firstNodes[0])
 	}
-	if secondNode != firstNode {
-		t.Fatalf("expected equivalent reordered request to select %s, got %s", firstNode.Host, secondNode.Host)
+	if diff := cmp.Diff(firstNodes, secondNodes); diff != "" {
+		t.Fatalf("expected equivalent reordered requests to use the same query plan (-want +got):\n%s", diff)
 	}
 }
 
-func TestBatchWriteItemKeyRouteAffinityVotingFallsBackOnTie(t *testing.T) {
+func TestBatchWriteItemKeyRouteAffinityVotingUsesDeterministicTieBreak(t *testing.T) {
 	t.Parallel()
 
 	nodes := batchWriteSortedTestNodes()
-	leftKey := batchWriteStringKeysForNode(t, nodes[0], 1)[0]
-	rightKey := batchWriteStringKeysForNode(t, nodes[1], 1)[0]
+	left := nodes[3]
+	right := nodes[2]
+	leftKey := batchWriteStringKeysForNode(t, left, 1)[0]
+	rightKey := batchWriteStringKeysForNode(t, right, 1)[0]
 
 	h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
 	input := &dynamodb.BatchWriteItemInput{
@@ -1675,8 +1725,13 @@ func TestBatchWriteItemKeyRouteAffinityVotingFallsBackOnTie(t *testing.T) {
 		},
 	}
 
-	if _, err := h.batchWriteQueryPlan(input.RequestItems); err == nil {
-		t.Fatal("expected tied top vote count to fall back to non-affinity routing")
+	got := mustBatchWritePlanNodes(t, h, input, len(batchWriteTestNodes()))
+	want := batchWriteExpectedPlanHosts(t, []url.URL{right, left}, []string{
+		leftKey,
+		rightKey,
+	})
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("unexpected batch write tie-break query plan (-want +got):\n%s", diff)
 	}
 }
 
@@ -1971,15 +2026,43 @@ func batchWriteSortedTestNodes() []url.URL {
 	return nodes
 }
 
-func batchWriteSortedTestNodeHostsExcept(except url.URL) []string {
+func batchWriteExpectedPlanHosts(t *testing.T, preferred []url.URL, keys []string) []string {
+	t.Helper()
+
+	hashes := make([]int64, 0, len(keys))
+	for _, key := range keys {
+		hashes = append(hashes, batchWriteHashForStringKey(t, key))
+	}
+
 	nodes := batchWriteSortedTestNodes()
-	hosts := make([]string, 0, len(nodes)-1)
-	for _, node := range nodes {
-		if node != except {
-			hosts = append(hosts, node.Host)
+	hosts := make([]string, 0, len(nodes))
+	for _, preferredNode := range preferred {
+		idx := slices.Index(nodes, preferredNode)
+		if idx < 0 {
+			continue
 		}
+		hosts = append(hosts, nodes[idx].Host)
+		nodes = append(nodes[:idx], nodes[idx+1:]...)
+	}
+
+	rnd := rand.New(rand.NewSource(batchWriteSeed(hashes)))
+	for len(nodes) > 0 {
+		idx := rnd.Intn(len(nodes))
+		hosts = append(hosts, nodes[idx].Host)
+		nodes[idx] = nodes[len(nodes)-1]
+		nodes = nodes[:len(nodes)-1]
 	}
 	return hosts
+}
+
+func batchWriteHashForStringKey(t *testing.T, key string) int64 {
+	t.Helper()
+
+	hash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: key})
+	if err != nil {
+		t.Fatalf("HashAttributeValue returned error: %v", err)
+	}
+	return hash
 }
 
 func sortNodes(nodes []url.URL) []url.URL {
