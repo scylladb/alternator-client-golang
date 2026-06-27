@@ -1313,12 +1313,19 @@ func TestOptions(t *testing.T) {
 				const testKey = "same-key"
 
 				for opName, opFn := range operations {
+					optimized := slices.Contains(tc.optimizedOps, opName)
 					for i := 0; i < requestsPerOperation; i++ {
+						if optimized {
+							h.queryPlanSeed = 0
+						} else {
+							h.queryPlanSeed = int64(i + 1)
+						}
 						ctx := context.WithValue(context.Background(), operationCtxKey, opName)
 						if err := opFn(ctx, client, testKey); err != nil {
 							t.Fatalf("%s call failed: %v", opName, err)
 						}
 					}
+					h.queryPlanSeed = 0
 				}
 
 				for opName, nodes := range requestedNodes {
