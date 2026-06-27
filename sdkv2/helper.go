@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"sort"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -701,6 +702,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 	}
 
 	votes := make(map[url.URL]int)
+	hashes := make([]int64, 0, len(candidates))
 	discoveryTriggered := make(map[string]struct{})
 	for _, candidate := range candidates {
 		keyName := lb.keyAffinity.GetPartitionKeyName(candidate.tableName)
@@ -724,6 +726,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		if err != nil {
 			continue
 		}
+		hashes = append(hashes, hash)
 
 		node := shared.FirstNodeWithSeed(activeNodes, hash)
 		if node.Host != "" {
@@ -731,12 +734,12 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		}
 	}
 
-	preferredNode, ok := selectBatchWritePreferredNode(votes)
-	if !ok {
-		return nil, fmt.Errorf("batch write request does not have a unique preferred node")
+	preferredNodes := selectBatchWritePreferredNodes(votes)
+	if len(preferredNodes) == 0 {
+		return nil, fmt.Errorf("batch write request does not have usable preferred nodes")
 	}
 
-	return shared.NewLazyQueryPlanWithPreferredNode(lb.nodes, preferredNode), nil
+	return shared.NewLazyQueryPlanWithPreferredNodes(lb.nodes, preferredNodes, batchWriteSeed(hashes)), nil
 }
 
 func selectBatchWriteRoutingCandidates(requestItems map[string][]types.WriteRequest) []batchWriteRoutingCandidate {
@@ -765,25 +768,41 @@ func selectBatchWriteRoutingCandidates(requestItems map[string][]types.WriteRequ
 	return candidates
 }
 
-func selectBatchWritePreferredNode(votes map[url.URL]int) (url.URL, bool) {
-	var preferredNode url.URL
-	var preferredVotes int
-	var tied bool
+func selectBatchWritePreferredNodes(votes map[url.URL]int) []url.URL {
+	if len(votes) == 0 {
+		return nil
+	}
+
+	preferredNodes := make([]url.URL, 0, len(votes))
 	for node, count := range votes {
-		switch {
-		case count > preferredVotes:
-			preferredNode = node
-			preferredVotes = count
-			tied = false
-		case count == preferredVotes:
-			tied = true
+		if count > 0 {
+			preferredNodes = append(preferredNodes, node)
 		}
 	}
 
-	if preferredVotes == 0 || tied {
-		return url.URL{}, false
+	sort.Slice(preferredNodes, func(i, j int) bool {
+		left := preferredNodes[i]
+		right := preferredNodes[j]
+		if votes[left] != votes[right] {
+			return votes[left] > votes[right]
+		}
+		return left.String() < right.String()
+	})
+
+	return preferredNodes
+}
+
+func batchWriteSeed(hashes []int64) int64 {
+	sortedHashes := append([]int64(nil), hashes...)
+	sort.Slice(sortedHashes, func(i, j int) bool {
+		return sortedHashes[i] < sortedHashes[j]
+	})
+
+	var seed int64
+	for _, hash := range sortedHashes {
+		seed = seed*31 + hash
 	}
-	return preferredNode, true
+	return seed
 }
 
 type keyAffinity struct {
