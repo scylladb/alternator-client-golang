@@ -69,6 +69,8 @@ type Config struct {
 	UserAgent UserAgentFunc
 	// RequestCompression configures compression for request bodies
 	RequestCompression RequestCompressionFunc
+	// ResponseCompression configures accepted response body compression encodings
+	ResponseCompression []ResponseCompression
 	// NodeHealthStoreConfig controls node health tracking logic
 	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
 	// KeyRouteAffinity configures route affinity feature
@@ -131,7 +133,9 @@ const (
 	defaultAWSRegion = "default-alb-region"
 )
 
-var defaultTLSSessionCache = tls.NewLRUClientSessionCache(256)
+func newDefaultTLSSessionCache() tls.ClientSessionCache {
+	return tls.NewLRUClientSessionCache(256)
+}
 
 // NewDefaultConfig creates default `Config`
 func NewDefaultConfig() *Config {
@@ -142,7 +146,7 @@ func NewDefaultConfig() *Config {
 		RoutingScope:                  rt.NewClusterScope(),
 		NodesListUpdatePeriod:         5 * time.Minute,
 		IdleNodesListUpdatePeriod:     2 * time.Hour,
-		TLSSessionCache:               defaultTLSSessionCache,
+		TLSSessionCache:               newDefaultTLSSessionCache(),
 		MaxIdleHTTPConnections:        100,
 		MaxIdleHTTPConnectionsPerHost: http.DefaultMaxIdleConnsPerHost,
 		IdleHTTPConnectionTimeout:     defaultIdleConnectionTimeout,
@@ -513,6 +517,21 @@ func WithRequestCompression(compressionFunc RequestCompressionFunc) Option {
 	}
 }
 
+// WithResponseCompression enables HTTP response compression with the accepted encodings.
+// Response compression is disabled by default.
+func WithResponseCompression(encodings ...ResponseCompression) Option {
+	encodings = cloneResponseCompression(encodings)
+	validateResponseCompression(encodings)
+	return func(config *Config) {
+		config.ResponseCompression = cloneResponseCompression(encodings)
+	}
+}
+
+// WithoutResponseCompression disables HTTP response compression.
+func WithoutResponseCompression() Option {
+	return WithResponseCompression()
+}
+
 // WithHTTPTransportWrapper provides ability to control http transport
 // For testing purposes only, don't use it on production
 func WithHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripper) Option {
@@ -532,13 +551,24 @@ func WithHTTPClientTimeout(value time.Duration) Option {
 func NewHTTPTransport(config Config) http.RoundTripper {
 	alnConfig := config.ToALNConfig()
 
-	transport := PatchHTTPTransport(alnConfig, DefaultHTTPTransport())
+	baseTransport := DefaultHTTPTransport()
+	if len(config.ResponseCompression) == 0 {
+		baseTransport.DisableCompression = true
+	}
+	transport := PatchHTTPTransport(alnConfig, baseTransport)
 	if alnConfig.HTTPTransportWrapper != nil {
 		transport = alnConfig.HTTPTransportWrapper(transport)
 	}
 
 	if config.OptimizeHeaders != nil {
 		transport = NewHeaderWhiteListingTransport(transport, config.OptimizeHeaders(config)...)
+	}
+
+	if len(config.ResponseCompression) > 0 {
+		transport = NewResponseCompressionTransport(
+			transport,
+			config.ResponseCompression...,
+		)
 	}
 
 	if config.RequestCompression != nil {

@@ -9,7 +9,7 @@ networks:
 
 services:
   scylla1:
-    image: scylladb/scylla:2025.1
+    image: scylladb/scylla:2026.1.6
     networks:
       public:
         ipv4_address: 172.41.0.2
@@ -21,6 +21,8 @@ services:
       --ring-delay-ms 0
       --smp 2
       --memory 1G
+      --alternator-response-gzip-compression-level 1
+      --alternator-response-compression-threshold-in-bytes 1
     healthcheck:
       test: [ "CMD", "cqlsh", "scylla1", "-e", "select * from system.local WHERE key='local'" ]
       interval: 5s
@@ -33,7 +35,7 @@ services:
     volumes:
       - ./scylla:/etc/scylla
   scylla2:
-    image: scylladb/scylla:2025.1
+    image: scylladb/scylla:2026.1.6
     networks:
       public:
         ipv4_address: 172.41.0.3
@@ -45,6 +47,8 @@ services:
       --ring-delay-ms 0
       --smp 2
       --memory 1G
+      --alternator-response-gzip-compression-level 1
+      --alternator-response-compression-threshold-in-bytes 1
     healthcheck:
       test: [ "CMD", "cqlsh", "scylla2", "-e", "select * from system.local WHERE key='local'" ]
       interval: 5s
@@ -60,7 +64,7 @@ services:
     volumes:
       - ./scylla:/etc/scylla
   scylla3:
-    image: scylladb/scylla:2025.1
+    image: scylladb/scylla:2026.1.6
     networks:
       public:
         ipv4_address: 172.41.0.4
@@ -72,6 +76,8 @@ services:
       --ring-delay-ms 0
       --smp 2
       --memory 1G
+      --alternator-response-gzip-compression-level 1
+      --alternator-response-compression-threshold-in-bytes 1
     healthcheck:
       test: [ "CMD", "cqlsh", "scylla3", "-e", "select * from system.local WHERE key='local'" ]
       interval: 5s

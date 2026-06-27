@@ -55,6 +55,9 @@ import (
 // Option is option for the `NewHelper`
 type Option = shared.Option
 
+// ResponseCompression is an HTTP response compression encoding supported by the client.
+type ResponseCompression = shared.ResponseCompression
+
 // WithAWSConfigOptions lets callers mutate the generated aws.Config before it is used by the SDK.
 func WithAWSConfigOptions(options ...func(*aws.Config)) Option {
 	return func(config *shared.Config) {
@@ -165,6 +168,12 @@ var (
 	// Currently supported algorithms: "gzip"
 	WithRequestCompression = shared.WithRequestCompression
 
+	// WithResponseCompression enables response body compression with the accepted encodings.
+	WithResponseCompression = shared.WithResponseCompression
+
+	// WithoutResponseCompression disables response body compression.
+	WithoutResponseCompression = shared.WithoutResponseCompression
+
 	// NewGzipConfig creates a new GzipConfig for configuring gzip request compression
 	NewGzipConfig = shared.NewGzipConfig
 
@@ -173,6 +182,13 @@ var (
 
 	// WithKeyRouteAffinity enables routing optimization heuristics for the specified operation types.
 	WithKeyRouteAffinity = shared.WithKeyRouteAffinity
+)
+
+const (
+	// ResponseCompressionGzip accepts gzip-compressed responses.
+	ResponseCompressionGzip = shared.ResponseCompressionGzip
+	// ResponseCompressionDeflate accepts deflate-compressed responses.
+	ResponseCompressionDeflate = shared.ResponseCompressionDeflate
 )
 
 const (

@@ -273,6 +273,28 @@ It is supported only for AWS SDK v2, example how to enable it:
     }
 ```
 
+### Response compression
+
+HTTP response compression is supported for gzip and deflate responses. It is disabled by default. When enabled, the
+helper sends `Accept-Encoding` with the configured encodings and transparently decompresses compressed DynamoDB
+responses before returning them to the AWS SDK.
+
+To enable response compression, configure the accepted response encodings:
+```go
+    h, err := helper.NewHelper(
+        []string{"x.x.x.x"},
+        helper.WithPort(9999),
+        helper.WithResponseCompression(helper.ResponseCompressionDeflate),
+    )
+    if err != nil {
+        panic(fmt.Sprintf("failed to create alternator helper: %v", err))
+    }
+```
+
+Use `helper.WithoutResponseCompression()` to disable response compression after another option enabled it. Older
+Alternator versions that do not support response compression ignore the `Accept-Encoding` header and continue returning
+uncompressed responses.
+
 ### Request compression
 
 It is possible to enable request compression with:
@@ -286,9 +308,9 @@ It is possible to enable request compression with:
         panic(fmt.Sprintf("failed to create alternator helper: %v", err))
     }
 ```
-For now only Gzip compression is supported in the future there is a possiblity to add more.
+Only gzip request compression is currently supported.
 
-#### GZIP compression
+#### Gzip compression
 
 To create a new Gzip configuration, use `NewGzipConfig()`. You can also set compression level via `WithLevel()` option to control the trade-off between compression speed and compression ratio.
 
