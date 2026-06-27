@@ -498,6 +498,13 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 	return val, nil
 }
 
+func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
+	if lb.queryPlanSeed == 0 {
+		return shared.NewLazyQueryPlan(lb.nodes)
+	}
+	return shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
+}
+
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
@@ -506,16 +513,12 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
-						if lb.queryPlanSeed == 0 {
-							qp = shared.NewLazyQueryPlan(lb.nodes)
-						} else {
-							qp = shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
-						}
+						qp = lb.newDefaultQueryPlan()
 					} else {
 						if affinityPlan, err := lb.getAffinityQueryPlan(in); err == nil {
 							qp = affinityPlan
 						} else {
-							qp = shared.NewLazyQueryPlan(lb.nodes)
+							qp = lb.newDefaultQueryPlan()
 						}
 					}
 
