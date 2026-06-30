@@ -317,6 +317,7 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 				cfg.Logger.Error("failed to check node health status", logx.A("node", u.String()), logx.A("error", err))
 				return false
 			}
+			defer drainAndCloseResponseBody(resp.Body)
 			if resp.StatusCode != http.StatusOK {
 				cfg.Logger.Error("failed to check node health status, node reported an error",
 					logx.A("node", u.String()),
@@ -524,7 +525,7 @@ func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close() //nolint: errcheck // no need to check
+	defer drainAndCloseResponseBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, errors.New("non-200 response")
 	}
@@ -548,6 +549,14 @@ func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
 		uris = append(uris, *nodeURL)
 	}
 	return sortNodesByAddress(uris), nil
+}
+
+func drainAndCloseResponseBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, body)
+	_ = body.Close()
 }
 
 func sortNodesByAddress(nodes []url.URL) []url.URL {
