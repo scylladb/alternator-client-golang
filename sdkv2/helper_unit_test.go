@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2127,13 +2126,8 @@ func batchWriteSortedTestNodes() []url.URL {
 	return nodes
 }
 
-func batchWriteExpectedPlanHosts(t *testing.T, preferred []url.URL, keys []string) []string {
+func batchWriteExpectedPlanHosts(t *testing.T, preferred []url.URL, _ []string) []string {
 	t.Helper()
-
-	hashes := make([]int64, 0, len(keys))
-	for _, key := range keys {
-		hashes = append(hashes, batchWriteHashForStringKey(t, key))
-	}
 
 	nodes := batchWriteSortedTestNodes()
 	hosts := make([]string, 0, len(nodes))
@@ -2146,24 +2140,10 @@ func batchWriteExpectedPlanHosts(t *testing.T, preferred []url.URL, keys []strin
 		nodes = append(nodes[:idx], nodes[idx+1:]...)
 	}
 
-	rnd := rand.New(rand.NewSource(batchWriteSeed(hashes)))
-	for len(nodes) > 0 {
-		idx := rnd.Intn(len(nodes))
-		hosts = append(hosts, nodes[idx].Host)
-		nodes[idx] = nodes[len(nodes)-1]
-		nodes = nodes[:len(nodes)-1]
+	for _, node := range nodes {
+		hosts = append(hosts, node.Host)
 	}
 	return hosts
-}
-
-func batchWriteHashForStringKey(t *testing.T, key string) int64 {
-	t.Helper()
-
-	hash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: key})
-	if err != nil {
-		t.Fatalf("HashAttributeValue returned error: %v", err)
-	}
-	return hash
 }
 
 func sortNodes(nodes []url.URL) []url.URL {
