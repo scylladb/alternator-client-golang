@@ -1,12 +1,16 @@
 package shared
 
 import (
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
@@ -186,6 +190,89 @@ func TestAlternatorLiveNodes_CheckIfRackAndDatacenterSetCorrectlyRetriesSeedNode
 	}
 }
 
+func TestAlternatorLiveNodes_NonOKDiscoveryResponseKeepsConnectionReusable(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server, connections := newCountingHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/localnodes" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("temporary failure"))
+			return
+		}
+		_, _ = w.Write([]byte(`["127.0.0.1"]`))
+	}))
+	defer server.Close()
+
+	host, port := splitServerHostPort(t, server.URL)
+	aln, err := NewAlternatorLiveNodes(
+		[]string{host},
+		WithALNPort(port),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err == nil {
+		t.Fatalf("expected first UpdateLiveNodes to fail")
+	}
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("second UpdateLiveNodes returned error: %v", err)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("expected non-200 discovery response to leave connection reusable, got %d connections", got)
+	}
+}
+
+func TestAlternatorLiveNodes_NonOKHealthResponseKeepsConnectionReusable(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server, connections := newCountingHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("temporary failure"))
+			return
+		}
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	host, port := splitServerHostPort(t, server.URL)
+	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	nodeHealthConfig.QuarantineReleasePeriod = -1
+	aln, err := NewAlternatorLiveNodes(
+		[]string{host},
+		WithALNPort(port),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if released := aln.nodeHealthStore.TryReleaseQuarantinedNodes(); len(released) != 0 {
+		t.Fatalf("expected first health probe to keep node quarantined, released %v", released)
+	}
+	if released := aln.nodeHealthStore.TryReleaseQuarantinedNodes(); len(released) != 1 {
+		t.Fatalf("expected second health probe to release one node, released %v", released)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("expected non-200 health response to leave connection reusable, got %d connections", got)
+	}
+}
+
 type liveNodesRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f liveNodesRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -198,4 +285,36 @@ func hostnames(nodes []url.URL) []string {
 		out = append(out, node.Hostname())
 	}
 	return out
+}
+
+func newCountingHTTPServer(t *testing.T, handler http.Handler) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+
+	var connections atomic.Int32
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.Start()
+	return server, &connections
+}
+
+func splitServerHostPort(t *testing.T, rawURL string) (string, int) {
+	t.Helper()
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("failed to parse server URL: %v", err)
+	}
+	host, portString, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("failed to split server host: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("failed to parse server port: %v", err)
+	}
+	return host, port
 }

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -460,4 +462,96 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestDynamoDBNonOKResponsesKeepConnectionReusable(t *testing.T) {
+	t.Parallel()
+
+	server, connections, requests := newDynamoDBCountingHTTPServer(t)
+	defer server.Close()
+	host, port := splitTestServerHostPort(t, server)
+
+	h, err := NewHelper(
+		[]string{host},
+		WithPort(port),
+		WithCredentials("whatever", "secret"),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithMaxIdleHTTPConnectionsPerHost(1),
+		WithAWSConfigOptions(func(cfg *aws.Config) {
+			cfg.MaxRetries = aws.Int(0)
+			cfg.SleepDelay = func(time.Duration) {}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	defer h.Stop()
+
+	ddb, err := h.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %v", err)
+	}
+
+	if _, err := ddb.ListTables(&dynamodb.ListTablesInput{}); err == nil {
+		t.Fatalf("expected first ListTables to fail")
+	}
+	if _, err := ddb.ListTables(&dynamodb.ListTablesInput{}); err == nil {
+		t.Fatalf("expected second ListTables to fail")
+	}
+	if _, err := ddb.ListTables(&dynamodb.ListTablesInput{}); err != nil {
+		t.Fatalf("third ListTables returned error: %v", err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("expected 3 DynamoDB requests, got %d", got)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("expected non-200 DynamoDB responses to leave connection reusable, got %d connections", got)
+	}
+}
+
+func newDynamoDBCountingHTTPServer(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+
+	var connections atomic.Int32
+	var requests atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+		}
+
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		switch requests.Add(1) {
+		case 1, 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"__type":"ValidationException","message":"bad"}`))
+		default:
+			_, _ = w.Write([]byte(`{"TableNames":[]}`))
+		}
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.Start()
+	return server, &connections, &requests
+}
+
+func splitTestServerHostPort(t *testing.T, server *httptest.Server) (string, int) {
+	t.Helper()
+
+	host, portString, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split server address: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("failed to parse server port: %v", err)
+	}
+	return host, port
 }
