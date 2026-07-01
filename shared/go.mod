@@ -6,4 +6,4 @@ require go.uber.org/zap v1.28.0
 
 require go.uber.org/multierr v1.11.0 // indirect
 
-require github.com/klauspost/compress v1.18.6
+require github.com/klauspost/compress v1.19.0
