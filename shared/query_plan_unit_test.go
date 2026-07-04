@@ -123,7 +123,7 @@ func TestLazyQueryPlan(t *testing.T) {
 		}
 	})
 
-	t.Run("PreferredNodesSinglePreferredFirstThenSeededRemaining", func(t *testing.T) {
+	t.Run("PreferredNodesSinglePreferredFirstThenSortedRemaining", func(t *testing.T) {
 		const seed = int64(42)
 		preferred := url.URL{Host: "b"}
 		source := &fakeNodesSource{
@@ -147,7 +147,7 @@ func TestLazyQueryPlan(t *testing.T) {
 		}
 	})
 
-	t.Run("PreferredNodesFirstThenSeededRemaining", func(t *testing.T) {
+	t.Run("PreferredNodesFirstThenSortedRemaining", func(t *testing.T) {
 		const seed = int64(42)
 		preferredC := url.URL{Host: "c"}
 		preferredB := url.URL{Host: "b"}
@@ -200,7 +200,7 @@ func TestLazyQueryPlan(t *testing.T) {
 }
 
 func expectedPreferredPlanHosts(activeNodes, quarantinedNodes, preferredNodes []url.URL, seed int64) []string {
-	rnd := rand.New(rand.NewSource(seed))
+	_ = seed
 	activeNodes = cloneAndSortNodes(activeNodes)
 	quarantinedNodes = cloneAndSortNodes(quarantinedNodes)
 
@@ -214,18 +214,15 @@ func expectedPreferredPlanHosts(activeNodes, quarantinedNodes, preferredNodes []
 		}
 	}
 
-	hosts = append(hosts, seededPlanHosts(rnd, activeNodes)...)
-	hosts = append(hosts, seededPlanHosts(rnd, quarantinedNodes)...)
+	hosts = append(hosts, planHosts(activeNodes)...)
+	hosts = append(hosts, planHosts(quarantinedNodes)...)
 	return hosts
 }
 
-func seededPlanHosts(rnd *rand.Rand, nodes []url.URL) []string {
+func planHosts(nodes []url.URL) []string {
 	hosts := make([]string, 0, len(nodes))
-	for len(nodes) > 0 {
-		idx := rnd.Intn(len(nodes))
-		hosts = append(hosts, nodes[idx].Host)
-		nodes[idx] = nodes[len(nodes)-1]
-		nodes = nodes[:len(nodes)-1]
+	for _, node := range nodes {
+		hosts = append(hosts, node.Host)
 	}
 	return hosts
 }

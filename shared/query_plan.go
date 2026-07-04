@@ -22,6 +22,7 @@ type LazyQueryPlan struct {
 	rnd              *rand.Rand
 	preferredNodes   []url.URL
 	sortNodes        bool
+	deterministic    bool
 }
 
 // NewLazyQueryPlan constructs a plan bound to the provided nodes source.
@@ -50,15 +51,16 @@ func NewLazyQueryPlanWithSortedSeed(nodes nodesSource, seed int64) *LazyQueryPla
 	}
 }
 
-// NewLazyQueryPlanWithPreferredNodes constructs a seeded plan that tries
-// preferredNodes first when they are still active, then applies the seeded
-// selection algorithm to the remaining lexicographically sorted nodes.
+// NewLazyQueryPlanWithPreferredNodes constructs a plan that tries
+// preferredNodes first when they are still active, then returns the remaining
+// lexicographically sorted nodes.
 func NewLazyQueryPlanWithPreferredNodes(nodes nodesSource, preferredNodes []url.URL, seed int64) *LazyQueryPlan {
+	_ = seed
 	return &LazyQueryPlan{
 		nodes:          nodes,
-		rnd:            rand.New(rand.NewSource(seed)),
 		preferredNodes: append([]url.URL(nil), preferredNodes...),
 		sortNodes:      true,
+		deterministic:  true,
 	}
 }
 
@@ -104,6 +106,12 @@ func (p *LazyQueryPlan) Next() url.URL {
 }
 
 func (p *LazyQueryPlan) pickAndRemove(nodes *[]url.URL) url.URL {
+	if p.deterministic {
+		node := (*nodes)[0]
+		*nodes = (*nodes)[1:]
+		return node
+	}
+
 	idx := p.rnd.Intn(len(*nodes))
 	node := (*nodes)[idx]
 	(*nodes)[idx] = (*nodes)[len(*nodes)-1]
