@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -117,6 +118,57 @@ func TestAlternatorLiveNodes_ClusterScopeMergesSeedNodes(t *testing.T) {
 	}
 	if dc2Requests.Load() == 0 {
 		t.Fatalf("expected discovery request for dc2 seed")
+	}
+}
+
+func TestAlternatorLiveNodes_DNSEntrypointDiscoversDNSNodeRecords(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	listener, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("failed to listen on localhost: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path != "/localnodes" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		if !strings.HasPrefix(r.Host, "localhost:") {
+			t.Fatalf("request Host header got %q, want localhost:<port>", r.Host)
+		}
+		_, _ = w.Write([]byte(`["localhost","node-a.internal"]`))
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	_, port := splitServerHostPort(t, server.URL)
+	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	nodeHealthConfig.Disabled = true
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"localhost"},
+		WithALNPort(port),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("DNS seed should be contacted once, got %d requests", got)
+	}
+	got := hostnames(aln.GetNodes())
+	want := []string{"localhost", "node-a.internal"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("GetNodes got %v, want %v", got, want)
 	}
 }
 

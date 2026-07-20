@@ -7,18 +7,24 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 
 	helper "github.com/scylladb/alternator-client-golang/sdkv1"
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 )
 
@@ -29,6 +35,69 @@ var (
 )
 
 var notFoundErr = new(*dynamodb.ResourceNotFoundException)
+
+func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
+	body := fetchIntegrationLocalNodes(t)
+	listener, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("failed to listen on localhost: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/localnodes" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		_, _ = w.Write(body)
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	_, portString, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split DNS entrypoint address: %v", err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatalf("failed to parse DNS entrypoint port: %v", err)
+	}
+
+	h, err := helper.NewHelper(
+		[]string{"localhost"},
+		helper.WithPort(port),
+		helper.WithNodesListUpdatePeriod(0),
+		helper.WithIdleNodesListUpdatePeriod(0),
+		helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+	)
+	if err != nil {
+		t.Fatalf("failed to create alternator helper: %v", err)
+	}
+	defer h.Stop()
+
+	if err := h.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes() unexpectedly returned an error: %v", err)
+	}
+	if len(h.GetNodes()) == 0 {
+		t.Fatalf("UpdateLiveNodes() did not discover any nodes")
+	}
+}
+
+func fetchIntegrationLocalNodes(t *testing.T) []byte {
+	t.Helper()
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get("http://" + knownNodes[0] + ":" + strconv.Itoa(httpPort) + "/localnodes")
+	if err != nil {
+		t.Fatalf("failed to fetch integration /localnodes: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("integration /localnodes returned HTTP %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("failed to read integration /localnodes: %v", err)
+	}
+	return body
+}
 
 func TestRoutingFallback(t *testing.T) {
 	h, err := helper.NewHelper(
