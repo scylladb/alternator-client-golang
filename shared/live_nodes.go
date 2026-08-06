@@ -22,11 +22,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -315,13 +319,14 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 
 	nodes := make([]url.URL, len(initialNodes))
 	for i, node := range initialNodes {
-		parsed, err := url.Parse(fmt.Sprintf("%s://%s:%d", cfg.Scheme, node, cfg.Port))
+		uri, err := nodeURL(cfg.Scheme, node, cfg.Port)
 		if err != nil {
-			return nil, fmt.Errorf("invalid node URI: %w", err)
+			return nil, fmt.Errorf("invalid node URI %q: %w", node, err)
 		}
-		nodes[i] = *parsed
+		nodes[i] = uri
 	}
 	sortNodesByAddress(nodes)
+	initialNodeURLs := slices.Clone(nodes)
 
 	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
 		cfg.NodeHealthStoreConfig,
@@ -341,13 +346,13 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 			}
 			return true
 		},
-		nodes)
+		slices.Clone(nodes))
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	out := &AlternatorLiveNodes{
-		initialNodes:    nodes,
+		initialNodes:    initialNodeURLs,
 		cfg:             cfg,
 		ctx:             ctx,
 		stopFn:          cancel,
@@ -475,7 +480,37 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 	plan := NewLazyQueryPlan(aln)
 	var discoveredNodes []url.URL
 	var lastErr error
+	attempted := make(map[string]struct{})
 	for node := plan.Next(); node.Host != ""; node = plan.Next() {
+		attempted[node.String()] = struct{}{}
+		endpoint := node
+		endpoint.Path = "/localnodes"
+		endpoint.RawQuery = scope.GetLocalNodesQuery()
+
+		newNodes, err := aln.getNodes(&endpoint)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(newNodes) == 0 {
+			continue
+		}
+		if !clusterScope {
+			return newNodes, nil
+		}
+		discoveredNodes = append(discoveredNodes, newNodes...)
+	}
+	if len(discoveredNodes) != 0 {
+		return cloneAndDedupeNodes(discoveredNodes), nil
+	}
+
+	// Successful discovery replaces the initial entrypoints in the active node set. If every
+	// learned node later fails, retry the original entrypoints so a long-lived client can relearn
+	// the cluster without being recreated.
+	for _, node := range aln.initialNodes {
+		if _, ok := attempted[node.String()]; ok {
+			continue
+		}
 		endpoint := node
 		endpoint.Path = "/localnodes"
 		endpoint.RawQuery = scope.GetLocalNodesQuery()
@@ -555,14 +590,36 @@ func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
 
 	var uris []url.URL
 	for _, node := range nodes {
-		nodeURL, err := url.Parse(fmt.Sprintf("%s://%s:%d", aln.cfg.Scheme, node, aln.cfg.Port))
+		uri, err := nodeURL(aln.cfg.Scheme, node, aln.cfg.Port)
 		if err != nil {
-			aln.cfg.Logger.Error(fmt.Errorf("failed to parse node list entry: %w", err).Error())
+			aln.cfg.Logger.Error("invalid node URI", logx.A("node", node), logx.A("error", err))
 			continue
 		}
-		uris = append(uris, *nodeURL)
+		uris = append(uris, uri)
 	}
 	return sortNodesByAddress(uris), nil
+}
+
+func nodeURL(scheme, host string, port int) (url.URL, error) {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	if host == "" {
+		return url.URL{}, errors.New("host cannot be empty")
+	}
+	if strings.Contains(host, ":") {
+		if _, err := netip.ParseAddr(host); err != nil {
+			return url.URL{}, fmt.Errorf("invalid IPv6 address: %w", err)
+		}
+	}
+	uri := url.URL{
+		Scheme: scheme,
+		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
+	}
+	if _, err := url.Parse(uri.String()); err != nil {
+		return url.URL{}, err
+	}
+	return uri, nil
 }
 
 func drainAndCloseResponseBody(body io.ReadCloser) {

@@ -15,6 +15,7 @@
 package shared
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -183,6 +184,231 @@ func TestAlternatorLiveNodes_DNSEntrypointDiscoversDNSNodeRecords(t *testing.T) 
 	want := []string{"localhost", "node-a.internal"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("GetNodes got %v, want %v", got, want)
+	}
+}
+
+func TestAlternatorLiveNodes_IPv6LiteralDiscoversAndRoutesRequests(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+
+	var discoveryRequests atomic.Int32
+	var operationRequests atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != listener.Addr().String() {
+			t.Errorf("request Host header got %q, want %q", r.Host, listener.Addr().String())
+		}
+		switch r.URL.Path {
+		case "/localnodes":
+			discoveryRequests.Add(1)
+			_, _ = w.Write([]byte(`["::1"]`))
+		case "/":
+			operationRequests.Add(1)
+			_, _ = w.Write([]byte("OK"))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	_, port := splitServerHostPort(t, server.URL)
+	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	nodeHealthConfig.Disabled = true
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"::1"},
+		WithALNPort(port),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	wantURL := "http://" + listener.Addr().String()
+	initialNode := aln.NextNode()
+	if got := initialNode.String(); got != wantURL {
+		t.Fatalf("initial IPv6 node URL got %q, want %q", got, wantURL)
+	}
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	discoveredNode := aln.NextNode()
+	if got := discoveredNode.String(); got != wantURL {
+		t.Fatalf("discovered IPv6 node URL got %q, want %q", got, wantURL)
+	}
+
+	routedNode := aln.NextNode()
+	response, err := aln.httpClient.Get(routedNode.String())
+	if err != nil {
+		t.Fatalf("request through discovered IPv6 node failed: %v", err)
+	}
+	drainAndCloseResponseBody(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("request through discovered IPv6 node returned HTTP %d", response.StatusCode)
+	}
+	if got := discoveryRequests.Load(); got != 1 {
+		t.Fatalf("discovery requests got %d, want 1", got)
+	}
+	if got := operationRequests.Load(); got != 1 {
+		t.Fatalf("operation requests got %d, want 1", got)
+	}
+}
+
+func TestAlternatorLiveNodes_FallsBackToOriginalIPv6Entrypoint(t *testing.T) {
+	t.Parallel()
+
+	var seedRequests atomic.Int32
+	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	nodeHealthConfig.Disabled = true
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"2001:db8::1"},
+		WithALNPort(8080),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/localnodes" {
+					t.Fatalf("unexpected request path %q", req.URL.Path)
+				}
+				switch req.URL.Hostname() {
+				case "2001:db8::1":
+					if req.URL.Host != "[2001:db8::1]:8080" {
+						t.Fatalf("IPv6 entrypoint authority got %q, want %q", req.URL.Host, "[2001:db8::1]:8080")
+					}
+					if seedRequests.Add(1) == 1 {
+						return resp.AlternatorNodesResponse([]string{"2001:db8::2"}, req)
+					}
+					return resp.AlternatorNodesResponse([]string{"2001:db8::3"}, req)
+				case "2001:db8::2":
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader("malformed")),
+						Header:     make(http.Header),
+						Request:    req,
+					}, nil
+				default:
+					t.Fatalf("unexpected discovery host %q", req.URL.Hostname())
+					return nil, nil
+				}
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("first UpdateLiveNodes returned error: %v", err)
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"2001:db8::2"}) {
+		t.Fatalf("first discovery got %v, want [2001:db8::2]", got)
+	}
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("recovery UpdateLiveNodes returned error: %v", err)
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"2001:db8::3"}) {
+		t.Fatalf("recovery discovery got %v, want [2001:db8::3]", got)
+	}
+	if got := seedRequests.Load(); got != 2 {
+		t.Fatalf("original IPv6 entrypoint requests got %d, want 2", got)
+	}
+}
+
+func TestNodeURLFormatsHostAndPort(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{name: "DNS", host: "alternator.example.com", want: "https://alternator.example.com:8043"},
+		{name: "IPv4", host: "192.0.2.10", want: "https://192.0.2.10:8043"},
+		{name: "IPv6", host: "2001:db8::10", want: "https://[2001:db8::10]:8043"},
+		{name: "scoped IPv6", host: "fe80::10%eth0", want: "https://[fe80::10%25eth0]:8043"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := nodeURL("https", tt.host, 8043)
+			if err != nil {
+				t.Fatalf("nodeURL() returned error: %v", err)
+			}
+			if got.String() != tt.want {
+				t.Fatalf("nodeURL().String() got %q, want %q", got.String(), tt.want)
+			}
+			if got.Hostname() != tt.host {
+				t.Fatalf("nodeURL().Hostname() got %q, want %q", got.Hostname(), tt.host)
+			}
+		})
+	}
+}
+
+func TestNewAlternatorLiveNodesRejectsMalformedHost(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewAlternatorLiveNodes([]string{"bad host"}); err == nil {
+		t.Fatal("NewAlternatorLiveNodes() accepted a malformed host")
+	}
+}
+
+func TestAlternatorLiveNodesSkipsMalformedDiscoveredHost(t *testing.T) {
+	t.Parallel()
+
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed.local"},
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return resp.AlternatorNodesResponse([]string{"bad host", "::1"}, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"::1"}) {
+		t.Fatalf("discovered hosts got %v, want [::1]", got)
+	}
+}
+
+func TestAlternatorLiveNodesKeepsIndependentInitialNodesWhenHealthDisabled(t *testing.T) {
+	t.Parallel()
+
+	healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	healthConfig.Disabled = true
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed-a.local", "seed-b.local"},
+		WithALNNodeHealthStoreConfig(healthConfig),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return resp.AlternatorNodesResponse([]string{"seed-b.local"}, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	if got := hostnames(aln.initialNodes); !slices.Equal(got, []string{"seed-a.local", "seed-b.local"}) {
+		t.Fatalf("initial nodes were mutated to %v", got)
 	}
 }
 
