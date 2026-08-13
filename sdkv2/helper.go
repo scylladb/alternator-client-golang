@@ -46,6 +46,7 @@ package sdkv2
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -112,6 +113,9 @@ var (
 
 	// WithIdleNodesListUpdatePeriod configures how often update list of nodes, while no requests are running
 	WithIdleNodesListUpdatePeriod = shared.WithIdleNodesListUpdatePeriod
+
+	// WithDNSResolver sets the resolver used by discovery and normal SDK requests.
+	WithDNSResolver = shared.WithDNSResolver
 
 	// WithCredentials provides credentials to DynamoDB client, which could be used by Alternator as well
 	WithCredentials = shared.WithCredentials
@@ -236,9 +240,14 @@ type AlternatorNodesSource interface {
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
 	ReportNodeError(nodeURL url.URL, err error)
+	ReportNodeSuccess(nodeURL url.URL)
 	TryReleaseQuarantinedNodes() []url.URL
 	Start()
 	Stop()
+}
+
+type dnsResolverUpdater interface {
+	UpdateDNSResolver(*net.Resolver)
 }
 
 var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
@@ -330,6 +339,11 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if cfg.DNSResolver != lb.cfg.DNSResolver {
+		if updater, ok := lb.nodes.(dnsResolverUpdater); ok {
+			updater.UpdateDNSResolver(cfg.DNSResolver)
+		}
 	}
 	return &Helper{
 		nodes:       lb.nodes,
@@ -454,10 +468,9 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Host = node.Host
 	resp, err := rt.originalTransport.RoundTrip(req)
 	if err != nil && req.URL != nil {
-		rt.lb.nodes.ReportNodeError(url.URL{
-			Host:   req.URL.Host,
-			Scheme: req.URL.Scheme,
-		}, err)
+		rt.lb.nodes.ReportNodeError(node, err)
+	} else if err == nil {
+		rt.lb.nodes.ReportNodeSuccess(node)
 	}
 	return resp, err
 }

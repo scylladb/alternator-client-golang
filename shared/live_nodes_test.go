@@ -15,6 +15,8 @@
 package shared
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -25,11 +27,58 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
+	testhelpers "github.com/scylladb/alternator-client-golang/shared/tests/helpers"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
+
+func TestAlternatorLiveNodes_UpdateDNSResolver(t *testing.T) {
+	t.Parallel()
+
+	var oldResolverCalls atomic.Int32
+	oldResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			oldResolverCalls.Add(1)
+			return nil, errors.New("old resolver unavailable")
+		},
+	}
+	newResolver := testhelpers.NewStaticResolver("entrypoint.test", []string{"127.0.0.1"})
+	storeConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	storeConfig.Disabled = true
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"entrypoint.test"},
+		WithALNDNSResolver(oldResolver),
+		WithALNNodeHealthStoreConfig(storeConfig),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return resp.AlternatorNodesResponse([]string{"learned.local"}, request)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err == nil {
+		t.Fatal("discovery unexpectedly succeeded with the old resolver")
+	}
+	if oldResolverCalls.Load() == 0 {
+		t.Fatal("old resolver was not exercised")
+	}
+
+	aln.UpdateDNSResolver(newResolver)
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("discovery with updated resolver failed: %v", err)
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"learned.local"}) {
+		t.Fatalf("discovered nodes got %v, want [learned.local]", got)
+	}
+}
 
 func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T) {
 	t.Parallel()
@@ -47,7 +96,7 @@ func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T)
 				}
 				switch req.URL.RawQuery {
 				case "dc=wrong":
-					return resp.AlternatorNodesResponse(nil, req)
+					return resp.AlternatorNodesResponse([]string{}, req)
 				case "dc=target":
 					fallbackRequests.Add(1)
 					return resp.AlternatorNodesResponse([]string{"node3.local"}, req)
@@ -76,6 +125,46 @@ func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T)
 	}
 	if fallbackRequests.Load() == 0 {
 		t.Fatalf("expected discovery request for fallback scope")
+	}
+}
+
+func TestAlternatorLiveNodes_RoutingScopeFallbackSurvivesAnotherSeedFailure(t *testing.T) {
+	t.Parallel()
+
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"empty-seed.local", "failing-seed.local"},
+		WithALNPort(8080),
+		WithALNRoutingScope(rt.NewDCScope("wrong", rt.NewDCScope("target", nil))),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "" || req.URL.Path == "/" {
+					return resp.HealthCheckResponse(req)
+				}
+				if req.URL.Hostname() == "failing-seed.local" {
+					return nil, errors.New("seed unavailable")
+				}
+				switch req.URL.RawQuery {
+				case "dc=wrong":
+					return resp.AlternatorNodesResponse([]string{}, req)
+				case "dc=target":
+					return resp.AlternatorNodesResponse([]string{"target-node.local"}, req)
+				default:
+					t.Fatalf("unexpected /localnodes query %q", req.URL.RawQuery)
+					return nil, nil
+				}
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"target-node.local"}) {
+		t.Fatalf("GetNodes got %v, want [target-node.local]", got)
 	}
 }
 
@@ -244,7 +333,7 @@ func TestAlternatorLiveNodes_IPv6LiteralDiscoversAndRoutesRequests(t *testing.T)
 	}
 
 	routedNode := aln.NextNode()
-	response, err := aln.httpClient.Get(routedNode.String())
+	response, err := aln.httpState.Load().client.Get(routedNode.String())
 	if err != nil {
 		t.Fatalf("request through discovered IPv6 node failed: %v", err)
 	}
@@ -361,6 +450,46 @@ func TestNewAlternatorLiveNodesRejectsMalformedHost(t *testing.T) {
 	}
 }
 
+func TestDiscoveryDNSLookupUsesFiniteDeadline(t *testing.T) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"stalled-dns.test"},
+		WithALNDNSResolver(resolver),
+		WithALNHTTPClientTimeout(20*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	startedAt := time.Now()
+	err = aln.UpdateLiveNodes()
+	if err == nil {
+		t.Fatal("UpdateLiveNodes succeeded for a stalled DNS lookup")
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("stalled DNS lookup took %s, want at most 1s", elapsed)
+	}
+	if got := aln.discoveryTimeout(); got != 20*time.Millisecond {
+		t.Fatalf("discoveryTimeout() = %s, want 20ms", got)
+	}
+
+	defaultALN, err := NewAlternatorLiveNodes([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer defaultALN.Stop()
+	if got := defaultALN.discoveryTimeout(); got != defaultDiscoveryTimeout {
+		t.Fatalf("default discoveryTimeout() = %s, want %s", got, defaultDiscoveryTimeout)
+	}
+}
+
 func TestAlternatorLiveNodesSkipsMalformedDiscoveredHost(t *testing.T) {
 	t.Parallel()
 
@@ -459,7 +588,7 @@ func TestAlternatorLiveNodes_CheckIfRackAndDatacenterSetCorrectlyRetriesSeedNode
 							targetRequests.Add(1)
 							return resp.AlternatorNodesResponse([]string{"dc1-node.local"}, req)
 						case "dc2-node.local":
-							return resp.AlternatorNodesResponse(nil, req)
+							return resp.AlternatorNodesResponse([]string{}, req)
 						default:
 							t.Fatalf("unexpected validation host %q", req.URL.Hostname())
 							return nil, nil

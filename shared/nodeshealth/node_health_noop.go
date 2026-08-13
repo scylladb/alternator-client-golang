@@ -65,6 +65,38 @@ func (n *NodeHealthNoop) RemoveNode(node url.URL) {
 	})
 }
 
+// ReplaceNodes atomically replaces the known-node snapshot.
+func (n *NodeHealthNoop) ReplaceNodes(nodes []url.URL) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	oldNodes := make(map[url.URL]struct{}, len(n.knownNodes))
+	for _, node := range n.knownNodes {
+		oldNodes[node] = struct{}{}
+	}
+	replacement := make([]url.URL, 0, len(nodes))
+	seen := make(map[url.URL]struct{}, len(nodes))
+	hasNewNodes := false
+	for _, node := range nodes {
+		if _, duplicate := seen[node]; duplicate {
+			continue
+		}
+		seen[node] = struct{}{}
+		replacement = append(replacement, node)
+		if _, exists := oldNodes[node]; !exists {
+			hasNewNodes = true
+		}
+	}
+	n.knownNodes = replacement
+	return hasNewNodes
+}
+
+// GetAllNodes returns one consistent snapshot; health tracking is disabled.
+func (n *NodeHealthNoop) GetAllNodes() (active, quarantined []url.URL) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return cloneNodes(n.knownNodes), nil
+}
+
 // ReportNodeError is a no-op since health tracking is disabled.
 func (n *NodeHealthNoop) ReportNodeError(_ url.URL, _ error) {}
 
