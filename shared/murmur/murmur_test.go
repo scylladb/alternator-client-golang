@@ -282,6 +282,21 @@ func TestMurmur3CrossLanguageVectors(t *testing.T) {
 	}
 }
 
+func TestGetBlockUsesLittleEndian(t *testing.T) {
+	data := []byte{
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+	}
+
+	k1, k2 := getBlock(data, 0)
+	if got, want := uint64(k1), uint64(0x0706050403020100); got != want {
+		t.Errorf("First block word has wrong byte order: got=0x%016X, want=0x%016X", got, want)
+	}
+	if got, want := uint64(k2), uint64(0x0f0e0d0c0b0a0908); got != want {
+		t.Errorf("Second block word has wrong byte order: got=0x%016X, want=0x%016X", got, want)
+	}
+}
+
 func TestPartialBlockHandling(t *testing.T) {
 	testCases := []struct {
 		name string

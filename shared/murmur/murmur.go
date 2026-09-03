@@ -40,8 +40,8 @@
 package murmur
 
 import (
+	"encoding/binary"
 	"hash"
-	"unsafe"
 )
 
 const (
@@ -180,10 +180,10 @@ func Murmur3H1(data []byte) int64 {
 }
 
 func getBlock(data []byte, n int) (int64, int64) {
-	block := (*[2]int64)(unsafe.Pointer(&data[n*16]))
+	block := data[n*16:]
 
-	k1 := block[0]
-	k2 := block[1]
+	k1 := int64(binary.LittleEndian.Uint64(block[:8]))
+	k2 := int64(binary.LittleEndian.Uint64(block[8:16]))
 	return k1, k2
 }
 
