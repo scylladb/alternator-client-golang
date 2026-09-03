@@ -1,6 +1,6 @@
 module github.com/scylladb/alternator-client-golang/sdkv2
 
-go 1.24.0
+go 1.25
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.66.0
 	github.com/aws/smithy-go v1.28.1
 	github.com/google/go-cmp v0.7.0
-	github.com/klauspost/compress v1.19.0
+	github.com/klauspost/compress v1.20.0
 	github.com/scylladb/alternator-client-golang/shared v1.0.6
 )
 
