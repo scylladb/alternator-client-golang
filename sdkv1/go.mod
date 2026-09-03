@@ -1,11 +1,11 @@
 // Deprecated: use github.com/scylladb/alternator-client-golang/sdkv2 instead; sdkv1 no longer receives new features.
 module github.com/scylladb/alternator-client-golang/sdkv1
 
-go 1.24.0
+go 1.25
 
 require (
 	github.com/aws/aws-sdk-go v1.55.8
-	github.com/klauspost/compress v1.19.0
+	github.com/klauspost/compress v1.20.0
 	github.com/scylladb/alternator-client-golang/shared v1.0.6
 )
 
