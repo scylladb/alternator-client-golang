@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.30
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.53
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.61.0
-	github.com/aws/smithy-go v1.27.4
+	github.com/aws/smithy-go v1.28.1
 	github.com/google/go-cmp v0.7.0
 	github.com/klauspost/compress v1.19.0
 	github.com/scylladb/alternator-client-golang/shared v1.0.6
