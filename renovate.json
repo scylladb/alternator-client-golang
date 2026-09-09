@@ -3,11 +3,52 @@
   "extends": [
     "config:recommended"
   ],
+  "customDatasources": {
+    "supported-go": {
+      "defaultRegistryUrlTemplate": "https://go.dev/dl/?mode=json",
+      "transformTemplates": [
+        "($currentValue := \"{{{currentValue}}}\"; $currentCycle := $replace($currentValue, /^(\\d+\\.\\d+)(?:\\.\\d+)?$/, \"$1\"); $targetVersion := $substring($[-1].version, 2); $isSupported := $count($[$replace(version, /^go(\\d+\\.\\d+)\\.\\d+$/, \"$1\") = $currentCycle]) > 0; {\"releases\": $isSupported ? [{\"version\": $currentValue}] : [{\"version\": $currentValue}, {\"version\": $targetVersion}]})"
+      ]
+    }
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Keep all non-module Go version references synchronized",
+      "managerFilePatterns": [
+        "/^go\\.work$/",
+        "/(^|/)\\.golangci\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\\n)go[ \\t]+(?<currentValue>\\d+\\.\\d+(?:\\.\\d+)?)[ \\t]*(?:\\r?\\n|$)",
+        "(?:^|\\n)[ \\t]+go:[ \\t]+(?<currentValue>\\d+\\.\\d+(?:\\.\\d+)?)[ \\t]*(?:\\r?\\n|$)"
+      ],
+      "depNameTemplate": "go",
+      "packageNameTemplate": "go",
+      "depTypeTemplate": "golang",
+      "datasourceTemplate": "custom.supported-go",
+      "versioningTemplate": "semver"
+    }
+  ],
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
       "pinDigests": true,
       "minimumReleaseAge": "90 days"
+    },
+    {
+      "description": "Keep module updates compatible with the supported Go baseline",
+      "matchManagers": ["gomod"],
+      "constraintsFiltering": "strict"
+    },
+    {
+      "description": "Update Go only after the current release becomes unsupported",
+      "matchDatasources": ["golang-version", "custom.supported-go"],
+      "matchDepTypes": ["golang"],
+      "matchPackageNames": ["go"],
+      "overrideDatasource": "custom.supported-go",
+      "rangeStrategy": "bump",
+      "groupName": "Go version"
     }
   ]
 }
