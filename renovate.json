@@ -7,7 +7,7 @@
     "supported-go": {
       "defaultRegistryUrlTemplate": "https://go.dev/dl/?mode=json",
       "transformTemplates": [
-        "($currentValue := \"{{{currentValue}}}\"; $currentCycle := $replace($currentValue, /^(\\d+\\.\\d+)(?:\\.\\d+)?$/, \"$1\"); $targetVersion := $substring($[-1].version, 2); $isSupported := $count($[$replace(version, /^go(\\d+\\.\\d+)\\.\\d+$/, \"$1\") = $currentCycle]) > 0; {\"releases\": $isSupported ? [{\"version\": $currentValue}] : [{\"version\": $currentValue}, {\"version\": $targetVersion}]})"
+        "($currentValue := \"{{{currentValue}}}\"; $currentCycle := $replace($currentValue, /^(\\d+\\.\\d+)(?:\\.\\d+)?$/, \"$1\"); $supportedCycle := $replace($[-1].version, /^go(\\d+\\.\\d+)\\.\\d+$/, \"$1\"); $targetVersion := $supportedCycle & \".0\"; $isSupported := $count($[$replace(version, /^go(\\d+\\.\\d+)\\.\\d+$/, \"$1\") = $currentCycle]) > 0; {\"releases\": $isSupported ? [{\"version\": $currentValue}] : [{\"version\": $currentValue}, {\"version\": $targetVersion}]})"
       ]
     }
   },
