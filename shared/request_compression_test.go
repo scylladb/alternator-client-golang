@@ -16,6 +16,9 @@ package shared
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
@@ -24,6 +27,11 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 )
+
+type legacyOriginalError struct{ err error }
+
+func (e legacyOriginalError) Error() string  { return "legacy wrapper: " + e.err.Error() }
+func (e legacyOriginalError) OrigErr() error { return e.err }
 
 func TestCompressionTransport_Gzip(t *testing.T) {
 	originalBody := "test request body"
@@ -66,6 +74,40 @@ func TestCompressionTransport_Gzip(t *testing.T) {
 
 	if string(decompressedBody) != originalBody {
 		t.Errorf("Expected body %q, got %q", originalBody, string(decompressedBody))
+	}
+}
+
+func TestCompressionTransportMarksPreTransportFailure(t *testing.T) {
+	t.Parallel()
+	original := errors.New("compress failed")
+	transport := NewCompressionTransport(
+		roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("physical transport was called")
+			return nil, nil
+		}),
+		func(body io.ReadCloser) (io.ReadCloser, string, int64, error) {
+			return body, "", 0, original
+		},
+	)
+	req, err := http.NewRequest(http.MethodPost, "http://example.com", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reported error
+	ctx := WithRequestCompressionFailureHandler(context.Background(), func(err error) { reported = err })
+	_, gotErr := transport.RoundTrip(req.WithContext(ctx))
+	if !IsRequestCompressionError(gotErr) || !errors.Is(gotErr, original) {
+		t.Fatalf("compression error = %v, want marked wrapper of %v", gotErr, original)
+	}
+	legacyWrapped := legacyOriginalError{err: fmt.Errorf("outer: %w", gotErr)}
+	if !IsRequestCompressionError(legacyWrapped) {
+		t.Fatalf("legacy OrigErr chain did not expose marked error: %v", legacyWrapped)
+	}
+	if IsRequestCompressionError(errors.New("dial failed")) {
+		t.Fatal("ordinary transport error was classified as request compression")
+	}
+	if !errors.Is(reported, original) {
+		t.Fatalf("pre-transport failure handler received %v, want %v", reported, original)
 	}
 }
 
