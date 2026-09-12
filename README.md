@@ -42,6 +42,9 @@ There is a separate library for each AWS SDK version:
 New applications should use `sdkv2`. It is the more feature-rich helper and is where new feature development happens.
 The `sdkv1` module is kept for existing users that cannot migrate yet, but it is deprecated and no longer receives new features.
 
+Language-agnostic behavioral contracts and Go-specific conformance mappings are maintained in the
+[`feature-specs`](feature-specs/README.md) directory.
+
 ### Migrating from SDK v1
 
 Move new and actively maintained applications to `sdkv2`. In most cases, migration starts by changing imports from
