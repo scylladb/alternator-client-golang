@@ -15,6 +15,7 @@
 package nodeshealth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -109,18 +110,11 @@ func NewNodeHealthStoreBasic(
 		return nil, err
 	}
 
-	var releaseTimer *time.Timer
-	if cfg.QuarantineReleasePeriod > 0 {
-		releaseTimer = time.NewTimer(cfg.QuarantineReleasePeriod)
-	}
-
 	store := &NodeHealthStore{
-		cfg:            cfg,
-		releaseFunc:    releaseFunc,
-		initialNodes:   append([]url.URL(nil), initialNodes...),
-		nodesStatuses:  make(map[url.URL]*NodeHealthStatus, len(initialNodes)),
-		releaseTimer:   releaseTimer,
-		releaseTrigger: make(chan struct{}, 1),
+		cfg:           cfg,
+		releaseFunc:   releaseFunc,
+		initialNodes:  append([]url.URL(nil), initialNodes...),
+		nodesStatuses: make(map[url.URL]*NodeHealthStatus, len(initialNodes)),
 	}
 	empty := make([]url.URL, 0)
 	store.activeNodes.Store(&empty)
@@ -143,8 +137,13 @@ type NodeHealthStore struct {
 	activeNodes      atomic.Pointer[[]url.URL]
 	quarantinedNodes atomic.Pointer[[]url.URL]
 
-	releaseTrigger chan struct{}
-	releaseTimer   *time.Timer
+	releaseMu sync.Mutex
+
+	workerMu      sync.Mutex
+	workerRunning bool
+	workerStopped bool
+	workerCancel  context.CancelFunc
+	workerDone    chan struct{}
 }
 
 // NodeHealthStatus captures the current health data for a node.
@@ -206,6 +205,13 @@ func (e *NodeHealthStore) TryReleaseQuarantinedNodes() []url.URL {
 	if e.releaseFunc == nil {
 		return nil
 	}
+	// Coalesce overlapping foreground and periodic sweeps. This makes the
+	// configured callback concurrency a store-wide bound rather than a
+	// per-sweep bound and prevents duplicate health probes for the same nodes.
+	if !e.releaseMu.TryLock() {
+		return nil
+	}
+	defer e.releaseMu.Unlock()
 	candidates := e.GetQuarantinedNodes()
 	if len(candidates) == 0 {
 		return nil
@@ -295,14 +301,36 @@ func (e *NodeHealthStore) GetNodeStatus(node url.URL) *NodeHealthStatus {
 
 // ReleaseNode released node from quarantine
 func (e *NodeHealthStore) ReleaseNode(node url.URL) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	status := e.nodesStatuses[node]
-	if status == nil {
+	e.ReleaseNodes([]url.URL{node})
+}
+
+// ReleaseNodes atomically moves the selected tracked nodes out of quarantine.
+func (e *NodeHealthStore) ReleaseNodes(nodes []url.URL) {
+	if len(nodes) == 0 {
 		return
 	}
-	e.cfg.Scoring.Release(status)
-	e.nodesStatuses[node] = status
+	selected := make(map[url.URL]struct{}, len(nodes))
+	for _, node := range nodes {
+		selected[node] = struct{}{}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	active := e.GetActiveNodes()
+	quarantined := make([]url.URL, 0, len(e.GetQuarantinedNodes()))
+	for _, node := range e.GetQuarantinedNodes() {
+		if _, release := selected[node]; !release {
+			quarantined = append(quarantined, node)
+			continue
+		}
+		status := e.nodesStatuses[node]
+		if status == nil {
+			continue
+		}
+		e.cfg.Scoring.Release(status)
+		active = append(active, node)
+	}
+	e.activeNodes.Store(&active)
+	e.quarantinedNodes.Store(&quarantined)
 }
 
 // AddNode registers a node in the store and places it into the appropriate pool.
@@ -347,18 +375,44 @@ func (e *NodeHealthStore) RemoveNode(node url.URL) {
 	e.quarantinedNodes.Store(&quarantined)
 }
 
-// GetAllNodes returns the active and quarantined node sets and triggers async release if configured.
-func (e *NodeHealthStore) GetAllNodes() (active, quarantined []url.URL) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	for node, status := range e.nodesStatuses {
-		if status.quarantined {
+// ReplaceNodes atomically replaces the tracked-node set while preserving health
+// status for nodes that are present in both snapshots.
+func (e *NodeHealthStore) ReplaceNodes(nodes []url.URL) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	statuses := make(map[url.URL]*NodeHealthStatus, len(nodes))
+	active := make([]url.URL, 0, len(nodes))
+	quarantined := make([]url.URL, 0, len(nodes))
+	hasNewNodes := false
+	for _, node := range nodes {
+		if _, duplicate := statuses[node]; duplicate {
+			continue
+		}
+		status := e.nodesStatuses[node]
+		if status == nil {
+			status = e.cfg.Scoring.NewStatus()
+			hasNewNodes = true
+		}
+		statuses[node] = status
+		if status.Quarantined() {
 			quarantined = append(quarantined, node)
 		} else {
 			active = append(active, node)
 		}
 	}
-	return active, quarantined
+
+	e.nodesStatuses = statuses
+	e.activeNodes.Store(&active)
+	e.quarantinedNodes.Store(&quarantined)
+	return hasNewNodes
+}
+
+// GetAllNodes returns one coherent, order-preserving node snapshot.
+func (e *NodeHealthStore) GetAllNodes() (active, quarantined []url.URL) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return cloneNodes(*e.activeNodes.Load()), cloneNodes(*e.quarantinedNodes.Load())
 }
 
 // Start starts release worker and it's timer
@@ -376,35 +430,56 @@ func (e *NodeHealthStore) startReleaseWorker() {
 		return
 	}
 
-	e.releaseTimer = time.NewTimer(e.cfg.QuarantineReleasePeriod)
-
-	go func() {
-		for range e.releaseTimer.C {
-			e.triggerReleaseWorker()
-		}
-	}()
-
-	go func() {
-		for range e.releaseTrigger {
-			e.TryReleaseQuarantinedNodes()
-		}
-	}()
-}
-
-func (e *NodeHealthStore) triggerReleaseWorker() {
-	select {
-	case e.releaseTrigger <- struct{}{}:
-	default:
+	e.workerMu.Lock()
+	if e.workerRunning || e.workerStopped {
+		e.workerMu.Unlock()
+		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	e.workerRunning = true
+	e.workerCancel = cancel
+	e.workerDone = done
+	e.workerMu.Unlock()
+
+	go func() {
+		defer func() {
+			close(done)
+			e.workerMu.Lock()
+			if e.workerDone == done {
+				e.workerCancel = nil
+				e.workerDone = nil
+				e.workerRunning = false
+			}
+			e.workerMu.Unlock()
+		}()
+		ticker := time.NewTicker(e.cfg.QuarantineReleasePeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				e.TryReleaseQuarantinedNodes()
+			}
+		}
+	}()
 }
 
 func (e *NodeHealthStore) stopReleaseWorker() {
-	if e.releaseFunc == nil || e.cfg.QuarantineReleasePeriod <= 0 {
+	e.workerMu.Lock()
+	defer e.workerMu.Unlock()
+	if e.workerStopped {
 		return
 	}
-
-	e.releaseTimer.Stop()
-	close(e.releaseTrigger)
+	e.workerStopped = true
+	if !e.workerRunning {
+		return
+	}
+	e.workerCancel()
 }
 
 func cloneNodes(orig []url.URL) []url.URL {

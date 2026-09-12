@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -77,6 +78,8 @@ type Config struct {
 	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
 	// Timeout for HTTP requests
 	HTTPClientTimeout time.Duration
+	// DNSResolver overrides hostname resolution for discovery and SDK requests.
+	DNSResolver *net.Resolver
 	// AWSConfigOptions holds []func(*aws.Config) where the aws.Config type differs for each SDK version (v1 vs v2)
 	AWSConfigOptions []any
 	// UserAgent updates the DynamoDB request User-Agent header.
@@ -194,6 +197,9 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNRoutingScope(c.RoutingScope),
 		WithALNLogger(c.Logger),
 		WithALNNodeHealthStoreConfig(c.NodeHealthStoreConfig),
+	}
+	if c.DNSResolver != nil {
+		out = append(out, WithALNDNSResolver(c.DNSResolver))
 	}
 
 	if c.IdleNodesListUpdatePeriod != 0 {
@@ -558,6 +564,16 @@ func WithHTTPTransportWrapper(wrapper func(http.RoundTripper) http.RoundTripper)
 func WithHTTPClientTimeout(value time.Duration) Option {
 	return func(config *Config) {
 		config.HTTPClientTimeout = value
+	}
+}
+
+// WithDNSResolver sets the resolver used by discovery and normal SDK requests.
+func WithDNSResolver(resolver *net.Resolver) Option {
+	if resolver == nil {
+		panic("resolver can't be nil")
+	}
+	return func(config *Config) {
+		config.DNSResolver = resolver
 	}
 }
 

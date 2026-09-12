@@ -15,6 +15,8 @@
 package sdkv1
 
 import (
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -23,18 +25,46 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/klauspost/compress/gzip"
 
+	"github.com/scylladb/alternator-client-golang/shared"
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
+	testhelpers "github.com/scylladb/alternator-client-golang/shared/tests/helpers"
 	"github.com/scylladb/alternator-client-golang/shared/tests/mocks"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 )
+
+type dnsResolverUpdateRecorderV1 struct {
+	AlternatorNodesSource
+	resolver *net.Resolver
+}
+
+func (r *dnsResolverUpdateRecorderV1) UpdateDNSResolver(resolver *net.Resolver) {
+	r.resolver = resolver
+}
+
+func TestHelperUpdatePropagatesDNSResolver(t *testing.T) {
+	t.Parallel()
+
+	recorder := &dnsResolverUpdateRecorderV1{}
+	helper := &Helper{nodes: recorder, cfg: *shared.NewDefaultConfig()}
+	resolver := &net.Resolver{}
+	updated := helper.Update(WithDNSResolver(resolver))
+	if recorder.resolver != resolver {
+		t.Fatal("Helper.Update did not propagate the DNS resolver to discovery")
+	}
+	if updated.cfg.DNSResolver != resolver {
+		t.Fatal("Helper.Update did not retain the DNS resolver for SDK requests")
+	}
+}
 
 func TestOptions(t *testing.T) {
 	t.Parallel()
@@ -476,6 +506,249 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestLiveNodeManagerRecoveryRoutesOperationsToLearnedNode(t *testing.T) {
+	t.Parallel()
+
+	var recovery atomic.Bool
+	var hostsMu sync.Mutex
+	var operationHosts []string
+	mockTransport := &mocks.MockRoundTripper{
+		AlternatorRequest: func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Hostname() {
+			case "entrypoint.local":
+				if recovery.Load() {
+					return resp.AlternatorNodesResponse([]string{"new.local"}, request)
+				}
+				return resp.AlternatorNodesResponse([]string{"old.local"}, request)
+			case "old.local":
+				return nil, errors.New("old node unavailable")
+			default:
+				return nil, errors.New("unexpected discovery node")
+			}
+		},
+		NodeHealthRequest: resp.HealthCheckResponse,
+		DynamoDBRequest: func(request *http.Request) (*http.Response, error) {
+			hostsMu.Lock()
+			operationHosts = append(operationHosts, request.URL.Hostname())
+			hostsMu.Unlock()
+			if request.URL.Hostname() == "old.local" {
+				return nil, errors.New("old node unavailable")
+			}
+			if request.URL.Hostname() != "new.local" {
+				return nil, errors.New("normal operation used a discovery seed")
+			}
+			return resp.DynamoDBListTablesResponse([]string{"recovered"}, request)
+		},
+	}
+	storeConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	storeConfig.Disabled = true
+	helper, err := NewHelper(
+		[]string{"entrypoint.local"},
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+		WithNodeHealthStoreConfig(storeConfig),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithCredentials("test-key", "test-secret"),
+		WithAWSConfigOptions(func(config *aws.Config) {
+			config.MaxRetries = aws.Int(0)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	defer helper.Stop()
+	if err := helper.UpdateLiveNodes(); err != nil {
+		t.Fatalf("initial UpdateLiveNodes returned error: %v", err)
+	}
+	client, err := helper.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %v", err)
+	}
+	recovery.Store(true)
+	if _, err := client.ListTables(&dynamodb.ListTablesInput{}); err == nil {
+		t.Fatal("ListTables unexpectedly succeeded through the failed learned node")
+	}
+	deadline := time.Now().Add(time.Second)
+	for helper.GetNodes()[0].Hostname() != "new.local" {
+		if time.Now().After(deadline) {
+			t.Fatal("live-node manager did not recover through the original entrypoint")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	output, err := client.ListTables(&dynamodb.ListTablesInput{})
+	if err != nil {
+		t.Fatalf("ListTables after live-node recovery returned error: %v", err)
+	}
+	if len(output.TableNames) != 1 || aws.StringValue(output.TableNames[0]) != "recovered" {
+		t.Fatalf("ListTables after recovery returned %v", output.TableNames)
+	}
+	hostsMu.Lock()
+	defer hostsMu.Unlock()
+	if len(operationHosts) != 2 || operationHosts[0] != "old.local" || operationHosts[1] != "new.local" {
+		t.Fatalf("normal operation hosts got %v, want [old.local new.local]", operationHosts)
+	}
+}
+
+func TestPartialOperationFailureUsesRemainingLearnedNodeWithoutRefresh(t *testing.T) {
+	t.Parallel()
+
+	var discoveryRequests atomic.Int32
+	var operationRequests atomic.Int32
+	var hostsMu sync.Mutex
+	var operationHosts []string
+	storeConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	storeConfig.Disabled = true
+	helper, err := NewHelper(
+		[]string{"entrypoint.local"},
+		WithNodeHealthStoreConfig(storeConfig),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithCredentials("test-key", "test-secret"),
+		WithAWSConfigOptions(func(config *aws.Config) {
+			config.MaxRetries = aws.Int(1)
+			config.SleepDelay = func(time.Duration) {}
+		}),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return &mocks.MockRoundTripper{
+				AlternatorRequest: func(request *http.Request) (*http.Response, error) {
+					discoveryRequests.Add(1)
+					return resp.AlternatorNodesResponse([]string{"node-a.local", "node-b.local"}, request)
+				},
+				NodeHealthRequest: resp.HealthCheckResponse,
+				DynamoDBRequest: func(request *http.Request) (*http.Response, error) {
+					hostsMu.Lock()
+					operationHosts = append(operationHosts, request.URL.Hostname())
+					hostsMu.Unlock()
+					if operationRequests.Add(1) == 1 {
+						return nil, errors.New("first learned node unavailable")
+					}
+					return resp.DynamoDBListTablesResponse([]string{"surviving"}, request)
+				},
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	defer helper.Stop()
+	if err := helper.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	client, err := helper.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %v", err)
+	}
+	if _, err := client.ListTables(&dynamodb.ListTablesInput{}); err != nil {
+		t.Fatalf("ListTables did not use surviving learned node: %v", err)
+	}
+	if got := discoveryRequests.Load(); got != 1 {
+		t.Fatalf("partial failure triggered %d discovery requests, want initial request only", got)
+	}
+	hostsMu.Lock()
+	defer hostsMu.Unlock()
+	if len(operationHosts) != 2 || operationHosts[0] == operationHosts[1] {
+		t.Fatalf("operation hosts got %v, want two distinct learned nodes", operationHosts)
+	}
+}
+
+func TestDNSFallbackPreservesTLSAndSigning(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse listener port: %v", err)
+	}
+	logicalHost := net.JoinHostPort("example.com", portText)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.Host != logicalHost || request.TLS == nil || request.TLS.ServerName != "example.com" {
+			t.Errorf("logical TLS endpoint got Host=%q TLS=%v", request.Host, request.TLS)
+		}
+		authorization := request.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, "AWS4-HMAC-SHA256 ") ||
+			!strings.Contains(authorization, "Credential=test-key/") ||
+			!strings.Contains(authorization, "/test-region/dynamodb/aws4_request") ||
+			!signedHeadersContainHost(authorization) {
+			t.Errorf("unexpected Authorization header %q", authorization)
+		}
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		_, _ = w.Write([]byte(`{"TableNames":["signed"]}`))
+	}))
+	server.Listener = listener
+	server.StartTLS()
+	defer server.Close()
+	certificatePool := x509.NewCertPool()
+	certificatePool.AddCert(server.Certificate())
+
+	resolver := testhelpers.NewStaticResolver(
+		"example.com",
+		[]string{"127.0.0.2", "127.0.0.1"},
+	)
+	directTransport := func(roundTripper http.RoundTripper) http.RoundTripper {
+		transport := roundTripper.(*http.Transport)
+		transport.Proxy = nil
+		return transport
+	}
+	storeConfig := nodeshealth.DefaultNodeHealthStoreConfig()
+	storeConfig.Disabled = true
+	helper, err := NewHelper(
+		[]string{"example.com"},
+		WithScheme("https"),
+		WithPort(port),
+		WithAWSRegion("test-region"),
+		WithCredentials("test-key", "test-secret"),
+		WithDNSResolver(resolver),
+		WithServerCACertificatePool(certificatePool),
+		WithNodeHealthStoreConfig(storeConfig),
+		WithHTTPTransportWrapper(directTransport),
+		WithAWSConfigOptions(func(config *aws.Config) { config.MaxRetries = aws.Int(0) }),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	defer helper.Stop()
+	client, err := helper.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %v", err)
+	}
+	if _, err := client.ListTables(&dynamodb.ListTablesInput{}); err != nil {
+		t.Fatalf("ListTables returned error: %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("fallback HTTPS requests got %d, want 1", got)
+	}
+}
+
+func signedHeadersContainHost(authorization string) bool {
+	start := strings.Index(authorization, "SignedHeaders=")
+	if start == -1 {
+		return false
+	}
+	value := authorization[start+len("SignedHeaders="):]
+	if end := strings.IndexByte(value, ','); end != -1 {
+		value = value[:end]
+	}
+	return slicesContains(strings.Split(value, ";"), "host")
+}
+
+func slicesContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDynamoDBNonOKResponsesKeepConnectionReusable(t *testing.T) {
