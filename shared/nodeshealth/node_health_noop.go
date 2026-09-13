@@ -21,6 +21,8 @@ import (
 )
 
 // NodeHealthNoop is a no-op implementation of NodeHealthStoreInterface that tracks nodes without health monitoring.
+//
+// Deprecated: use StateStore with Config.Disabled.
 type NodeHealthNoop struct {
 	mu         sync.RWMutex
 	knownNodes []url.URL
@@ -39,6 +41,8 @@ func (n *NodeHealthNoop) GetQuarantinedNodes() []url.URL {
 }
 
 // TryReleaseQuarantinedNodes is a no-op and returns nil.
+//
+// Deprecated: use the helper-level ProbeQuarantinedNodes method.
 func (n *NodeHealthNoop) TryReleaseQuarantinedNodes() []url.URL {
 	return nil
 }
@@ -66,9 +70,13 @@ func (n *NodeHealthNoop) RemoveNode(node url.URL) {
 }
 
 // ReportNodeError is a no-op since health tracking is disabled.
+//
+// Deprecated: SDK helpers classify physical attempts automatically.
 func (n *NodeHealthNoop) ReportNodeError(_ url.URL, _ error) {}
 
 // NewNodeHealthNoop creates a new NodeHealthNoop with the given initial nodes.
+//
+// Deprecated: use NewStateStore with Config.Disabled.
 func NewNodeHealthNoop(initialNodes []url.URL) *NodeHealthNoop {
 	return &NodeHealthNoop{
 		knownNodes: initialNodes,

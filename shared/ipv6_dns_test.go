@@ -28,8 +28,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 )
 
 func TestAlternatorLiveNodes_DNSAddressFamilies(t *testing.T) {
@@ -105,15 +103,13 @@ func TestAlternatorLiveNodes_DNSAddressFamilies(t *testing.T) {
 				FallbackDelay: 10 * time.Millisecond,
 				Resolver:      resolver,
 			}
-			nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-			nodeHealthConfig.Disabled = true
 			aln, err := NewAlternatorLiveNodes(
 				[]string{"entrypoint.test"},
 				WithALNPort(port),
 				WithALNUpdatePeriod(0),
 				WithALNIdleUpdatePeriod(-1),
 				WithALNHTTPClientTimeout(time.Second),
-				WithALNNodeHealthStoreConfig(nodeHealthConfig),
+				WithoutALNNodeHealth(),
 				WithALNHTTPTransportWrapper(func(roundTripper http.RoundTripper) http.RoundTripper {
 					transport := roundTripper.(*http.Transport)
 					transport.Proxy = nil

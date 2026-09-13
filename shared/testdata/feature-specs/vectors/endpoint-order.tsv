@@ -1,0 +1,8 @@
+# case	input-endpoints	expected-canonical-order	expected-representative-order
+http-default-port-implicit-first	http://A,http://a:80,http://a.example	http://a,http://a.example	http://A,http://a.example
+http-default-port-explicit-first	http://A:80,http://a,http://a.example	http://a,http://a.example	http://A:80,http://a.example
+https-default-port	https://B:443,https://a	https://a,https://b	https://a,https://B:443
+scheme-and-host-case	HTTP://B:80,http://a	http://a,http://b	http://a,HTTP://B:80
+non-endpoint-components	http://user@b:80/path?x=y#fragment,http://a	http://a,http://b	http://a,http://user@b:80/path?x=y#fragment
+non-default-port	http://a:8080,http://a.example:80,http://a.example	http://a.example,http://a:8080	http://a.example:80,http://a:8080
+ipv6-host	HTTP://[2001:DB8::1]:80/path,http://a	http://[2001:db8::1],http://a	HTTP://[2001:DB8::1]:80/path,http://a

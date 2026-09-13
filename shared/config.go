@@ -75,6 +75,9 @@ type Config struct {
 	IdleHTTPConnectionTimeout time.Duration
 	// A hook to control http transports
 	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
+	// HTTPAttemptObserver observes the raw result returned by the physical transport. It is used by
+	// SDK adapters to classify node health before response decoding.
+	HTTPAttemptObserver HTTPAttemptObserver
 	// Timeout for HTTP requests
 	HTTPClientTimeout time.Duration
 	// AWSConfigOptions holds []func(*aws.Config) where the aws.Config type differs for each SDK version (v1 vs v2)
@@ -85,11 +88,24 @@ type Config struct {
 	RequestCompression RequestCompressionFunc
 	// ResponseCompression configures accepted response body compression encodings
 	ResponseCompression []ResponseCompression
-	// NodeHealthStoreConfig controls node health tracking logic
-	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
+	// NodeHealthConfig controls node health tracking and direct probes.
+	NodeHealthConfig nodeshealth.Config
+	// NodeHealthStoreConfig controls the deprecated score-based node health configuration.
+	//
+	// Deprecated: use NodeHealthConfig and WithNodeHealthConfig.
+	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig //nolint:staticcheck // Retained compatibility API.
+	nodeHealthSource      nodeHealthConfigSource
 	// KeyRouteAffinity configures route affinity feature
 	KeyRouteAffinity KeyRouteAffinityConfig
 }
+
+type nodeHealthConfigSource uint8
+
+const (
+	nodeHealthConfigDefault nodeHealthConfigSource = iota
+	nodeHealthConfigCurrent
+	nodeHealthConfigLegacy
+)
 
 // KeyRouteAffinity specifies the type of operations that should use route affinity
 type KeyRouteAffinity int
@@ -167,7 +183,8 @@ func NewDefaultConfig() *Config {
 		HTTPClientTimeout:             http.DefaultClient.Timeout,
 		Logger:                        logxzap.DefaultLogger(),
 		AWSConfigOptions:              []any{},
-		NodeHealthStoreConfig:         nodeshealth.DefaultNodeHealthStoreConfig(),
+		NodeHealthConfig:              nodeshealth.DefaultConfig(),
+		NodeHealthStoreConfig:         nodeshealth.DefaultNodeHealthStoreConfig(), //nolint:staticcheck // Retained compatibility default.
 	}
 }
 
@@ -193,7 +210,18 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNHTTPClientTimeout(c.HTTPClientTimeout),
 		WithALNRoutingScope(c.RoutingScope),
 		WithALNLogger(c.Logger),
-		WithALNNodeHealthStoreConfig(c.NodeHealthStoreConfig),
+	}
+
+	useLegacyConfig := useLegacyNodeHealthConfig(
+		c.NodeHealthConfig,
+		c.NodeHealthStoreConfig,
+		c.nodeHealthSource,
+	)
+	switch {
+	case useLegacyConfig:
+		out = append(out, WithALNNodeHealthStoreConfig(c.NodeHealthStoreConfig))
+	default:
+		out = append(out, WithALNNodeHealthConfig(c.NodeHealthConfig))
 	}
 
 	if c.IdleNodesListUpdatePeriod != 0 {
@@ -221,6 +249,15 @@ func (c *Config) ToALNOptions() []ALNOption {
 	}
 
 	return out
+}
+
+// PreserveNodeHealthFrom restores construction-time node-health configuration.
+// It is intended for SDK adapters whose Helper.Update methods retain an existing
+// live-node manager.
+func (c *Config) PreserveNodeHealthFrom(original Config) {
+	c.NodeHealthConfig = original.NodeHealthConfig
+	c.NodeHealthStoreConfig = original.NodeHealthStoreConfig
+	c.nodeHealthSource = original.nodeHealthSource
 }
 
 // WithScheme changes schema (http/https) for both dynamodb and alternator requests
@@ -319,10 +356,34 @@ func WithClientCertificateSource(source CertSource) Option {
 	}
 }
 
-// WithNodeHealthStoreConfig overrides the entire node health store configuration.
+// WithNodeHealthConfig configures the node-health state machine and probe manager.
+func WithNodeHealthConfig(healthCfg nodeshealth.Config) Option {
+	return func(config *Config) {
+		config.NodeHealthConfig = healthCfg
+		config.NodeHealthStoreConfig = nodeshealth.NodeHealthStoreConfig{} //nolint:staticcheck // Zero marks the compatibility field as unset.
+		config.nodeHealthSource = nodeHealthConfigCurrent
+	}
+}
+
+// WithoutNodeHealth disables node-health tracking and probing.
+func WithoutNodeHealth() Option {
+	return func(config *Config) {
+		config.NodeHealthConfig = nodeshealth.DefaultConfig()
+		config.NodeHealthConfig.Disabled = true
+		config.NodeHealthStoreConfig = nodeshealth.NodeHealthStoreConfig{} //nolint:staticcheck // Zero marks the compatibility field as unset.
+		config.nodeHealthSource = nodeHealthConfigCurrent
+	}
+}
+
+// WithNodeHealthStoreConfig overrides the deprecated score-based node health configuration.
+//
+// Deprecated: use WithNodeHealthConfig or WithoutNodeHealth. Custom score functions and score
+// thresholds cannot be translated to the state-machine model and are rejected by NewHelper.
 func WithNodeHealthStoreConfig(storeCfg nodeshealth.NodeHealthStoreConfig) Option {
 	return func(config *Config) {
 		config.NodeHealthStoreConfig = storeCfg
+		config.NodeHealthConfig = nodeshealth.Config{}
+		config.nodeHealthSource = nodeHealthConfigLegacy
 	}
 }
 
@@ -572,6 +633,9 @@ func NewHTTPTransport(config Config) http.RoundTripper {
 	transport := PatchHTTPTransport(alnConfig, baseTransport)
 	if alnConfig.HTTPTransportWrapper != nil {
 		transport = alnConfig.HTTPTransportWrapper(transport)
+	}
+	if config.HTTPAttemptObserver != nil {
+		transport = newHTTPAttemptObserverTransport(transport, config.HTTPAttemptObserver)
 	}
 
 	if config.OptimizeHeaders != nil {
