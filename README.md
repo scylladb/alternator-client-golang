@@ -389,6 +389,8 @@ h, err := helper.NewHelper(
 ```
 Until the partition key is discovered, requests are routed without optimization. Once discovered, requests for the same partition key are pinned to the same coordinator node.
 
+When key route affinity is combined with a rack or datacenter routing scope, affinity takes precedence for operations covered by the configured affinity mode. Those operations choose their coordinator from the cluster-wide node set so clients in different racks select the same node for the same partition key. Operations not covered by key route affinity continue to use the configured rack or datacenter scope.
+
 #### Pre-Configuring Partition Keys with WithPkInfo
 
 If you don't want to wait till driver automatically discovers partition key you can use `WithPkInfo` to pre-configure the 

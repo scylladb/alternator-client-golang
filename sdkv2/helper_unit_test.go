@@ -38,6 +38,7 @@ import (
 	"github.com/klauspost/compress/gzip"
 
 	"github.com/scylladb/alternator-client-golang/shared"
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -1378,6 +1379,115 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
+	t.Parallel()
+
+	const (
+		datacenter = "dc1"
+		tableName  = "test-table"
+		keyName    = "id"
+		testKey    = "same-key"
+	)
+	clusterNodes := []string{"rack1-node.local", "rack2-node.local", "rack3-node.local"}
+
+	type routedNodes struct {
+		read  string
+		write string
+	}
+
+	runClient := func(t *testing.T, rack, rackNode string) routedNodes {
+		t.Helper()
+
+		var routed routedNodes
+		mockTransport := &mocks.MockRoundTripper{
+			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+				switch req.URL.RawQuery {
+				case "":
+					return resp.AlternatorNodesResponse(clusterNodes, req)
+				case fmt.Sprintf("dc=%s&rack=%s", datacenter, rack):
+					return resp.AlternatorNodesResponse([]string{rackNode}, req)
+				default:
+					return nil, fmt.Errorf("unexpected localnodes query %q", req.URL.RawQuery)
+				}
+			},
+			NodeHealthRequest: resp.HealthCheckResponse,
+			DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+				switch req.Header.Get("X-Amz-Target") {
+				case "DynamoDB_20120810.GetItem":
+					routed.read = req.URL.Host
+					return resp.DynamoDBGetItemResponse(map[string]types.AttributeValue{
+						keyName: &types.AttributeValueMemberS{Value: testKey},
+					}, req)
+				case "DynamoDB_20120810.UpdateItem":
+					routed.write = req.URL.Host
+					return resp.DynamoDBUpdateItemResponse(req)
+				default:
+					return nil, fmt.Errorf("unexpected DynamoDB target %q", req.Header.Get("X-Amz-Target"))
+				}
+			},
+		}
+
+		h, err := NewHelper(
+			[]string{"seed.local"},
+			WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+			WithCredentials("test-key", "test-secret"),
+			WithRoutingScope(rt.NewRackScope(datacenter, rack, nil)),
+			WithKeyRouteAffinity(
+				shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+					tableName: keyName,
+				}),
+			),
+		)
+		if err != nil {
+			t.Fatalf("NewHelper returned error: %v", err)
+		}
+		defer h.Stop()
+
+		if err := h.UpdateLiveNodes(); err != nil {
+			t.Fatalf("UpdateLiveNodes returned error: %v", err)
+		}
+
+		client, err := h.NewDynamoDB()
+		if err != nil {
+			t.Fatalf("NewDynamoDB returned error: %v", err)
+		}
+		key := map[string]types.AttributeValue{
+			keyName: &types.AttributeValueMemberS{Value: testKey},
+		}
+		if _, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+			TableName: aws.String(tableName),
+			Key:       key,
+		}); err != nil {
+			t.Fatalf("GetItem returned error: %v", err)
+		}
+		if _, err := client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+			TableName:        aws.String(tableName),
+			Key:              key,
+			UpdateExpression: aws.String("SET value = :value"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":value": &types.AttributeValueMemberN{Value: "1"},
+			},
+		}); err != nil {
+			t.Fatalf("UpdateItem returned error: %v", err)
+		}
+
+		return routed
+	}
+
+	rack1 := runClient(t, "rack1", clusterNodes[0])
+	rack2 := runClient(t, "rack2", clusterNodes[1])
+
+	if want := net.JoinHostPort(clusterNodes[0], "8080"); rack1.read != want {
+		t.Errorf("rack1 read routed to %q, want %q", rack1.read, want)
+	}
+	if want := net.JoinHostPort(clusterNodes[1], "8080"); rack2.read != want {
+		t.Errorf("rack2 read routed to %q, want %q", rack2.read, want)
+	}
+	if rack1.write != rack2.write {
+		t.Errorf("same-key writes routed to different coordinators: rack1=%q rack2=%q", rack1.write, rack2.write)
+	}
 }
 
 func TestDynamoDBNonOKResponsesKeepConnectionReusable(t *testing.T) {
