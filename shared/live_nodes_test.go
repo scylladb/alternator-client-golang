@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
@@ -163,6 +165,74 @@ func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 	nodes := aln.GetNodes()
 	if len(nodes) != 1 || nodes[0].Hostname() != "node.local" {
 		t.Fatalf("canceled refresh published nodes after Stop: %v", nodes)
+	}
+}
+
+func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T) {
+	t.Parallel()
+
+	healthStarted := make(chan struct{})
+	healthCanceled := make(chan struct{})
+	allowHealthReturn := make(chan struct{})
+	var healthCalls atomic.Int32
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"node.local"},
+		WithALNUpdatePeriod(time.Minute),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNHTTPClientTimeout(0),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "/localnodes" {
+					return resp.AlternatorNodesResponse([]string{"node.local", "new-node.local"}, req)
+				}
+				if healthCalls.Add(1) == 1 {
+					close(healthStarted)
+					<-req.Context().Done()
+					close(healthCanceled)
+					<-allowHealthReturn
+				}
+				return nil, req.Context().Err()
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+
+	aln.nextUpdate.Store(0)
+	aln.TriggerUpdate()
+	select {
+	case <-healthStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background refresh did not reach node health probing")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		aln.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-healthCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the blocked background health request")
+	}
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before the blocked health probe exited")
+	default:
+	}
+	close(allowHealthReturn)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not join the updater blocked in health probing")
+	}
+
+	want := aln.GetNodes()
+	time.Sleep(10 * time.Millisecond)
+	if diff := cmp.Diff(want, aln.GetNodes()); diff != "" {
+		t.Fatalf("topology changed after Stop returned (-want +got):\n%s", diff)
 	}
 }
 

@@ -332,17 +332,18 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	}
 	sortNodesByAddress(nodes)
 	initialNodeURLs := slices.Clone(nodes)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
 		cfg.NodeHealthStoreConfig,
 		func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
-			return checkNodeHealth(context.Background(), httpClient, cfg.Logger, u)
+			return checkNodeHealth(ctx, httpClient, cfg.Logger, u)
 		},
 		slices.Clone(nodes))
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	out := &AlternatorLiveNodes{
 		initialNodes:    initialNodeURLs,
 		cfg:             cfg,
