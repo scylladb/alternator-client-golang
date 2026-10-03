@@ -63,15 +63,14 @@ func TestAlternatorLiveNodesConcurrentStartStopIsTerminal(t *testing.T) {
 		wg.Wait()
 
 		aln.Start()
-		aln.TriggerUpdate()
 		aln.Stop()
 	}
 }
 
-func TestAlternatorLiveNodesRequestRefreshWorksWithoutIdleTicker(t *testing.T) {
+func TestAlternatorLiveNodesNextNodeDoesNotStartDisabledIdleUpdater(t *testing.T) {
 	t.Parallel()
 
-	refreshed := make(chan struct{}, 1)
+	var requests atomic.Int32
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"node.local"},
 		WithALNUpdatePeriod(time.Minute),
@@ -79,14 +78,8 @@ func TestAlternatorLiveNodesRequestRefreshWorksWithoutIdleTicker(t *testing.T) {
 		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path == "/localnodes" {
-					select {
-					case refreshed <- struct{}{}:
-					default:
-					}
-					return resp.AlternatorNodesResponse([]string{"node.local", "new-node.local"}, req)
-				}
-				return resp.HealthCheckResponse(req)
+				requests.Add(1)
+				return resp.AlternatorNodesResponse([]string{"node.local"}, req)
 			})
 		}),
 	)
@@ -95,12 +88,12 @@ func TestAlternatorLiveNodesRequestRefreshWorksWithoutIdleTicker(t *testing.T) {
 	}
 	defer aln.Stop()
 
-	aln.nextUpdate.Store(0)
-	aln.TriggerUpdate()
-	select {
-	case <-refreshed:
-	case <-time.After(time.Second):
-		t.Fatal("request-driven refresh did not run with idle updates disabled")
+	_ = aln.NextNode()
+	if aln.idleUpdaterStarted.Load() {
+		t.Fatal("NextNode started updater while idle updates were disabled")
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("NextNode made %d discovery requests while idle updates were disabled", got)
 	}
 }
 
@@ -113,7 +106,7 @@ func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"node.local"},
 		WithALNUpdatePeriod(time.Minute),
-		WithALNIdleUpdatePeriod(-1),
+		WithALNIdleUpdatePeriod(time.Hour),
 		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -133,7 +126,7 @@ func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 	}
 
 	aln.nextUpdate.Store(0)
-	aln.TriggerUpdate()
+	_ = aln.NextNode()
 	select {
 	case <-requestStarted:
 	case <-time.After(time.Second):
@@ -178,7 +171,7 @@ func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"node.local"},
 		WithALNUpdatePeriod(time.Minute),
-		WithALNIdleUpdatePeriod(-1),
+		WithALNIdleUpdatePeriod(time.Hour),
 		WithALNHTTPClientTimeout(0),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -200,7 +193,7 @@ func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T
 	}
 
 	aln.nextUpdate.Store(0)
-	aln.TriggerUpdate()
+	_ = aln.NextNode()
 	select {
 	case <-healthStarted:
 	case <-time.After(time.Second):

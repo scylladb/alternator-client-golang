@@ -60,21 +60,21 @@ type NodeHealthStoreInterface interface {
 
 // AlternatorLiveNodes holds logic that allows to read and remember alternator nodes
 type AlternatorLiveNodes struct {
-	liveNodes       atomic.Pointer[[]url.URL]
-	initialNodes    []url.URL
-	nextLiveNodeIdx atomic.Uint64
-	cfg             ALNConfig
-	nextUpdate      atomic.Int64
-	updaterStarted  atomic.Bool
-	updaterWG       sync.WaitGroup
-	lifecycleMu     sync.Mutex
-	started         bool
-	stopped         bool
-	ctx             context.Context
-	stopFn          context.CancelFunc
-	httpClient      *http.Client
-	updateSignal    chan struct{}
-	nodeHealthStore NodeHealthStoreInterface
+	liveNodes          atomic.Pointer[[]url.URL]
+	initialNodes       []url.URL
+	nextLiveNodeIdx    atomic.Uint64
+	cfg                ALNConfig
+	nextUpdate         atomic.Int64
+	idleUpdaterStarted atomic.Bool
+	updaterWG          sync.WaitGroup
+	lifecycleMu        sync.Mutex
+	started            bool
+	stopped            bool
+	ctx                context.Context
+	stopFn             context.CancelFunc
+	httpClient         *http.Client
+	updateSignal       chan struct{}
+	nodeHealthStore    NodeHealthStoreInterface
 }
 
 // GetActiveNodes returns nodes that are currently considered healthy.
@@ -373,23 +373,21 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 	}
 }
 
-func (aln *AlternatorLiveNodes) startUpdater() {
-	if aln.updaterStarted.CompareAndSwap(false, true) {
+func (aln *AlternatorLiveNodes) startIdleUpdater() {
+	if aln.cfg.IdleUpdatePeriod <= 0 {
+		return
+	}
+	if aln.idleUpdaterStarted.CompareAndSwap(false, true) {
 		aln.updaterWG.Add(1)
 		go func() {
 			defer aln.updaterWG.Done()
-			var idleUpdates <-chan time.Time
-			var idleTicker *time.Ticker
-			if aln.cfg.IdleUpdatePeriod > 0 {
-				idleTicker = time.NewTicker(aln.cfg.IdleUpdatePeriod)
-				idleUpdates = idleTicker.C
-				defer idleTicker.Stop()
-			}
+			idleTicker := time.NewTicker(aln.cfg.IdleUpdatePeriod)
+			defer idleTicker.Stop()
 			for {
 				select {
 				case <-aln.ctx.Done():
 					return
-				case <-idleUpdates:
+				case <-idleTicker.C:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
 					_ = aln.updateLiveNodes(aln.ctx, false)
 				case <-aln.updateSignal:
@@ -410,7 +408,7 @@ func (aln *AlternatorLiveNodes) Start() {
 		return
 	}
 	aln.started = true
-	aln.startUpdater()
+	aln.startIdleUpdater()
 	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	aln.nodeHealthStore.Start()
 }
@@ -434,19 +432,13 @@ func (aln *AlternatorLiveNodes) Stop() {
 
 // NextNode gets next node, check if node list needs to be updated and run updating routine if needed
 func (aln *AlternatorLiveNodes) NextNode() url.URL {
-	aln.TriggerUpdate()
-	return aln.nextNode()
-}
-
-// TriggerUpdate starts the background updater and requests a live-node refresh when one is due.
-func (aln *AlternatorLiveNodes) TriggerUpdate() {
 	aln.lifecycleMu.Lock()
-	defer aln.lifecycleMu.Unlock()
-	if aln.stopped {
-		return
+	if !aln.stopped {
+		aln.startIdleUpdater()
+		aln.triggerUpdate()
 	}
-	aln.startUpdater()
-	aln.triggerUpdate()
+	aln.lifecycleMu.Unlock()
+	return aln.nextNode()
 }
 
 func (aln *AlternatorLiveNodes) nextNode() url.URL {
@@ -581,7 +573,7 @@ func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
 	if aln.stopped {
 		return errors.New("live-node source is stopped")
 	}
-	aln.startUpdater()
+	aln.startIdleUpdater()
 	if aln.cfg.UpdatePeriod > 0 {
 		aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
 	}

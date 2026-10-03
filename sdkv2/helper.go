@@ -580,18 +580,15 @@ func (r *EndpointResolverV2) ResolveEndpoint(
 }
 
 type (
-	queryPlanKeyType       struct{}
-	requestNodeKeyType     struct{}
-	affinityRequestKeyType struct{}
+	queryPlanKeyType   struct{}
+	requestNodeKeyType struct{}
 )
 
 var (
 	// A context key to store/retrieve a query plan assigned to the request
 	queryPlanKey = queryPlanKeyType{}
 	// A context key to store/retrieve a node assigned to the request
-	requestNodeKey = requestNodeKeyType{}
-	// A context key that marks a request using key-route affinity
-	affinityRequestKey           = affinityRequestKeyType{}
+	requestNodeKey               = requestNodeKeyType{}
 	queryPlanMiddlewareName      = "alternatorQueryPlanMiddleware"
 	queryPlanFinalMiddlewareName = "alternatorQueryPlanMiddlewareFinal"
 )
@@ -607,11 +604,6 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 		return url.URL{}, errs.ErrCtxHasNoNode
 	}
 	return val, nil
-}
-
-func isAffinityRequest(ctx context.Context) bool {
-	value, _ := middleware.GetStackValue(ctx, affinityRequestKey).(bool)
-	return value
 }
 
 func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
@@ -685,15 +677,6 @@ func (lb *Helper) ensureAffinityNodes(ctx context.Context) error {
 	return nil
 }
 
-func (lb *Helper) triggerAffinityRefresh() {
-	nodes := lb.affinityNodeSource()
-	if trigger, ok := nodes.(interface{ TriggerUpdate() }); ok {
-		trigger.TriggerUpdate()
-	} else {
-		_ = nodes.NextNode()
-	}
-}
-
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
@@ -701,13 +684,11 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
-					affinity := false
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						qp = lb.newDefaultQueryPlan()
 					} else {
 						if affinityPlan, err := lb.getAffinityQueryPlan(ctx, in); err == nil {
 							qp = affinityPlan
-							affinity = true
 						} else if errors.Is(err, errAffinityDiscoveryFailed) {
 							return middleware.InitializeOutput{}, middleware.Metadata{}, err
 						} else {
@@ -716,9 +697,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 					}
 
 					ctx = middleware.WithStackValue(ctx, queryPlanKey, qp)
-					if affinity {
-						ctx = middleware.WithStackValue(ctx, affinityRequestKey, true)
-					}
 
 					return next.HandleInitialize(ctx, in)
 				},
@@ -738,11 +716,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				node := plan.Next()
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
-				}
-				if isAffinityRequest(ctx) {
-					// Snapshot first so the current retry plan cannot be changed by the
-					// refresh that this request schedules for subsequent requests.
-					lb.triggerAffinityRefresh()
 				}
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
 

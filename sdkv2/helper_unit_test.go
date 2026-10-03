@@ -1404,10 +1404,12 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 
 		var routed routedNodes
 		clusterDiscovery := make(chan struct{}, 1)
+		var clusterDiscoveries atomic.Int32
 		mockTransport := &mocks.MockRoundTripper{
 			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
 				switch req.URL.RawQuery {
 				case "":
+					clusterDiscoveries.Add(1)
 					select {
 					case clusterDiscovery <- struct{}{}:
 					default:
@@ -1484,6 +1486,12 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		}
 		if got := len(h.affinityNodes.GetActiveNodes()); got != len(clusterNodes) {
 			t.Fatalf("cluster-wide discovery published %d nodes, want %d", got, len(clusterNodes))
+		}
+		if _, err := client.UpdateItem(context.Background(), update); err != nil {
+			t.Fatalf("second UpdateItem returned error: %v", err)
+		}
+		if got := clusterDiscoveries.Load(); got != 1 {
+			t.Fatalf("two affinity requests caused %d cluster discoveries, want only initial discovery", got)
 		}
 
 		if _, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
@@ -1707,69 +1715,6 @@ func TestAffinityDiscoveryHealthChecksRespectRequestDeadline(t *testing.T) {
 	}
 	if got := dynamoRequests.Load(); got != 0 {
 		t.Fatalf("sent %d rack-scoped DynamoDB requests after affinity health-check timeout", got)
-	}
-}
-
-func TestReadyAffinityRequestRefreshesAfterPlanSnapshot(t *testing.T) {
-	t.Parallel()
-
-	oldNode := url.URL{Scheme: "http", Host: "old-cluster-node.local:8080"}
-	newNode := url.URL{Scheme: "http", Host: "new-cluster-node.local:8080"}
-	affinityNodes := &refreshingAffinityNodeSource{
-		batchWriteAffinityNodeSource: batchWriteAffinityNodeSource{activeNodes: []url.URL{oldNode}},
-		refreshNodes:                 []url.URL{newNode},
-	}
-
-	var routed []string
-	mockTransport := &mocks.MockRoundTripper{
-		DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
-			routed = append(routed, req.URL.Host)
-			return resp.DynamoDBUpdateItemResponse(req)
-		},
-	}
-	cfg := shared.NewDefaultConfig()
-	WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport })(cfg)
-	WithCredentials("test-key", "test-secret")(cfg)
-	cfg.KeyRouteAffinity = shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
-		"orders": "id",
-	})
-	h := &Helper{
-		nodes: &batchWriteAffinityNodeSource{
-			activeNodes: []url.URL{{Scheme: "http", Host: "rack.local:8080"}},
-		},
-		affinityNodes:     affinityNodes,
-		affinityDiscovery: &affinityDiscoveryState{ready: true},
-		cfg:               *cfg,
-		keyAffinity: keyAffinity{pkInfoPerTable: map[string]string{
-			"orders": "id",
-		}},
-	}
-	client, err := h.NewDynamoDB()
-	if err != nil {
-		t.Fatalf("NewDynamoDB returned error: %v", err)
-	}
-	update := &dynamodb.UpdateItemInput{
-		TableName: aws.String("orders"),
-		Key: map[string]types.AttributeValue{
-			"id": &types.AttributeValueMemberS{Value: "same-key"},
-		},
-		UpdateExpression: aws.String("SET value = :value"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":value": &types.AttributeValueMemberN{Value: "1"},
-		},
-	}
-
-	if _, err := client.UpdateItem(context.Background(), update); err != nil {
-		t.Fatalf("first UpdateItem returned error: %v", err)
-	}
-	if got := affinityNodes.triggerCalls.Load(); got != 1 {
-		t.Fatalf("affinity refresh trigger count = %d, want 1", got)
-	}
-	if _, err := client.UpdateItem(context.Background(), update); err != nil {
-		t.Fatalf("second UpdateItem returned error: %v", err)
-	}
-	if diff := cmp.Diff([]string{oldNode.Host, newNode.Host}, routed); diff != "" {
-		t.Fatalf("refresh changed the current plan or was not visible to the next request (-want +got):\n%s", diff)
 	}
 }
 
@@ -2750,17 +2695,6 @@ type batchWriteAffinityNodeSource struct {
 	quarantinedNodes []url.URL
 }
 
-type refreshingAffinityNodeSource struct {
-	batchWriteAffinityNodeSource
-	refreshNodes []url.URL
-	triggerCalls atomic.Int32
-}
-
-func (s *refreshingAffinityNodeSource) TriggerUpdate() {
-	s.triggerCalls.Add(1)
-	s.activeNodes = append([]url.URL(nil), s.refreshNodes...)
-}
-
 func (s batchWriteAffinityNodeSource) NextNode() url.URL {
 	if len(s.activeNodes) > 0 {
 		return s.activeNodes[0]
@@ -2769,9 +2703,6 @@ func (s batchWriteAffinityNodeSource) NextNode() url.URL {
 		return s.quarantinedNodes[0]
 	}
 	return url.URL{}
-}
-
-func (s batchWriteAffinityNodeSource) TriggerUpdate() {
 }
 
 func (s batchWriteAffinityNodeSource) GetNodes() []url.URL {
