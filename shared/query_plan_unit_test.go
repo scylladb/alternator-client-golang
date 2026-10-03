@@ -230,12 +230,33 @@ func TestLazyQueryPlan(t *testing.T) {
 			plan.Next().Host,
 			plan.Next().Host,
 		}
-		want := expectedPreferredPlanHosts(
-			nil,
-			source.quarantinedNodes,
-			[]url.URL{preferredQ2, preferredQ1},
+		want := []string{"q2", "q1", "q3"}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
+			}
+		}
+	})
+
+	t.Run("PreferredNodesPreserveHealthTierOrder", func(t *testing.T) {
+		const seed = int64(42)
+		source := &fakeNodesSource{
+			activeNodes:      []url.URL{{Host: "a2"}, {Host: "a1"}},
+			quarantinedNodes: []url.URL{{Host: "q2"}, {Host: "q1"}},
+		}
+
+		plan := NewLazyQueryPlanWithPreferredNodes(
+			source,
+			[]url.URL{{Host: "q2"}, {Host: "a2"}},
 			seed,
 		)
+		got := []string{
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+		}
+		want := []string{"a2", "a1", "q2", "q1"}
 		for i := range got {
 			if got[i] != want[i] {
 				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)

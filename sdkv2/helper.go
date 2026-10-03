@@ -52,6 +52,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -258,11 +259,11 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 // It internally relies on the shared.AlternatorLiveNodes component for tracking
 // and routing to healthy nodes.
 type Helper struct {
-	nodes         AlternatorNodesSource
-	affinityNodes AlternatorNodesSource
-	initialNodes  []string
-	cfg           shared.Config
-	queryPlanSeed int64
+	nodes             AlternatorNodesSource
+	affinityNodes     AlternatorNodesSource
+	affinityDiscovery *affinityDiscoveryState
+	cfg               shared.Config
+	queryPlanSeed     int64
 
 	keyAffinity keyAffinity
 }
@@ -290,12 +291,25 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	}
 
 	return &Helper{
-		nodes:         nodes,
-		affinityNodes: affinityNodes,
-		initialNodes:  append([]string(nil), initialNodes...),
-		cfg:           *cfg,
-		keyAffinity:   keyAffinity{pkInfoPerTable: pkInfoPerTable},
+		nodes:             nodes,
+		affinityNodes:     affinityNodes,
+		affinityDiscovery: newAffinityDiscoveryState(cfg.KeyRouteAffinity.Type),
+		cfg:               *cfg,
+		keyAffinity:       keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
+}
+
+type affinityDiscoveryState struct {
+	mu       sync.Mutex
+	ready    bool
+	inFlight chan struct{}
+}
+
+func newAffinityDiscoveryState(affinityType shared.KeyRouteAffinity) *affinityDiscoveryState {
+	if affinityType == KeyRouteAffinityNone {
+		return nil
+	}
+	return &affinityDiscoveryState{}
 }
 
 func newNodeSources(
@@ -353,7 +367,9 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 	return cfg, nil
 }
 
-// Update takes config of current helper, updates its config and creates a new helper with updated config
+// Update takes config of current helper, updates its config and creates a new helper with updated config.
+// It panics if options change the routing scope or enable/disable key route affinity because those changes require
+// independently owned node sources; create a new Helper instead.
 func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg := lb.cfg
 	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
@@ -361,24 +377,20 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 		opt(&cfg)
 	}
 
-	nodes := lb.nodes
-	affinityNodes := lb.affinityNodes
-	if !routingScopesEqual(lb.cfg.RoutingScope, cfg.RoutingScope) ||
-		(lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) !=
-			(cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) {
-		var err error
-		nodes, affinityNodes, err = newNodeSources(lb.initialNodes, &cfg)
-		if err != nil {
-			panic(fmt.Sprintf("failed to update helper node sources: %v", err))
-		}
+	if !routingScopesEqual(lb.cfg.RoutingScope, cfg.RoutingScope) {
+		panic("sdkv2: Helper.Update cannot change the routing scope; create a new Helper")
+	}
+	if (lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) !=
+		(cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) {
+		panic("sdkv2: Helper.Update cannot enable or disable key route affinity; create a new Helper")
 	}
 
 	updated := &Helper{
-		nodes:         nodes,
-		affinityNodes: affinityNodes,
-		initialNodes:  append([]string(nil), lb.initialNodes...),
-		cfg:           cfg,
-		keyAffinity:   lb.keyAffinity.Clone(),
+		nodes:             lb.nodes,
+		affinityNodes:     lb.affinityNodes,
+		affinityDiscovery: lb.affinityDiscovery,
+		cfg:               cfg,
+		keyAffinity:       lb.keyAffinity.Clone(),
 	}
 	for table, keyName := range cfg.KeyRouteAffinity.PkInfoPerTable {
 		updated.keyAffinity.SetPartitionKeyName(table, keyName)
@@ -563,18 +575,15 @@ func (r *EndpointResolverV2) ResolveEndpoint(
 }
 
 type (
-	queryPlanKeyType     struct{}
-	requestNodeKeyType   struct{}
-	affinityNodesKeyType struct{}
+	queryPlanKeyType   struct{}
+	requestNodeKeyType struct{}
 )
 
 var (
 	// A context key to store/retrieve a query plan assigned to the request
 	queryPlanKey = queryPlanKeyType{}
 	// A context key to store/retrieve a node assigned to the request
-	requestNodeKey = requestNodeKeyType{}
-	// A context key to store the node source that an affinity request should refresh
-	affinityNodesKey             = affinityNodesKeyType{}
+	requestNodeKey               = requestNodeKeyType{}
 	queryPlanMiddlewareName      = "alternatorQueryPlanMiddleware"
 	queryPlanFinalMiddlewareName = "alternatorQueryPlanMiddlewareFinal"
 )
@@ -592,11 +601,6 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 	return val, nil
 }
 
-func getAffinityNodesFromContext(ctx context.Context) AlternatorNodesSource {
-	nodes, _ := middleware.GetStackValue(ctx, affinityNodesKey).(AlternatorNodesSource)
-	return nodes
-}
-
 func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
 	if lb.queryPlanSeed == 0 {
 		return shared.NewLazyQueryPlan(lb.nodes)
@@ -611,11 +615,58 @@ func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
 	return lb.nodes
 }
 
-func triggerNodeSourceUpdate(nodes AlternatorNodesSource) {
-	if trigger, ok := nodes.(interface{ TriggerUpdate() }); ok {
-		trigger.TriggerUpdate()
-	} else {
-		_ = nodes.NextNode()
+const affinityDiscoveryTimeout = 30 * time.Second
+
+var errAffinityDiscoveryFailed = errors.New("cluster-wide affinity discovery failed")
+
+func (lb *Helper) ensureAffinityNodes(ctx context.Context) error {
+	state := lb.affinityDiscovery
+	if state == nil {
+		return nil
+	}
+
+	for {
+		state.mu.Lock()
+		if state.ready {
+			state.mu.Unlock()
+			return nil
+		}
+		if state.inFlight != nil {
+			inFlight := state.inFlight
+			state.mu.Unlock()
+			select {
+			case <-inFlight:
+				continue
+			case <-ctx.Done():
+				return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, ctx.Err())
+			}
+		}
+		state.inFlight = make(chan struct{})
+		state.mu.Unlock()
+
+		discovery, ok := lb.affinityNodeSource().(interface {
+			DiscoverLiveNodes(context.Context) error
+		})
+		var err error
+		if !ok {
+			err = errors.New("node source does not support synchronous discovery")
+		} else {
+			discoveryCtx, cancel := context.WithTimeout(ctx, affinityDiscoveryTimeout)
+			err = discovery.DiscoverLiveNodes(discoveryCtx)
+			cancel()
+		}
+
+		state.mu.Lock()
+		if err == nil {
+			state.ready = true
+		}
+		close(state.inFlight)
+		state.inFlight = nil
+		state.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, err)
+		}
+		return nil
 	}
 }
 
@@ -626,22 +677,19 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
-					var affinityNodes AlternatorNodesSource
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						qp = lb.newDefaultQueryPlan()
 					} else {
-						if affinityPlan, err := lb.getAffinityQueryPlan(in); err == nil {
+						if affinityPlan, err := lb.getAffinityQueryPlan(ctx, in); err == nil {
 							qp = affinityPlan
-							affinityNodes = lb.affinityNodeSource()
+						} else if errors.Is(err, errAffinityDiscoveryFailed) {
+							return middleware.InitializeOutput{}, middleware.Metadata{}, err
 						} else {
 							qp = lb.newDefaultQueryPlan()
 						}
 					}
 
 					ctx = middleware.WithStackValue(ctx, queryPlanKey, qp)
-					if affinityNodes != nil {
-						ctx = middleware.WithStackValue(ctx, affinityNodesKey, affinityNodes)
-					}
 
 					return next.HandleInitialize(ctx, in)
 				},
@@ -662,12 +710,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
 				}
-				if affinityNodes := getAffinityNodesFromContext(ctx); affinityNodes != nil {
-					// Refresh after the plan takes its node snapshots so an asynchronous
-					// health-tier transition cannot exhaust the in-flight request plan.
-					triggerNodeSourceUpdate(affinityNodes)
-				}
-
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
 
 				req, ok := in.Request.(*smithyhttp.Request)
@@ -746,15 +788,24 @@ func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, table
 	return hash, nil
 }
 
-func (lb *Helper) getAffinityQueryPlan(in middleware.InitializeInput) (*shared.LazyQueryPlan, error) {
+func (lb *Helper) getAffinityQueryPlan(
+	ctx context.Context,
+	in middleware.InitializeInput,
+) (*shared.LazyQueryPlan, error) {
 	if params, ok := in.Parameters.(*dynamodb.BatchWriteItemInput); ok {
 		if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite {
+			if err := lb.ensureAffinityNodes(ctx); err != nil {
+				return nil, err
+			}
 			return lb.batchWriteQueryPlan(params.RequestItems)
 		}
 	}
 
 	pkHash, err := lb.getPkHash(in)
 	if err != nil {
+		return nil, err
+	}
+	if err := lb.ensureAffinityNodes(ctx); err != nil {
 		return nil, err
 	}
 	return shared.NewLazyQueryPlanWithSortedSeed(lb.affinityNodeSource(), pkHash), nil

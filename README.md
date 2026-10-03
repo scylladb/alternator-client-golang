@@ -391,6 +391,8 @@ Until the partition key is discovered, requests are routed without optimization.
 
 When key route affinity is combined with a rack or datacenter routing scope, affinity takes precedence for operations covered by the configured affinity mode. Those operations choose their coordinator from the cluster-wide node set so clients in different racks select the same node for the same partition key. Operations not covered by key route affinity continue to use the configured rack or datacenter scope.
 
+The first affinity-eligible request completes cluster-wide discovery before selecting its coordinator. Discovery is bounded by the request context and an internal 30-second limit. If discovery cannot return a usable node set, the request fails without being sent to a rack-local coordinator. Changing the routing scope or enabling/disabling key route affinity on an existing helper requires `NewHelper`; `Helper.Update` rejects those topology changes.
+
 #### Pre-Configuring Partition Keys with WithPkInfo
 
 If you don't want to wait till driver automatically discovers partition key you can use `WithPkInfo` to pre-configure the 

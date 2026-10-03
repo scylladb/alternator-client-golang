@@ -43,6 +43,11 @@ func (n *NodeHealthNoop) TryReleaseQuarantinedNodes() []url.URL {
 	return nil
 }
 
+// TryReleaseQuarantinedNodesWith is a no-op and returns nil.
+func (n *NodeHealthNoop) TryReleaseQuarantinedNodesWith(QuarantineReleaseFunc) []url.URL {
+	return nil
+}
+
 // Start is a no-op.
 func (n *NodeHealthNoop) Start() {}
 
