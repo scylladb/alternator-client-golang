@@ -1401,10 +1401,15 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		t.Helper()
 
 		var routed routedNodes
+		clusterDiscovery := make(chan struct{}, 1)
 		mockTransport := &mocks.MockRoundTripper{
 			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
 				switch req.URL.RawQuery {
 				case "":
+					select {
+					case clusterDiscovery <- struct{}{}:
+					default:
+					}
 					return resp.AlternatorNodesResponse(clusterNodes, req)
 				case fmt.Sprintf("dc=%s&rack=%s", datacenter, rack):
 					return resp.AlternatorNodesResponse([]string{rackNode}, req)
@@ -1430,9 +1435,10 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		}
 
 		h, err := NewHelper(
-			[]string{"seed.local"},
+			[]string{rackNode},
 			WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 			WithCredentials("test-key", "test-secret"),
+			WithIdleNodesListUpdatePeriod(-1),
 			WithRoutingScope(rt.NewRackScope(datacenter, rack, nil)),
 			WithKeyRouteAffinity(
 				shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
@@ -1445,10 +1451,6 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		}
 		defer h.Stop()
 
-		if err := h.UpdateLiveNodes(); err != nil {
-			t.Fatalf("UpdateLiveNodes returned error: %v", err)
-		}
-
 		client, err := h.NewDynamoDB()
 		if err != nil {
 			t.Fatalf("NewDynamoDB returned error: %v", err)
@@ -1456,20 +1458,40 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		key := map[string]types.AttributeValue{
 			keyName: &types.AttributeValueMemberS{Value: testKey},
 		}
-		if _, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-			TableName: aws.String(tableName),
-			Key:       key,
-		}); err != nil {
-			t.Fatalf("GetItem returned error: %v", err)
-		}
-		if _, err := client.UpdateItem(context.Background(), &dynamodb.UpdateItemInput{
+		update := &dynamodb.UpdateItemInput{
 			TableName:        aws.String(tableName),
 			Key:              key,
 			UpdateExpression: aws.String("SET value = :value"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":value": &types.AttributeValueMemberN{Value: "1"},
 			},
+		}
+
+		// The request itself must start cluster-wide discovery; callers should
+		// not need to invoke UpdateLiveNodes before using affinity routing.
+		if _, err := client.UpdateItem(context.Background(), update); err != nil {
+			t.Fatalf("initial UpdateItem returned error: %v", err)
+		}
+		select {
+		case <-clusterDiscovery:
+		case <-time.After(time.Second):
+			t.Fatal("affinity request did not trigger cluster-wide discovery")
+		}
+		deadline := time.Now().Add(time.Second)
+		for len(h.affinityNodes.GetActiveNodes()) != len(clusterNodes) {
+			if time.Now().After(deadline) {
+				t.Fatalf("cluster-wide discovery did not publish %d nodes", len(clusterNodes))
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		if _, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+			TableName: aws.String(tableName),
+			Key:       key,
 		}); err != nil {
+			t.Fatalf("GetItem returned error: %v", err)
+		}
+		if _, err := client.UpdateItem(context.Background(), update); err != nil {
 			t.Fatalf("UpdateItem returned error: %v", err)
 		}
 
@@ -1487,6 +1509,107 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 	}
 	if rack1.write != rack2.write {
 		t.Errorf("same-key writes routed to different coordinators: rack1=%q rack2=%q", rack1.write, rack2.write)
+	}
+}
+
+func TestHelperUpdateRebuildsAffinityState(t *testing.T) {
+	t.Parallel()
+
+	h, err := NewHelper(
+		[]string{"seed.local"},
+		WithRoutingScope(rt.NewRackScope("dc1", "rack1", nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	defer h.Stop()
+	if h.affinityNodes != nil {
+		t.Fatal("helper without key route affinity unexpectedly has affinity nodes")
+	}
+
+	withAffinity := h.Update(WithKeyRouteAffinity(
+		shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+			"orders": "order_id",
+		}),
+	))
+	defer withAffinity.Stop()
+	if withAffinity.affinityNodes == nil {
+		t.Fatal("enabling key route affinity did not create a cluster-wide node source")
+	}
+	if got := withAffinity.GetPartitionKeyName("orders"); got != "order_id" {
+		t.Fatalf("updated partition key name = %q, want %q", got, "order_id")
+	}
+
+	withMorePKInfo := withAffinity.Update(WithKeyRouteAffinity(
+		shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+			"audit": "audit_id",
+		}),
+	))
+	if got := withMorePKInfo.GetPartitionKeyName("orders"); got != "order_id" {
+		t.Fatalf("previous partition key name = %q, want %q", got, "order_id")
+	}
+	if got := withMorePKInfo.GetPartitionKeyName("audit"); got != "audit_id" {
+		t.Fatalf("new partition key name = %q, want %q", got, "audit_id")
+	}
+
+	withoutAffinity := withAffinity.Update(WithKeyRouteAffinity(
+		shared.NewKeyRouteAffinityConfig(KeyRouteAffinityNone),
+	))
+	defer withoutAffinity.Stop()
+	if withoutAffinity.affinityNodes != nil {
+		t.Fatal("disabling key route affinity retained the cluster-wide node source")
+	}
+}
+
+func TestHelperUpdateRebuildsRoutingScope(t *testing.T) {
+	t.Parallel()
+
+	const datacenter = "dc1"
+	clusterNodes := []string{"rack1-node.local", "rack2-node.local", "rack3-node.local"}
+	mockTransport := &mocks.MockRoundTripper{
+		AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+			switch req.URL.RawQuery {
+			case "":
+				return resp.AlternatorNodesResponse(clusterNodes, req)
+			case "dc=dc1&rack=rack1":
+				return resp.AlternatorNodesResponse([]string{clusterNodes[0]}, req)
+			case "dc=dc1&rack=rack2":
+				return resp.AlternatorNodesResponse([]string{clusterNodes[1]}, req)
+			default:
+				return nil, fmt.Errorf("unexpected localnodes query %q", req.URL.RawQuery)
+			}
+		},
+		NodeHealthRequest: resp.HealthCheckResponse,
+	}
+
+	h, err := NewHelper(
+		[]string{"seed.local"},
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+		WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithRoutingScope(rt.NewRackScope(datacenter, "rack1", nil)),
+		WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	defer h.Stop()
+
+	updated := h.Update(WithRoutingScope(rt.NewRackScope(datacenter, "rack2", nil)))
+	defer updated.Stop()
+	if err := updated.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+
+	wantRackNode := net.JoinHostPort(clusterNodes[1], "8080")
+	active := updated.GetActiveNodes()
+	if len(active) != 1 || active[0].Host != wantRackNode {
+		t.Fatalf("updated rack nodes = %v, want only %s", active, wantRackNode)
+	}
+	if updated.affinityNodes == nil {
+		t.Fatal("updated helper does not have a cluster-wide node source")
+	}
+	if got := len(updated.affinityNodes.GetActiveNodes()); got != len(clusterNodes) {
+		t.Fatalf("updated affinity node count = %d, want %d", got, len(clusterNodes))
 	}
 }
 
@@ -1770,6 +1893,44 @@ func TestBatchWriteItemKeyRouteAffinityVotingSelectsPreferredNode(t *testing.T) 
 	})
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("unexpected batch write query plan (-want +got):\n%s", diff)
+	}
+}
+
+func TestBatchWriteItemKeyRouteAffinityUsesClusterQuarantinedNodesAcrossRacks(t *testing.T) {
+	t.Parallel()
+
+	clusterNodes := batchWriteTestNodes()
+	target := batchWriteSortedTestNodes()[2]
+	targetKey := batchWriteStringKeysForNode(t, target, 1)[0]
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"orders": {
+				{
+					PutRequest: &types.PutRequest{
+						Item: itemWithID(targetKey, "payload"),
+					},
+				},
+			},
+		},
+	}
+
+	firstNodeForRack := func(localNode url.URL, quarantinedNodes []url.URL) url.URL {
+		h := newBatchWriteAffinityTestHelper(map[string]string{"orders": "id"})
+		h.nodes = batchWriteAffinityNodeSource{activeNodes: []url.URL{localNode}}
+		h.affinityNodes = batchWriteAffinityNodeSource{quarantinedNodes: quarantinedNodes}
+		return mustBatchWriteFirstNode(t, h, input)
+	}
+
+	rack1 := firstNodeForRack(clusterNodes[0], clusterNodes)
+	reversed := append([]url.URL(nil), clusterNodes...)
+	slices.Reverse(reversed)
+	rack2 := firstNodeForRack(clusterNodes[1], reversed)
+
+	if rack1 != target {
+		t.Fatalf("rack1 selected %s, want quarantined affinity target %s", rack1.Host, target.Host)
+	}
+	if rack2 != target {
+		t.Fatalf("rack2 selected %s, want quarantined affinity target %s", rack2.Host, target.Host)
 	}
 }
 
@@ -2191,7 +2352,16 @@ type batchWriteAffinityNodeSource struct {
 }
 
 func (s batchWriteAffinityNodeSource) NextNode() url.URL {
-	return s.activeNodes[0]
+	if len(s.activeNodes) > 0 {
+		return s.activeNodes[0]
+	}
+	if len(s.quarantinedNodes) > 0 {
+		return s.quarantinedNodes[0]
+	}
+	return url.URL{}
+}
+
+func (s batchWriteAffinityNodeSource) TriggerUpdate() {
 }
 
 func (s batchWriteAffinityNodeSource) GetNodes() []url.URL {

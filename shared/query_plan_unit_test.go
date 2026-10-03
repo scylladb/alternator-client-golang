@@ -211,6 +211,37 @@ func TestLazyQueryPlan(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("PreferredQuarantinedNodesFirstThenSortedRemaining", func(t *testing.T) {
+		const seed = int64(42)
+		preferredQ2 := url.URL{Host: "q2"}
+		preferredQ1 := url.URL{Host: "q1"}
+		source := &fakeNodesSource{
+			quarantinedNodes: []url.URL{{Host: "q3"}, preferredQ1, preferredQ2},
+		}
+
+		plan := NewLazyQueryPlanWithPreferredNodes(
+			source,
+			[]url.URL{preferredQ2, preferredQ1},
+			seed,
+		)
+		got := []string{
+			plan.Next().Host,
+			plan.Next().Host,
+			plan.Next().Host,
+		}
+		want := expectedPreferredPlanHosts(
+			nil,
+			source.quarantinedNodes,
+			[]url.URL{preferredQ2, preferredQ1},
+			seed,
+		)
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
+			}
+		}
+	})
 }
 
 func expectedPreferredPlanHosts(activeNodes, quarantinedNodes, preferredNodes []url.URL, seed int64) []string {
@@ -218,17 +249,13 @@ func expectedPreferredPlanHosts(activeNodes, quarantinedNodes, preferredNodes []
 	activeNodes = cloneAndSortNodes(activeNodes)
 	quarantinedNodes = cloneAndSortNodes(quarantinedNodes)
 
-	hosts := make([]string, 0, len(activeNodes)+len(quarantinedNodes))
-	for _, preferred := range preferredNodes {
-		if preferred.Host == "" {
-			continue
-		}
-		if node, ok := popNode(&activeNodes, preferred); ok {
-			hosts = append(hosts, node.Host)
-		}
-	}
+	activePreferred, unmatchedPreferred := takePreferredNodes(&activeNodes, preferredNodes)
+	quarantinedPreferred, _ := takePreferredNodes(&quarantinedNodes, unmatchedPreferred)
 
+	hosts := make([]string, 0, len(activeNodes)+len(quarantinedNodes))
+	hosts = append(hosts, planHosts(activePreferred)...)
 	hosts = append(hosts, planHosts(activeNodes)...)
+	hosts = append(hosts, planHosts(quarantinedPreferred)...)
 	hosts = append(hosts, planHosts(quarantinedNodes)...)
 	return hosts
 }

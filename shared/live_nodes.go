@@ -59,17 +59,17 @@ type NodeHealthStoreInterface interface {
 
 // AlternatorLiveNodes holds logic that allows to read and remember alternator nodes
 type AlternatorLiveNodes struct {
-	liveNodes          atomic.Pointer[[]url.URL]
-	initialNodes       []url.URL
-	nextLiveNodeIdx    atomic.Uint64
-	cfg                ALNConfig
-	nextUpdate         atomic.Int64
-	idleUpdaterStarted atomic.Bool
-	ctx                context.Context
-	stopFn             context.CancelFunc
-	httpClient         *http.Client
-	updateSignal       chan struct{}
-	nodeHealthStore    NodeHealthStoreInterface
+	liveNodes       atomic.Pointer[[]url.URL]
+	initialNodes    []url.URL
+	nextLiveNodeIdx atomic.Uint64
+	cfg             ALNConfig
+	nextUpdate      atomic.Int64
+	updaterStarted  atomic.Bool
+	ctx             context.Context
+	stopFn          context.CancelFunc
+	httpClient      *http.Client
+	updateSignal    chan struct{}
+	nodeHealthStore NodeHealthStoreInterface
 }
 
 // GetActiveNodes returns nodes that are currently considered healthy.
@@ -380,19 +380,21 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 	}
 }
 
-func (aln *AlternatorLiveNodes) startIdleUpdater() {
-	if aln.cfg.IdleUpdatePeriod <= 0 {
-		return
-	}
-	if aln.idleUpdaterStarted.CompareAndSwap(false, true) {
+func (aln *AlternatorLiveNodes) startUpdater() {
+	if aln.updaterStarted.CompareAndSwap(false, true) {
 		go func() {
-			t := time.NewTicker(aln.cfg.IdleUpdatePeriod)
-			defer t.Stop()
+			var idleUpdates <-chan time.Time
+			var idleTicker *time.Ticker
+			if aln.cfg.IdleUpdatePeriod > 0 {
+				idleTicker = time.NewTicker(aln.cfg.IdleUpdatePeriod)
+				idleUpdates = idleTicker.C
+				defer idleTicker.Stop()
+			}
 			for {
 				select {
 				case <-aln.ctx.Done():
 					return
-				case <-t.C:
+				case <-idleUpdates:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
 					_ = aln.UpdateLiveNodes()
 				case <-aln.updateSignal:
@@ -407,7 +409,7 @@ func (aln *AlternatorLiveNodes) startIdleUpdater() {
 // Start begins background routines used for periodic node discovery and updates.
 // It is not required to start if automatically on first API call
 func (aln *AlternatorLiveNodes) Start() {
-	aln.startIdleUpdater()
+	aln.startUpdater()
 	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	aln.nodeHealthStore.Start()
 }
@@ -422,9 +424,14 @@ func (aln *AlternatorLiveNodes) Stop() {
 
 // NextNode gets next node, check if node list needs to be updated and run updating routine if needed
 func (aln *AlternatorLiveNodes) NextNode() url.URL {
-	aln.startIdleUpdater()
-	aln.triggerUpdate()
+	aln.TriggerUpdate()
 	return aln.nextNode()
+}
+
+// TriggerUpdate starts the background updater and requests a live-node refresh when one is due.
+func (aln *AlternatorLiveNodes) TriggerUpdate() {
+	aln.startUpdater()
+	aln.triggerUpdate()
 }
 
 func (aln *AlternatorLiveNodes) nextNode() url.URL {

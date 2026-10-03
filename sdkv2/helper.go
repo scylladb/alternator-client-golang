@@ -260,6 +260,7 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 type Helper struct {
 	nodes         AlternatorNodesSource
 	affinityNodes AlternatorNodesSource
+	initialNodes  []string
 	cfg           shared.Config
 	queryPlanSeed int64
 
@@ -275,20 +276,9 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		opt(cfg)
 	}
 
-	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	nodes, affinityNodes, err := newNodeSources(initialNodes, cfg)
 	if err != nil {
 		return nil, err
-	}
-
-	var affinityNodes AlternatorNodesSource
-	if cfg.KeyRouteAffinity.Type != KeyRouteAffinityNone && !rt.IsClusterScope(cfg.RoutingScope) {
-		affinityCfg := *cfg
-		affinityCfg.RoutingScope = rt.NewClusterScope()
-		affinityNodes, err = shared.NewAlternatorLiveNodes(initialNodes, affinityCfg.ToALNOptions()...)
-		if err != nil {
-			nodes.Stop()
-			return nil, err
-		}
 	}
 
 	// Pre-populate runtime partition key information from config
@@ -302,9 +292,33 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	return &Helper{
 		nodes:         nodes,
 		affinityNodes: affinityNodes,
+		initialNodes:  append([]string(nil), initialNodes...),
 		cfg:           *cfg,
 		keyAffinity:   keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
+}
+
+func newNodeSources(
+	initialNodes []string,
+	cfg *shared.Config,
+) (AlternatorNodesSource, AlternatorNodesSource, error) {
+	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var affinityNodes AlternatorNodesSource
+	if cfg.KeyRouteAffinity.Type != KeyRouteAffinityNone && !rt.IsClusterScope(cfg.RoutingScope) {
+		affinityCfg := *cfg
+		affinityCfg.RoutingScope = rt.NewClusterScope()
+		affinityNodes, err = shared.NewAlternatorLiveNodes(initialNodes, affinityCfg.ToALNOptions()...)
+		if err != nil {
+			nodes.Stop()
+			return nil, nil, err
+		}
+	}
+
+	return nodes, affinityNodes, nil
 }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
@@ -346,12 +360,43 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Helper{
-		nodes:         lb.nodes,
-		affinityNodes: lb.affinityNodes,
+
+	nodes := lb.nodes
+	affinityNodes := lb.affinityNodes
+	if !routingScopesEqual(lb.cfg.RoutingScope, cfg.RoutingScope) ||
+		(lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) !=
+			(cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) {
+		var err error
+		nodes, affinityNodes, err = newNodeSources(lb.initialNodes, &cfg)
+		if err != nil {
+			panic(fmt.Sprintf("failed to update helper node sources: %v", err))
+		}
+	}
+
+	updated := &Helper{
+		nodes:         nodes,
+		affinityNodes: affinityNodes,
+		initialNodes:  append([]string(nil), lb.initialNodes...),
 		cfg:           cfg,
 		keyAffinity:   lb.keyAffinity.Clone(),
 	}
+	for table, keyName := range cfg.KeyRouteAffinity.PkInfoPerTable {
+		updated.keyAffinity.SetPartitionKeyName(table, keyName)
+	}
+	return updated
+}
+
+func routingScopesEqual(left, right rt.Scope) bool {
+	for left != nil && right != nil {
+		if left.Name() != right.Name() ||
+			left.String() != right.String() ||
+			left.GetLocalNodesQuery() != right.GetLocalNodesQuery() {
+			return false
+		}
+		left = left.Fallback()
+		right = right.Fallback()
+	}
+	return left == nil && right == nil
 }
 
 // NextNode returns the next available Alternator node URL
@@ -518,15 +563,18 @@ func (r *EndpointResolverV2) ResolveEndpoint(
 }
 
 type (
-	queryPlanKeyType   struct{}
-	requestNodeKeyType struct{}
+	queryPlanKeyType     struct{}
+	requestNodeKeyType   struct{}
+	affinityNodesKeyType struct{}
 )
 
 var (
 	// A context key to store/retrieve a query plan assigned to the request
 	queryPlanKey = queryPlanKeyType{}
 	// A context key to store/retrieve a node assigned to the request
-	requestNodeKey               = requestNodeKeyType{}
+	requestNodeKey = requestNodeKeyType{}
+	// A context key to store the node source that an affinity request should refresh
+	affinityNodesKey             = affinityNodesKeyType{}
 	queryPlanMiddlewareName      = "alternatorQueryPlanMiddleware"
 	queryPlanFinalMiddlewareName = "alternatorQueryPlanMiddlewareFinal"
 )
@@ -544,6 +592,11 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 	return val, nil
 }
 
+func getAffinityNodesFromContext(ctx context.Context) AlternatorNodesSource {
+	nodes, _ := middleware.GetStackValue(ctx, affinityNodesKey).(AlternatorNodesSource)
+	return nodes
+}
+
 func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
 	if lb.queryPlanSeed == 0 {
 		return shared.NewLazyQueryPlan(lb.nodes)
@@ -558,6 +611,14 @@ func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
 	return lb.nodes
 }
 
+func triggerNodeSourceUpdate(nodes AlternatorNodesSource) {
+	if trigger, ok := nodes.(interface{ TriggerUpdate() }); ok {
+		trigger.TriggerUpdate()
+	} else {
+		_ = nodes.NextNode()
+	}
+}
+
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
@@ -565,17 +626,22 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
+					var affinityNodes AlternatorNodesSource
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						qp = lb.newDefaultQueryPlan()
 					} else {
 						if affinityPlan, err := lb.getAffinityQueryPlan(in); err == nil {
 							qp = affinityPlan
+							affinityNodes = lb.affinityNodeSource()
 						} else {
 							qp = lb.newDefaultQueryPlan()
 						}
 					}
 
 					ctx = middleware.WithStackValue(ctx, queryPlanKey, qp)
+					if affinityNodes != nil {
+						ctx = middleware.WithStackValue(ctx, affinityNodesKey, affinityNodes)
+					}
 
 					return next.HandleInitialize(ctx, in)
 				},
@@ -595,6 +661,11 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				node := plan.Next()
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
+				}
+				if affinityNodes := getAffinityNodesFromContext(ctx); affinityNodes != nil {
+					// Refresh after the plan takes its node snapshots so an asynchronous
+					// health-tier transition cannot exhaust the in-flight request plan.
+					triggerNodeSourceUpdate(affinityNodes)
 				}
 
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
@@ -753,9 +824,12 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 	}
 
 	affinityNodes := lb.affinityNodeSource()
-	activeNodes := affinityNodes.GetActiveNodes()
-	if len(activeNodes) == 0 {
-		return nil, fmt.Errorf("batch write request does not have active nodes")
+	routingNodes := affinityNodes.GetActiveNodes()
+	if len(routingNodes) == 0 {
+		routingNodes = affinityNodes.GetQuarantinedNodes()
+	}
+	if len(routingNodes) == 0 {
+		return nil, fmt.Errorf("batch write request does not have usable nodes")
 	}
 
 	votes := make(map[url.URL]int)
@@ -785,7 +859,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		}
 		hashes = append(hashes, hash)
 
-		node := shared.FirstNodeWithSeed(activeNodes, hash)
+		node := shared.FirstNodeWithSeed(routingNodes, hash)
 		if node.Host != "" {
 			votes[node]++
 		}
