@@ -66,6 +66,7 @@ type AlternatorLiveNodes struct {
 	cfg             ALNConfig
 	nextUpdate      atomic.Int64
 	updaterStarted  atomic.Bool
+	updaterWG       sync.WaitGroup
 	lifecycleMu     sync.Mutex
 	started         bool
 	stopped         bool
@@ -373,7 +374,9 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 
 func (aln *AlternatorLiveNodes) startUpdater() {
 	if aln.updaterStarted.CompareAndSwap(false, true) {
+		aln.updaterWG.Add(1)
 		go func() {
+			defer aln.updaterWG.Done()
 			var idleUpdates <-chan time.Time
 			var idleTicker *time.Ticker
 			if aln.cfg.IdleUpdatePeriod > 0 {
@@ -387,10 +390,10 @@ func (aln *AlternatorLiveNodes) startUpdater() {
 					return
 				case <-idleUpdates:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
-					_ = aln.UpdateLiveNodes()
+					_ = aln.updateLiveNodes(aln.ctx, false)
 				case <-aln.updateSignal:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
-					_ = aln.UpdateLiveNodes()
+					_ = aln.updateLiveNodes(aln.ctx, false)
 				}
 			}
 		}()
@@ -422,6 +425,7 @@ func (aln *AlternatorLiveNodes) Stop() {
 	if aln.stopFn != nil {
 		aln.stopFn()
 	}
+	aln.updaterWG.Wait()
 	if aln.started {
 		aln.nodeHealthStore.Stop()
 	}
@@ -586,6 +590,9 @@ func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
 func (aln *AlternatorLiveNodes) updateLiveNodes(ctx context.Context, requireNodes bool) error {
 	newNodes, err := aln.fetchLiveNodes(ctx)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if len(newNodes) == 0 {

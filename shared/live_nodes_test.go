@@ -102,6 +102,70 @@ func TestAlternatorLiveNodesRequestRefreshWorksWithoutIdleTicker(t *testing.T) {
 	}
 }
 
+func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
+	t.Parallel()
+
+	requestStarted := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	allowReturn := make(chan struct{})
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"node.local"},
+		WithALNUpdatePeriod(time.Minute),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/localnodes" {
+					return resp.HealthCheckResponse(req)
+				}
+				close(requestStarted)
+				<-req.Context().Done()
+				close(requestCanceled)
+				<-allowReturn
+				return resp.AlternatorNodesResponse([]string{"published-after-stop.local"}, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+
+	aln.nextUpdate.Store(0)
+	aln.TriggerUpdate()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background refresh did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		aln.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the blocked discovery request")
+	}
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before the blocked updater exited")
+	default:
+	}
+	close(allowReturn)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not join the canceled updater")
+	}
+
+	nodes := aln.GetNodes()
+	if len(nodes) != 1 || nodes[0].Hostname() != "node.local" {
+		t.Fatalf("canceled refresh published nodes after Stop: %v", nodes)
+	}
+}
+
 func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T) {
 	t.Parallel()
 
