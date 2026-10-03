@@ -226,20 +226,9 @@ const (
 	sdkv2UserAgentProduct = "scylladb-alternator-client-golang"
 )
 
-// AlternatorNodesSource an interface for nodes list provider
-type AlternatorNodesSource interface {
-	NextNode() url.URL
-	GetNodes() []url.URL
-	UpdateLiveNodes() error
-	GetActiveNodes() []url.URL
-	GetQuarantinedNodes() []url.URL
-	CheckIfRackAndDatacenterSetCorrectly() error
-	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
-	ReportNodeError(nodeURL url.URL, err error)
-	TryReleaseQuarantinedNodes() []url.URL
-	Start()
-	Stop()
-}
+// AlternatorNodesSource provides node discovery, selection and health reporting.
+// It is shared with the discovery owner so affinity selection uses the same contract.
+type AlternatorNodesSource = shared.AlternatorNodesSource
 
 var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 
@@ -272,7 +261,7 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		opt(cfg)
 	}
 
-	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	nodes, err := newNodeSource(initialNodes, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +279,13 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		cfg:         *cfg,
 		keyAffinity: keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
+}
+
+func newNodeSource(initialNodes []string, cfg *shared.Config) (AlternatorNodesSource, error) {
+	if cfg.KeyRouteAffinity.Type != KeyRouteAffinityNone {
+		return shared.NewAlternatorLiveNodesWithKeyAffinity(initialNodes, cfg.ToALNOptions()...)
+	}
+	return shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
 }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
@@ -530,6 +526,19 @@ func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
 	return shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
 }
 
+// affinityNodeSelector is implemented by the discovery owner. Legacy custom
+// sources keep ordinary routing without needing to implement affinity selection.
+type affinityNodeSelector interface {
+	AffinityNodeSource() AlternatorNodesSource
+}
+
+func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
+	if source, ok := lb.nodes.(affinityNodeSelector); ok {
+		return source.AffinityNodeSource()
+	}
+	return lb.nodes
+}
+
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
@@ -568,7 +577,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
 				}
-
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
 
 				req, ok := in.Request.(*smithyhttp.Request)
@@ -658,7 +666,7 @@ func (lb *Helper) getAffinityQueryPlan(in middleware.InitializeInput) (*shared.L
 	if err != nil {
 		return nil, err
 	}
-	return shared.NewLazyQueryPlanWithSortedSeed(lb.nodes, pkHash), nil
+	return shared.NewLazyQueryPlanWithSortedSeed(lb.affinityNodeSource(), pkHash), nil
 }
 
 func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
@@ -724,7 +732,9 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have a routing target")
 	}
 
-	activeNodes := lb.nodes.GetActiveNodes()
+	source := lb.affinityNodeSource()
+	affinityNodes := shared.CaptureNodes(source)
+	activeNodes := affinityNodes.GetActiveNodes()
 	if len(activeNodes) == 0 {
 		return nil, fmt.Errorf("batch write request does not have active nodes")
 	}
@@ -767,7 +777,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have usable preferred nodes")
 	}
 
-	return shared.NewLazyQueryPlanWithPreferredNodes(lb.nodes, preferredNodes, batchWriteSeed(hashes)), nil
+	return shared.NewLazyQueryPlanWithPreferredNodes(affinityNodes, preferredNodes, batchWriteSeed(hashes)), nil
 }
 
 func selectBatchWriteRoutingCandidates(requestItems map[string][]types.WriteRequest) []batchWriteRoutingCandidate {

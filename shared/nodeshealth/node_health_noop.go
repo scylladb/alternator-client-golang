@@ -38,6 +38,11 @@ func (n *NodeHealthNoop) GetQuarantinedNodes() []url.URL {
 	return nil
 }
 
+// SnapshotNodes captures membership with an empty quarantine bucket.
+func (n *NodeHealthNoop) SnapshotNodes() (active, quarantined []url.URL) {
+	return n.GetActiveNodes(), nil
+}
+
 // TryReleaseQuarantinedNodes is a no-op and returns nil.
 func (n *NodeHealthNoop) TryReleaseQuarantinedNodes() []url.URL {
 	return nil
