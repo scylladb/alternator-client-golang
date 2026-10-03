@@ -23,13 +23,84 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
+
+func TestAlternatorLiveNodesConcurrentStartStopIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	for iteration := 0; iteration < 100; iteration++ {
+		aln, err := NewAlternatorLiveNodes(
+			[]string{"node.local"},
+			WithALNIdleUpdatePeriod(-1),
+			WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+				return liveNodesRoundTripFunc(resp.HealthCheckResponse)
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			aln.Start()
+		}()
+		go func() {
+			defer wg.Done()
+			aln.Stop()
+		}()
+		wg.Wait()
+
+		aln.Start()
+		aln.TriggerUpdate()
+		aln.Stop()
+	}
+}
+
+func TestAlternatorLiveNodesRequestRefreshWorksWithoutIdleTicker(t *testing.T) {
+	t.Parallel()
+
+	refreshed := make(chan struct{}, 1)
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"node.local"},
+		WithALNUpdatePeriod(time.Minute),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "/localnodes" {
+					select {
+					case refreshed <- struct{}{}:
+					default:
+					}
+					return resp.AlternatorNodesResponse([]string{"node.local", "new-node.local"}, req)
+				}
+				return resp.HealthCheckResponse(req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	aln.nextUpdate.Store(0)
+	aln.TriggerUpdate()
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		t.Fatal("request-driven refresh did not run with idle updates disabled")
+	}
+}
 
 func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T) {
 	t.Parallel()

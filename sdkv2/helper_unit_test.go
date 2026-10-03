@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1709,6 +1710,116 @@ func TestAffinityDiscoveryHealthChecksRespectRequestDeadline(t *testing.T) {
 	}
 }
 
+func TestReadyAffinityRequestRefreshesAfterPlanSnapshot(t *testing.T) {
+	t.Parallel()
+
+	oldNode := url.URL{Scheme: "http", Host: "old-cluster-node.local:8080"}
+	newNode := url.URL{Scheme: "http", Host: "new-cluster-node.local:8080"}
+	affinityNodes := &refreshingAffinityNodeSource{
+		batchWriteAffinityNodeSource: batchWriteAffinityNodeSource{activeNodes: []url.URL{oldNode}},
+		refreshNodes:                 []url.URL{newNode},
+	}
+
+	var routed []string
+	mockTransport := &mocks.MockRoundTripper{
+		DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+			routed = append(routed, req.URL.Host)
+			return resp.DynamoDBUpdateItemResponse(req)
+		},
+	}
+	cfg := shared.NewDefaultConfig()
+	WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport })(cfg)
+	WithCredentials("test-key", "test-secret")(cfg)
+	cfg.KeyRouteAffinity = shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW).WithPkInfo(map[string]string{
+		"orders": "id",
+	})
+	h := &Helper{
+		nodes: &batchWriteAffinityNodeSource{
+			activeNodes: []url.URL{{Scheme: "http", Host: "rack.local:8080"}},
+		},
+		affinityNodes:     affinityNodes,
+		affinityDiscovery: &affinityDiscoveryState{ready: true},
+		cfg:               *cfg,
+		keyAffinity: keyAffinity{pkInfoPerTable: map[string]string{
+			"orders": "id",
+		}},
+	}
+	client, err := h.NewDynamoDB()
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %v", err)
+	}
+	update := &dynamodb.UpdateItemInput{
+		TableName: aws.String("orders"),
+		Key: map[string]types.AttributeValue{
+			"id": &types.AttributeValueMemberS{Value: "same-key"},
+		},
+		UpdateExpression: aws.String("SET value = :value"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":value": &types.AttributeValueMemberN{Value: "1"},
+		},
+	}
+
+	if _, err := client.UpdateItem(context.Background(), update); err != nil {
+		t.Fatalf("first UpdateItem returned error: %v", err)
+	}
+	if got := affinityNodes.triggerCalls.Load(); got != 1 {
+		t.Fatalf("affinity refresh trigger count = %d, want 1", got)
+	}
+	if _, err := client.UpdateItem(context.Background(), update); err != nil {
+		t.Fatalf("second UpdateItem returned error: %v", err)
+	}
+	if diff := cmp.Diff([]string{oldNode.Host, newNode.Host}, routed); diff != "" {
+		t.Fatalf("refresh changed the current plan or was not visible to the next request (-want +got):\n%s", diff)
+	}
+}
+
+func TestAffinityDiscoveryWaiterUsesFlightResultAndSingleDeadline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("flight_error", func(t *testing.T) {
+		t.Parallel()
+
+		flightErr := errors.New("discovery failed")
+		flight := &affinityDiscoveryFlight{done: make(chan struct{})}
+		state := &affinityDiscoveryState{inFlight: flight}
+		h := &Helper{affinityDiscovery: state}
+
+		go func() {
+			flight.err = flightErr
+			close(flight.done)
+		}()
+		err := h.ensureAffinityNodes(context.Background())
+		if !errors.Is(err, flightErr) {
+			t.Fatalf("waiter error = %v, want shared flight error", err)
+		}
+		if state.inFlight != flight {
+			t.Fatal("waiter replaced the shared discovery flight")
+		}
+	})
+
+	t.Run("caller_deadline", func(t *testing.T) {
+		t.Parallel()
+
+		flight := &affinityDiscoveryFlight{done: make(chan struct{})}
+		state := &affinityDiscoveryState{inFlight: flight}
+		h := &Helper{affinityDiscovery: state}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+
+		started := time.Now()
+		err := h.ensureAffinityNodes(ctx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter error = %v, want caller deadline", err)
+		}
+		if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+			t.Fatalf("waiter exceeded its single deadline: %s", elapsed)
+		}
+		if state.inFlight != flight {
+			t.Fatal("timed-out waiter replaced the shared discovery flight")
+		}
+	})
+}
+
 func TestHelperUpdatePreservesSourcesAndRejectsAffinityToggle(t *testing.T) {
 	t.Parallel()
 
@@ -1825,6 +1936,48 @@ func TestHelperUpdateSharedSourcesCanBeStoppedMoreThanOnce(t *testing.T) {
 	updated.Stop()
 	h.Stop()
 	updated.Stop()
+}
+
+func TestHelperUpdateSharedSourcesConcurrentStartStop(t *testing.T) {
+	t.Parallel()
+
+	mockTransport := &mocks.MockRoundTripper{NodeHealthRequest: resp.HealthCheckResponse}
+	for iteration := 0; iteration < 100; iteration++ {
+		h, err := NewHelper(
+			[]string{"seed.local"},
+			WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
+			WithIdleNodesListUpdatePeriod(-1),
+		)
+		if err != nil {
+			t.Fatalf("NewHelper returned error: %v", err)
+		}
+		updated := h.Update(WithCredentials("test-key", "test-secret"))
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() {
+			defer wg.Done()
+			h.Start()
+		}()
+		go func() {
+			defer wg.Done()
+			updated.Start()
+		}()
+		go func() {
+			defer wg.Done()
+			h.Stop()
+		}()
+		go func() {
+			defer wg.Done()
+			updated.Stop()
+		}()
+		wg.Wait()
+
+		h.Start()
+		updated.Start()
+		h.Stop()
+		updated.Stop()
+	}
 }
 
 func assertNodeSourceState(
@@ -2595,6 +2748,17 @@ func batchWriteStringKeysForNode(t *testing.T, target url.URL, count int) []stri
 type batchWriteAffinityNodeSource struct {
 	activeNodes      []url.URL
 	quarantinedNodes []url.URL
+}
+
+type refreshingAffinityNodeSource struct {
+	batchWriteAffinityNodeSource
+	refreshNodes []url.URL
+	triggerCalls atomic.Int32
+}
+
+func (s *refreshingAffinityNodeSource) TriggerUpdate() {
+	s.triggerCalls.Add(1)
+	s.activeNodes = append([]url.URL(nil), s.refreshNodes...)
 }
 
 func (s batchWriteAffinityNodeSource) NextNode() url.URL {

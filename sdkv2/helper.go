@@ -302,7 +302,12 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 type affinityDiscoveryState struct {
 	mu       sync.Mutex
 	ready    bool
-	inFlight chan struct{}
+	inFlight *affinityDiscoveryFlight
+}
+
+type affinityDiscoveryFlight struct {
+	done chan struct{}
+	err  error
 }
 
 func newAffinityDiscoveryState(affinityType shared.KeyRouteAffinity) *affinityDiscoveryState {
@@ -575,15 +580,18 @@ func (r *EndpointResolverV2) ResolveEndpoint(
 }
 
 type (
-	queryPlanKeyType   struct{}
-	requestNodeKeyType struct{}
+	queryPlanKeyType       struct{}
+	requestNodeKeyType     struct{}
+	affinityRequestKeyType struct{}
 )
 
 var (
 	// A context key to store/retrieve a query plan assigned to the request
 	queryPlanKey = queryPlanKeyType{}
 	// A context key to store/retrieve a node assigned to the request
-	requestNodeKey               = requestNodeKeyType{}
+	requestNodeKey = requestNodeKeyType{}
+	// A context key that marks a request using key-route affinity
+	affinityRequestKey           = affinityRequestKeyType{}
 	queryPlanMiddlewareName      = "alternatorQueryPlanMiddleware"
 	queryPlanFinalMiddlewareName = "alternatorQueryPlanMiddlewareFinal"
 )
@@ -599,6 +607,11 @@ func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
 		return url.URL{}, errs.ErrCtxHasNoNode
 	}
 	return val, nil
+}
+
+func isAffinityRequest(ctx context.Context) bool {
+	value, _ := middleware.GetStackValue(ctx, affinityRequestKey).(bool)
+	return value
 }
 
 func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
@@ -624,49 +637,60 @@ func (lb *Helper) ensureAffinityNodes(ctx context.Context) error {
 	if state == nil {
 		return nil
 	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, affinityDiscoveryTimeout)
+	defer cancel()
 
-	for {
-		state.mu.Lock()
-		if state.ready {
-			state.mu.Unlock()
-			return nil
-		}
-		if state.inFlight != nil {
-			inFlight := state.inFlight
-			state.mu.Unlock()
-			select {
-			case <-inFlight:
-				continue
-			case <-ctx.Done():
-				return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, ctx.Err())
-			}
-		}
-		state.inFlight = make(chan struct{})
+	state.mu.Lock()
+	if state.ready {
 		state.mu.Unlock()
-
-		discovery, ok := lb.affinityNodeSource().(interface {
-			DiscoverLiveNodes(context.Context) error
-		})
-		var err error
-		if !ok {
-			err = errors.New("node source does not support synchronous discovery")
-		} else {
-			discoveryCtx, cancel := context.WithTimeout(ctx, affinityDiscoveryTimeout)
-			err = discovery.DiscoverLiveNodes(discoveryCtx)
-			cancel()
-		}
-
-		state.mu.Lock()
-		if err == nil {
-			state.ready = true
-		}
-		close(state.inFlight)
-		state.inFlight = nil
-		state.mu.Unlock()
-		if err != nil {
-			return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, err)
-		}
 		return nil
+	}
+	if state.inFlight != nil {
+		flight := state.inFlight
+		state.mu.Unlock()
+		select {
+		case <-flight.done:
+			if flight.err != nil {
+				return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, flight.err)
+			}
+			return nil
+		case <-discoveryCtx.Done():
+			return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, discoveryCtx.Err())
+		}
+	}
+
+	flight := &affinityDiscoveryFlight{done: make(chan struct{})}
+	state.inFlight = flight
+	state.mu.Unlock()
+
+	discovery, ok := lb.affinityNodeSource().(interface {
+		DiscoverLiveNodes(context.Context) error
+	})
+	if !ok {
+		flight.err = errors.New("node source does not support synchronous discovery")
+	} else {
+		flight.err = discovery.DiscoverLiveNodes(discoveryCtx)
+	}
+
+	state.mu.Lock()
+	if flight.err == nil {
+		state.ready = true
+	}
+	state.inFlight = nil
+	close(flight.done)
+	state.mu.Unlock()
+	if flight.err != nil {
+		return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, flight.err)
+	}
+	return nil
+}
+
+func (lb *Helper) triggerAffinityRefresh() {
+	nodes := lb.affinityNodeSource()
+	if trigger, ok := nodes.(interface{ TriggerUpdate() }); ok {
+		trigger.TriggerUpdate()
+	} else {
+		_ = nodes.NextNode()
 	}
 }
 
@@ -677,11 +701,13 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
 					var qp *shared.LazyQueryPlan
+					affinity := false
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						qp = lb.newDefaultQueryPlan()
 					} else {
 						if affinityPlan, err := lb.getAffinityQueryPlan(ctx, in); err == nil {
 							qp = affinityPlan
+							affinity = true
 						} else if errors.Is(err, errAffinityDiscoveryFailed) {
 							return middleware.InitializeOutput{}, middleware.Metadata{}, err
 						} else {
@@ -690,6 +716,9 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 					}
 
 					ctx = middleware.WithStackValue(ctx, queryPlanKey, qp)
+					if affinity {
+						ctx = middleware.WithStackValue(ctx, affinityRequestKey, true)
+					}
 
 					return next.HandleInitialize(ctx, in)
 				},
@@ -709,6 +738,11 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				node := plan.Next()
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
+				}
+				if isAffinityRequest(ctx) {
+					// Snapshot first so the current retry plan cannot be changed by the
+					// refresh that this request schedules for subsequent requests.
+					lb.triggerAffinityRefresh()
 				}
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
 

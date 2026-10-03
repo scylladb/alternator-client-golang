@@ -66,8 +66,9 @@ type AlternatorLiveNodes struct {
 	cfg             ALNConfig
 	nextUpdate      atomic.Int64
 	updaterStarted  atomic.Bool
-	startOnce       sync.Once
-	stopOnce        sync.Once
+	lifecycleMu     sync.Mutex
+	started         bool
+	stopped         bool
 	ctx             context.Context
 	stopFn          context.CancelFunc
 	httpClient      *http.Client
@@ -399,21 +400,31 @@ func (aln *AlternatorLiveNodes) startUpdater() {
 // Start begins background routines used for periodic node discovery and updates.
 // It is not required to start if automatically on first API call
 func (aln *AlternatorLiveNodes) Start() {
-	aln.startOnce.Do(func() {
-		aln.startUpdater()
-		aln.nodeHealthStore.TryReleaseQuarantinedNodes()
-		aln.nodeHealthStore.Start()
-	})
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.started || aln.stopped {
+		return
+	}
+	aln.started = true
+	aln.startUpdater()
+	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
+	aln.nodeHealthStore.Start()
 }
 
 // Stop stops background routines used for periodic node discovery and updates.
 func (aln *AlternatorLiveNodes) Stop() {
-	aln.stopOnce.Do(func() {
-		if aln.stopFn != nil {
-			aln.stopFn()
-		}
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return
+	}
+	aln.stopped = true
+	if aln.stopFn != nil {
+		aln.stopFn()
+	}
+	if aln.started {
 		aln.nodeHealthStore.Stop()
-	})
+	}
 }
 
 // NextNode gets next node, check if node list needs to be updated and run updating routine if needed
@@ -424,6 +435,11 @@ func (aln *AlternatorLiveNodes) NextNode() url.URL {
 
 // TriggerUpdate starts the background updater and requests a live-node refresh when one is due.
 func (aln *AlternatorLiveNodes) TriggerUpdate() {
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return
+	}
 	aln.startUpdater()
 	aln.triggerUpdate()
 }
@@ -545,8 +561,20 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 
 // DiscoverLiveNodes synchronously discovers and publishes a non-empty live-node set.
 func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
-	if err := aln.updateLiveNodes(ctx, true); err != nil {
+	discoveryCtx, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(aln.ctx, cancel)
+	defer func() {
+		stopCancel()
+		cancel()
+	}()
+
+	if err := aln.updateLiveNodes(discoveryCtx, true); err != nil {
 		return err
+	}
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return errors.New("live-node source is stopped")
 	}
 	aln.startUpdater()
 	if aln.cfg.UpdatePeriod > 0 {
