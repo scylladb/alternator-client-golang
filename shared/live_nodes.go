@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -65,6 +66,10 @@ type AlternatorLiveNodes struct {
 	cfg                ALNConfig
 	nextUpdate         atomic.Int64
 	idleUpdaterStarted atomic.Bool
+	updaterWG          sync.WaitGroup
+	lifecycleMu        sync.Mutex
+	started            bool
+	stopped            bool
 	ctx                context.Context
 	stopFn             context.CancelFunc
 	httpClient         *http.Client
@@ -327,30 +332,18 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	}
 	sortNodesByAddress(nodes)
 	initialNodeURLs := slices.Clone(nodes)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
 		cfg.NodeHealthStoreConfig,
 		func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
-			resp, err := httpClient.Get(u.String())
-			if err != nil {
-				cfg.Logger.Error("failed to check node health status", logx.A("node", u.String()), logx.A("error", err))
-				return false
-			}
-			defer drainAndCloseResponseBody(resp.Body)
-			if resp.StatusCode != http.StatusOK {
-				cfg.Logger.Error("failed to check node health status, node reported an error",
-					logx.A("node", u.String()),
-					logx.A("statusCode", resp.StatusCode),
-				)
-				return false
-			}
-			return true
+			return checkNodeHealth(ctx, httpClient, cfg.Logger, u)
 		},
 		slices.Clone(nodes))
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	out := &AlternatorLiveNodes{
 		initialNodes:    initialNodeURLs,
 		cfg:             cfg,
@@ -385,19 +378,21 @@ func (aln *AlternatorLiveNodes) startIdleUpdater() {
 		return
 	}
 	if aln.idleUpdaterStarted.CompareAndSwap(false, true) {
+		aln.updaterWG.Add(1)
 		go func() {
-			t := time.NewTicker(aln.cfg.IdleUpdatePeriod)
-			defer t.Stop()
+			defer aln.updaterWG.Done()
+			idleTicker := time.NewTicker(aln.cfg.IdleUpdatePeriod)
+			defer idleTicker.Stop()
 			for {
 				select {
 				case <-aln.ctx.Done():
 					return
-				case <-t.C:
+				case <-idleTicker.C:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
-					_ = aln.UpdateLiveNodes()
+					_ = aln.updateLiveNodes(aln.ctx, false)
 				case <-aln.updateSignal:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
-					_ = aln.UpdateLiveNodes()
+					_ = aln.updateLiveNodes(aln.ctx, false)
 				}
 			}
 		}()
@@ -407,6 +402,12 @@ func (aln *AlternatorLiveNodes) startIdleUpdater() {
 // Start begins background routines used for periodic node discovery and updates.
 // It is not required to start if automatically on first API call
 func (aln *AlternatorLiveNodes) Start() {
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.started || aln.stopped {
+		return
+	}
+	aln.started = true
 	aln.startIdleUpdater()
 	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	aln.nodeHealthStore.Start()
@@ -414,16 +415,29 @@ func (aln *AlternatorLiveNodes) Start() {
 
 // Stop stops background routines used for periodic node discovery and updates.
 func (aln *AlternatorLiveNodes) Stop() {
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return
+	}
+	aln.stopped = true
 	if aln.stopFn != nil {
 		aln.stopFn()
 	}
-	aln.nodeHealthStore.Stop()
+	aln.updaterWG.Wait()
+	if aln.started {
+		aln.nodeHealthStore.Stop()
+	}
 }
 
 // NextNode gets next node, check if node list needs to be updated and run updating routine if needed
 func (aln *AlternatorLiveNodes) NextNode() url.URL {
-	aln.startIdleUpdater()
-	aln.triggerUpdate()
+	aln.lifecycleMu.Lock()
+	if !aln.stopped {
+		aln.startIdleUpdater()
+		aln.triggerUpdate()
+	}
+	aln.lifecycleMu.Unlock()
 	return aln.nextNode()
 }
 
@@ -459,11 +473,11 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 }
 
 // fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
-func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
+func (aln *AlternatorLiveNodes) fetchLiveNodes(ctx context.Context) ([]url.URL, error) {
 	scope := aln.cfg.RoutingScope
 
 	for scope != nil {
-		newNodes, err := aln.getNodesForScope(scope)
+		newNodes, err := aln.getNodesForScope(ctx, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -475,7 +489,7 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 	return nil, nil
 }
 
-func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, error) {
+func (aln *AlternatorLiveNodes) getNodesForScope(ctx context.Context, scope rt.Scope) ([]url.URL, error) {
 	clusterScope := rt.IsClusterScope(scope)
 	plan := NewLazyQueryPlan(aln)
 	var discoveredNodes []url.URL
@@ -487,7 +501,7 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 		endpoint.Path = "/localnodes"
 		endpoint.RawQuery = scope.GetLocalNodesQuery()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		newNodes, err := aln.getNodes(ctx, &endpoint)
 		if err != nil {
 			lastErr = err
 			continue
@@ -515,7 +529,7 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 		endpoint.Path = "/localnodes"
 		endpoint.RawQuery = scope.GetLocalNodesQuery()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		newNodes, err := aln.getNodes(ctx, &endpoint)
 		if err != nil {
 			lastErr = err
 			continue
@@ -539,11 +553,45 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
-	newNodes, err := aln.fetchLiveNodes()
+	return aln.updateLiveNodes(context.Background(), false)
+}
+
+// DiscoverLiveNodes synchronously discovers and publishes a non-empty live-node set.
+func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
+	discoveryCtx, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(aln.ctx, cancel)
+	defer func() {
+		stopCancel()
+		cancel()
+	}()
+
+	if err := aln.updateLiveNodes(discoveryCtx, true); err != nil {
+		return err
+	}
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return errors.New("live-node source is stopped")
+	}
+	aln.startIdleUpdater()
+	if aln.cfg.UpdatePeriod > 0 {
+		aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
+	}
+	return nil
+}
+
+func (aln *AlternatorLiveNodes) updateLiveNodes(ctx context.Context, requireNodes bool) error {
+	newNodes, err := aln.fetchLiveNodes(ctx)
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(newNodes) == 0 {
+		if requireNodes {
+			return errors.New("live-node discovery returned no nodes")
+		}
 		return nil
 	}
 	currentNodes := *aln.liveNodes.Load()
@@ -564,13 +612,56 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 	sortNodesByAddress(newNodes)
 	aln.liveNodes.Store(&newNodes)
 	if hasNewNodes {
-		aln.nodeHealthStore.TryReleaseQuarantinedNodes()
+		if requireNodes {
+			contextualHealthStore, ok := aln.nodeHealthStore.(interface {
+				TryReleaseQuarantinedNodesWith(nodeshealth.QuarantineReleaseFunc) []url.URL
+			})
+			if !ok {
+				return errors.New("node health store does not support context-aware release")
+			}
+			contextualHealthStore.TryReleaseQuarantinedNodesWith(
+				func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
+					return checkNodeHealth(ctx, aln.httpClient, aln.cfg.Logger, u)
+				},
+			)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		} else {
+			aln.nodeHealthStore.TryReleaseQuarantinedNodes()
+		}
 	}
 	return nil
 }
 
-func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
-	resp, err := aln.httpClient.Get(endpoint.String())
+func checkNodeHealth(ctx context.Context, client *http.Client, logger logx.Logger, node url.URL) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, node.String(), nil)
+	if err != nil {
+		logger.Error("failed to create node health request", logx.A("node", node.String()), logx.A("error", err))
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Error("failed to check node health status", logx.A("node", node.String()), logx.A("error", err))
+		return false
+	}
+	defer drainAndCloseResponseBody(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		logger.Error("failed to check node health status, node reported an error",
+			logx.A("node", node.String()),
+			logx.A("statusCode", resp.StatusCode),
+		)
+		return false
+	}
+	return true
+}
+
+func (aln *AlternatorLiveNodes) getNodes(ctx context.Context, endpoint *url.URL) ([]url.URL, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := aln.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +759,7 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 			// Cluster scope does not require validation
 			return nil
 		}
-		newNodes, err := aln.getNodesForScope(scope)
+		newNodes, err := aln.getNodesForScope(context.Background(), scope)
 		if err != nil {
 			return fmt.Errorf("failed to read list of nodes: %w", err)
 		}
@@ -694,11 +785,11 @@ func (aln *AlternatorLiveNodes) CheckIfRackDatacenterFeatureIsSupported() (bool,
 	baseURI := aln.nextAsURLWithPath("/localnodes", "")
 	fakeRackURI := aln.nextAsURLWithPath("/localnodes", "rack=fakeRack")
 
-	hostsWithFakeRack, err := aln.getNodes(fakeRackURI)
+	hostsWithFakeRack, err := aln.getNodes(context.Background(), fakeRackURI)
 	if err != nil {
 		return false, err
 	}
-	hostsWithoutRack, err := aln.getNodes(baseURI)
+	hostsWithoutRack, err := aln.getNodes(context.Background(), baseURI)
 	if err != nil {
 		return false, err
 	}

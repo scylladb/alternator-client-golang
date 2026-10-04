@@ -45,12 +45,14 @@ package sdkv2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"runtime/debug"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -59,6 +61,7 @@ import (
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
 	"github.com/scylladb/alternator-client-golang/shared/logx"
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 
 	"github.com/scylladb/alternator-client-golang/shared"
 
@@ -256,9 +259,11 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 // It internally relies on the shared.AlternatorLiveNodes component for tracking
 // and routing to healthy nodes.
 type Helper struct {
-	nodes         AlternatorNodesSource
-	cfg           shared.Config
-	queryPlanSeed int64
+	nodes             AlternatorNodesSource
+	affinityNodes     AlternatorNodesSource
+	affinityDiscovery *affinityDiscoveryState
+	cfg               shared.Config
+	queryPlanSeed     int64
 
 	keyAffinity keyAffinity
 }
@@ -272,7 +277,7 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		opt(cfg)
 	}
 
-	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	nodes, affinityNodes, err := newNodeSources(initialNodes, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -286,10 +291,53 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	}
 
 	return &Helper{
-		nodes:       nodes,
-		cfg:         *cfg,
-		keyAffinity: keyAffinity{pkInfoPerTable: pkInfoPerTable},
+		nodes:             nodes,
+		affinityNodes:     affinityNodes,
+		affinityDiscovery: newAffinityDiscoveryState(cfg.KeyRouteAffinity.Type),
+		cfg:               *cfg,
+		keyAffinity:       keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
+}
+
+type affinityDiscoveryState struct {
+	mu       sync.Mutex
+	ready    bool
+	inFlight *affinityDiscoveryFlight
+}
+
+type affinityDiscoveryFlight struct {
+	done chan struct{}
+	err  error
+}
+
+func newAffinityDiscoveryState(affinityType shared.KeyRouteAffinity) *affinityDiscoveryState {
+	if affinityType == KeyRouteAffinityNone {
+		return nil
+	}
+	return &affinityDiscoveryState{}
+}
+
+func newNodeSources(
+	initialNodes []string,
+	cfg *shared.Config,
+) (AlternatorNodesSource, AlternatorNodesSource, error) {
+	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var affinityNodes AlternatorNodesSource
+	if cfg.KeyRouteAffinity.Type != KeyRouteAffinityNone && !rt.IsClusterScope(cfg.RoutingScope) {
+		affinityCfg := *cfg
+		affinityCfg.RoutingScope = rt.NewClusterScope()
+		affinityNodes, err = shared.NewAlternatorLiveNodes(initialNodes, affinityCfg.ToALNOptions()...)
+		if err != nil {
+			nodes.Stop()
+			return nil, nil, err
+		}
+	}
+
+	return nodes, affinityNodes, nil
 }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
@@ -324,18 +372,48 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 	return cfg, nil
 }
 
-// Update takes config of current helper, updates its config and creates a new helper with updated config
+// Update takes config of current helper, updates its config and creates a new helper with updated config.
+// It panics if options change the routing scope or enable/disable key route affinity because those changes require
+// independently owned node sources; create a new Helper instead.
 func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg := lb.cfg
 	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Helper{
-		nodes:       lb.nodes,
-		cfg:         cfg,
-		keyAffinity: lb.keyAffinity.Clone(),
+
+	if !routingScopesEqual(lb.cfg.RoutingScope, cfg.RoutingScope) {
+		panic("sdkv2: Helper.Update cannot change the routing scope; create a new Helper")
 	}
+	if (lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) !=
+		(cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) {
+		panic("sdkv2: Helper.Update cannot enable or disable key route affinity; create a new Helper")
+	}
+
+	updated := &Helper{
+		nodes:             lb.nodes,
+		affinityNodes:     lb.affinityNodes,
+		affinityDiscovery: lb.affinityDiscovery,
+		cfg:               cfg,
+		keyAffinity:       lb.keyAffinity.Clone(),
+	}
+	for table, keyName := range cfg.KeyRouteAffinity.PkInfoPerTable {
+		updated.keyAffinity.SetPartitionKeyName(table, keyName)
+	}
+	return updated
+}
+
+func routingScopesEqual(left, right rt.Scope) bool {
+	for left != nil && right != nil {
+		if left.Name() != right.Name() ||
+			left.String() != right.String() ||
+			left.GetLocalNodesQuery() != right.GetLocalNodesQuery() {
+			return false
+		}
+		left = left.Fallback()
+		right = right.Fallback()
+	}
+	return left == nil && right == nil
 }
 
 // NextNode returns the next available Alternator node URL
@@ -356,7 +434,10 @@ func (lb *Helper) GetActiveNodes() []url.URL {
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (lb *Helper) UpdateLiveNodes() error {
-	return lb.nodes.UpdateLiveNodes()
+	if lb.affinityNodes == nil {
+		return lb.nodes.UpdateLiveNodes()
+	}
+	return errors.Join(lb.nodes.UpdateLiveNodes(), lb.affinityNodes.UpdateLiveNodes())
 }
 
 // CheckIfRackAndDatacenterSetCorrectly verifies that the rack and datacenter
@@ -375,11 +456,17 @@ func (lb *Helper) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
 // It is not required to start if automatically on first API call
 func (lb *Helper) Start() {
 	lb.nodes.Start()
+	if lb.affinityNodes != nil {
+		lb.affinityNodes.Start()
+	}
 }
 
 // Stop stops background routines used for periodic node discovery and updates.
 func (lb *Helper) Stop() {
 	lb.nodes.Stop()
+	if lb.affinityNodes != nil {
+		lb.affinityNodes.Stop()
+	}
 }
 
 // GetMaxIdleHTTPConnectionsPerHost returns the configured maximum number of idle HTTP connections per host.
@@ -454,12 +541,19 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Host = node.Host
 	resp, err := rt.originalTransport.RoundTrip(req)
 	if err != nil && req.URL != nil {
-		rt.lb.nodes.ReportNodeError(url.URL{
+		rt.lb.reportNodeError(url.URL{
 			Host:   req.URL.Host,
 			Scheme: req.URL.Scheme,
 		}, err)
 	}
 	return resp, err
+}
+
+func (lb *Helper) reportNodeError(node url.URL, err error) {
+	lb.nodes.ReportNodeError(node, err)
+	if lb.affinityNodes != nil {
+		lb.affinityNodes.ReportNodeError(node, err)
+	}
 }
 
 func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTripper {
@@ -519,6 +613,70 @@ func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
 	return shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
 }
 
+func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
+	if lb.affinityNodes != nil {
+		return lb.affinityNodes
+	}
+	return lb.nodes
+}
+
+const affinityDiscoveryTimeout = 30 * time.Second
+
+var errAffinityDiscoveryFailed = errors.New("cluster-wide affinity discovery failed")
+
+func (lb *Helper) ensureAffinityNodes(ctx context.Context) error {
+	state := lb.affinityDiscovery
+	if state == nil {
+		return nil
+	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, affinityDiscoveryTimeout)
+	defer cancel()
+
+	state.mu.Lock()
+	if state.ready {
+		state.mu.Unlock()
+		return nil
+	}
+	if state.inFlight != nil {
+		flight := state.inFlight
+		state.mu.Unlock()
+		select {
+		case <-flight.done:
+			if flight.err != nil {
+				return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, flight.err)
+			}
+			return nil
+		case <-discoveryCtx.Done():
+			return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, discoveryCtx.Err())
+		}
+	}
+
+	flight := &affinityDiscoveryFlight{done: make(chan struct{})}
+	state.inFlight = flight
+	state.mu.Unlock()
+
+	discovery, ok := lb.affinityNodeSource().(interface {
+		DiscoverLiveNodes(context.Context) error
+	})
+	if !ok {
+		flight.err = errors.New("node source does not support synchronous discovery")
+	} else {
+		flight.err = discovery.DiscoverLiveNodes(discoveryCtx)
+	}
+
+	state.mu.Lock()
+	if flight.err == nil {
+		state.ready = true
+	}
+	state.inFlight = nil
+	close(flight.done)
+	state.mu.Unlock()
+	if flight.err != nil {
+		return fmt.Errorf("%w: %w", errAffinityDiscoveryFailed, flight.err)
+	}
+	return nil
+}
+
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
@@ -529,8 +687,10 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						qp = lb.newDefaultQueryPlan()
 					} else {
-						if affinityPlan, err := lb.getAffinityQueryPlan(in); err == nil {
+						if affinityPlan, err := lb.getAffinityQueryPlan(ctx, in); err == nil {
 							qp = affinityPlan
+						} else if errors.Is(err, errAffinityDiscoveryFailed) {
+							return middleware.InitializeOutput{}, middleware.Metadata{}, err
 						} else {
 							qp = lb.newDefaultQueryPlan()
 						}
@@ -557,7 +717,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
 				}
-
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
 
 				req, ok := in.Request.(*smithyhttp.Request)
@@ -636,9 +795,15 @@ func (lb *Helper) hashPartitionKey(values map[string]types.AttributeValue, table
 	return hash, nil
 }
 
-func (lb *Helper) getAffinityQueryPlan(in middleware.InitializeInput) (*shared.LazyQueryPlan, error) {
+func (lb *Helper) getAffinityQueryPlan(
+	ctx context.Context,
+	in middleware.InitializeInput,
+) (*shared.LazyQueryPlan, error) {
 	if params, ok := in.Parameters.(*dynamodb.BatchWriteItemInput); ok {
 		if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityAnyWrite {
+			if err := lb.ensureAffinityNodes(ctx); err != nil {
+				return nil, err
+			}
 			return lb.batchWriteQueryPlan(params.RequestItems)
 		}
 	}
@@ -647,7 +812,10 @@ func (lb *Helper) getAffinityQueryPlan(in middleware.InitializeInput) (*shared.L
 	if err != nil {
 		return nil, err
 	}
-	return shared.NewLazyQueryPlanWithSortedSeed(lb.nodes, pkHash), nil
+	if err := lb.ensureAffinityNodes(ctx); err != nil {
+		return nil, err
+	}
+	return shared.NewLazyQueryPlanWithSortedSeed(lb.affinityNodeSource(), pkHash), nil
 }
 
 func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
@@ -713,9 +881,13 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have a routing target")
 	}
 
-	activeNodes := lb.nodes.GetActiveNodes()
-	if len(activeNodes) == 0 {
-		return nil, fmt.Errorf("batch write request does not have active nodes")
+	affinityNodes := lb.affinityNodeSource()
+	routingNodes := affinityNodes.GetActiveNodes()
+	if len(routingNodes) == 0 {
+		routingNodes = affinityNodes.GetQuarantinedNodes()
+	}
+	if len(routingNodes) == 0 {
+		return nil, fmt.Errorf("batch write request does not have usable nodes")
 	}
 
 	votes := make(map[url.URL]int)
@@ -745,7 +917,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		}
 		hashes = append(hashes, hash)
 
-		node := shared.FirstNodeWithSeed(activeNodes, hash)
+		node := shared.FirstNodeWithSeed(routingNodes, hash)
 		if node.Host != "" {
 			votes[node]++
 		}
@@ -756,7 +928,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have usable preferred nodes")
 	}
 
-	return shared.NewLazyQueryPlanWithPreferredNodes(lb.nodes, preferredNodes, batchWriteSeed(hashes)), nil
+	return shared.NewLazyQueryPlanWithPreferredNodes(affinityNodes, preferredNodes, batchWriteSeed(hashes)), nil
 }
 
 func selectBatchWriteRoutingCandidates(requestItems map[string][]types.WriteRequest) []batchWriteRoutingCandidate {

@@ -30,13 +30,15 @@ type nodesSource interface {
 // It defers fetching active and quarantined nodes from the source until the first
 // time they are needed by Next().
 type LazyQueryPlan struct {
-	nodes            nodesSource
-	activeNodes      []url.URL
-	quarantinedNodes []url.URL
-	rnd              *rand.Rand
-	preferredNodes   []url.URL
-	sortNodes        bool
-	deterministic    bool
+	nodes                nodesSource
+	activeNodes          []url.URL
+	quarantinedNodes     []url.URL
+	rnd                  *rand.Rand
+	preferredNodes       []url.URL
+	activePreferred      []url.URL
+	quarantinedPreferred []url.URL
+	sortNodes            bool
+	deterministic        bool
 }
 
 // NewLazyQueryPlan constructs a plan bound to the provided nodes source.
@@ -65,9 +67,9 @@ func NewLazyQueryPlanWithSortedSeed(nodes nodesSource, seed int64) *LazyQueryPla
 	}
 }
 
-// NewLazyQueryPlanWithPreferredNodes constructs a plan that tries
-// preferredNodes first when they are still active, then returns the remaining
-// lexicographically sorted nodes.
+// NewLazyQueryPlanWithPreferredNodes constructs a plan that prioritizes
+// preferredNodes within each health tier: active nodes first, then quarantined
+// nodes. Remaining nodes in each tier are returned in lexicographic order.
 func NewLazyQueryPlanWithPreferredNodes(nodes nodesSource, preferredNodes []url.URL, seed int64) *LazyQueryPlan {
 	_ = seed
 	return &LazyQueryPlan{
@@ -94,16 +96,12 @@ func FirstNodeWithSeed(nodes []url.URL, seed int64) url.URL {
 func (p *LazyQueryPlan) Next() url.URL {
 	if p.activeNodes == nil {
 		p.activeNodes = p.prepareNodes(p.nodes.GetActiveNodes())
+		p.activePreferred, p.preferredNodes = takePreferredNodes(&p.activeNodes, p.preferredNodes)
 	}
-	for len(p.preferredNodes) > 0 {
-		preferredNode := p.preferredNodes[0]
-		p.preferredNodes = p.preferredNodes[1:]
-		if preferredNode.Host == "" {
-			continue
-		}
-		if node, ok := popNode(&p.activeNodes, preferredNode); ok {
-			return node
-		}
+	if len(p.activePreferred) > 0 {
+		node := p.activePreferred[0]
+		p.activePreferred = p.activePreferred[1:]
+		return node
 	}
 	if len(p.activeNodes) > 0 {
 		return p.pickAndRemove(&p.activeNodes)
@@ -111,6 +109,13 @@ func (p *LazyQueryPlan) Next() url.URL {
 
 	if p.quarantinedNodes == nil {
 		p.quarantinedNodes = p.prepareNodes(p.nodes.GetQuarantinedNodes())
+		p.quarantinedPreferred, _ = takePreferredNodes(&p.quarantinedNodes, p.preferredNodes)
+		p.preferredNodes = nil
+	}
+	if len(p.quarantinedPreferred) > 0 {
+		node := p.quarantinedPreferred[0]
+		p.quarantinedPreferred = p.quarantinedPreferred[1:]
+		return node
 	}
 	if len(p.quarantinedNodes) > 0 {
 		return p.pickAndRemove(&p.quarantinedNodes)
@@ -155,6 +160,20 @@ func popNode(nodes *[]url.URL, preferred url.URL) (url.URL, bool) {
 		}
 	}
 	return url.URL{}, false
+}
+
+func takePreferredNodes(nodes *[]url.URL, preferredNodes []url.URL) (matched, unmatched []url.URL) {
+	for _, preferred := range preferredNodes {
+		if preferred.Host == "" {
+			continue
+		}
+		if node, ok := popNode(nodes, preferred); ok {
+			matched = append(matched, node)
+		} else {
+			unmatched = append(unmatched, preferred)
+		}
+	}
+	return matched, unmatched
 }
 
 func cloneAndSortNodes(in []url.URL) []url.URL {
