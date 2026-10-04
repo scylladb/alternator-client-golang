@@ -40,7 +40,8 @@ There is a separate library for each AWS SDK version:
 - Deprecated legacy support: [sdkv1](sdkv1) for [AWS SDK for Go v1](https://github.com/aws/aws-sdk-go).
 
 New applications should use `sdkv2`. It is the more feature-rich helper and is where new feature development happens.
-The `sdkv1` module is kept for existing users that cannot migrate yet, but it is deprecated and no longer receives new features.
+The `sdkv1` module is kept for existing users that cannot migrate yet. It is deprecated and receives compatibility and
+maintenance fixes, but new user-facing features are developed for `sdkv2`.
 
 ### Migrating from SDK v1
 
@@ -97,16 +98,32 @@ lb, err := helper.NewHelper(
 )
 ```
 
-For cluster-wide routing, the helper queries the seed nodes passed to `NewHelper` and merges the returned node lists.
-Some Scylla versions return only the contacted node's datacenter from `/localnodes`, even with cluster scope. In that
-case, the seed list is assumed to contain working nodes from the datacenters that should be included:
+The helper discovers cluster topology by issuing authenticated DynamoDB `Scan` requests for Scylla's
+`.scylla.alternator.system.local` and `.scylla.alternator.system.peers` virtual tables. One reachable seed can therefore
+discover nodes in every datacenter represented in the cluster topology. The virtual-table interface requires
+ScyllaDB 4.1 or newer.
 
 ```golang
 lb, err := helper.NewHelper(
-    []string{"dc1-node.example.com", "dc2-node.example.com", "dc3-node.example.com"},
+    []string{"seed.example.com"},
     helper.WithRoutingScope(rt.NewClusterScope()),
 )
 ```
+
+Topology requests use the same AWS region, credentials, TLS settings, HTTP transport wrapper, response compression,
+user agent, and AWS SDK config options supplied to `NewHelper`. Request compression and header filtering are disabled
+for these scans because changing headers or the body after SigV4 signing would invalidate the signature. On clusters
+with Alternator authentication and authorization enabled, the configured role must be able to authenticate and must
+have `SELECT` permission on both `system.local` and `system.peers`. Datacenter and rack filtering is performed by the
+client from the returned topology metadata.
+
+Peer candidates are checked concurrently through their own `system.local` row before publication. Unreachable peers and
+nodes that have not completed bootstrap are excluded, and normal node-health tracking handles failures after discovery.
+
+Applications that construct `shared.AlternatorLiveNodes` directly can provide `shared.WithALNTopologyDiscoverer`.
+`sdkv2.NewTopologyDiscoverer` creates the standard signed system-table adapter from the same helper options; legacy AWS
+SDK v1 users can use `sdkv1.NewTopologyDiscoverer`. Omitting a discoverer uses the initial nodes as a static topology
+without refresh or rack/datacenter metadata; `shared.WithALNStaticTopology` makes that intent explicit.
 
 #### Deprecated Options
 
@@ -318,6 +335,9 @@ To create a new Gzip configuration, use `NewGzipConfig()`. You can also set comp
 
 By default, the library tracks node health and temporarily quarantines nodes that experience connection errors. This helps route traffic away from unhealthy nodes. However, in some scenarios you may want to disable this behavior:
 
+Call `h.Start()` for periodic topology refresh and quarantine recovery, and `defer h.Stop()` when the helper is no longer
+needed. Request-driven topology refresh works without `Start`, but periodic health recovery does not; `Stop` is terminal.
+
 - When using an external load balancer that already handles node health
 - In testing environments where you want predictable round-robin behavior
 - When you prefer to let AWS SDK retries handle transient failures
@@ -391,7 +411,7 @@ Until the partition key is discovered, requests are routed without optimization.
 
 When key route affinity is combined with a rack or datacenter routing scope, affinity takes precedence for operations covered by the configured affinity mode. Those operations choose their coordinator from the cluster-wide node set so clients in different racks select the same node for the same partition key. Operations not covered by key route affinity continue to use the configured rack or datacenter scope.
 
-The first affinity-eligible request completes cluster-wide discovery before selecting its coordinator. Discovery is bounded by the request context and an internal 30-second limit. If discovery cannot return a usable node set, the request fails without being sent to a rack-local coordinator. Changing the routing scope or enabling/disabling key route affinity on an existing helper requires `NewHelper`; `Helper.Update` rejects those topology changes.
+The first affinity-eligible request completes cluster-wide discovery before selecting its coordinator. Discovery is bounded by the request context and an internal 30-second limit. If discovery cannot return a usable node set, the request fails without being sent to a rack-local coordinator. Changing the routing scope or enabling/disabling key route affinity on an existing helper requires `NewHelper`; `Helper.Update` rejects those changes. Every accepted `Helper.Update` creates independently owned node sources in the returned helper, which must be stopped separately.
 
 #### Pre-Configuring Partition Keys with WithPkInfo
 

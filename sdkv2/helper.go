@@ -50,6 +50,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -262,6 +263,7 @@ type Helper struct {
 	nodes             AlternatorNodesSource
 	affinityNodes     AlternatorNodesSource
 	affinityDiscovery *affinityDiscoveryState
+	initialNodes      []string
 	cfg               shared.Config
 	queryPlanSeed     int64
 
@@ -277,7 +279,11 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		opt(cfg)
 	}
 
-	nodes, affinityNodes, err := newNodeSources(initialNodes, cfg)
+	topologyDiscoverer, err := newFixedEndpointTopologyDiscoverer(*cfg)
+	if err != nil {
+		return nil, err
+	}
+	nodes, affinityNodes, err := newNodeSources(initialNodes, cfg, topologyDiscoverer)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +300,7 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		nodes:             nodes,
 		affinityNodes:     affinityNodes,
 		affinityDiscovery: newAffinityDiscoveryState(cfg.KeyRouteAffinity.Type),
+		initialNodes:      slices.Clone(initialNodes),
 		cfg:               *cfg,
 		keyAffinity:       keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
@@ -320,8 +327,10 @@ func newAffinityDiscoveryState(affinityType shared.KeyRouteAffinity) *affinityDi
 func newNodeSources(
 	initialNodes []string,
 	cfg *shared.Config,
+	topologyDiscoverer shared.TopologyDiscoverer,
 ) (AlternatorNodesSource, AlternatorNodesSource, error) {
-	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	alnOptions := append(cfg.ToALNOptions(), shared.WithALNTopologyDiscoverer(topologyDiscoverer))
+	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, alnOptions...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -330,7 +339,11 @@ func newNodeSources(
 	if cfg.KeyRouteAffinity.Type != KeyRouteAffinityNone && !rt.IsClusterScope(cfg.RoutingScope) {
 		affinityCfg := *cfg
 		affinityCfg.RoutingScope = rt.NewClusterScope()
-		affinityNodes, err = shared.NewAlternatorLiveNodes(initialNodes, affinityCfg.ToALNOptions()...)
+		affinityOptions := append(
+			affinityCfg.ToALNOptions(),
+			shared.WithALNTopologyDiscoverer(topologyDiscoverer),
+		)
+		affinityNodes, err = shared.NewAlternatorLiveNodes(initialNodes, affinityOptions...)
 		if err != nil {
 			nodes.Stop()
 			return nil, nil, err
@@ -341,28 +354,34 @@ func newNodeSources(
 }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
+	httpClient := &http.Client{
+		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(lb.cfg)),
+		Timeout:   lb.cfg.HTTPClientTimeout,
+	}
+	return configuredAWSConfig(
+		lb.cfg,
+		fmt.Sprintf("%s://%s:%d", lb.cfg.Scheme, "dynamodb.fake.alterntor.cluster.node", lb.cfg.Port),
+		httpClient,
+	)
+}
+
+func configuredAWSConfig(config shared.Config, baseEndpoint string, httpClient *http.Client) (aws.Config, error) {
 	cfg := aws.Config{
 		// Region is used in the signature algorithm so prevent request sent
 		// to one region to be forward by an attacker to a different region.
 		// But Alternator doesn't check it. It can be anything.
-		Region: lb.cfg.AWSRegion,
-		BaseEndpoint: aws.String(
-			fmt.Sprintf("%s://%s:%d", lb.cfg.Scheme, "dynamodb.fake.alterntor.cluster.node", lb.cfg.Port),
-		),
+		Region:       config.AWSRegion,
+		BaseEndpoint: aws.String(baseEndpoint),
+		HTTPClient:   httpClient,
 	}
 
-	if lb.cfg.AccessKeyID != "" && lb.cfg.SecretAccessKey != "" {
+	if config.AccessKeyID != "" && config.SecretAccessKey != "" {
 		// The third credential below, the session token, is only used for
 		// temporary credentials, and is not supported by Alternator anyway.
-		cfg.Credentials = credentials.NewStaticCredentialsProvider(lb.cfg.AccessKeyID, lb.cfg.SecretAccessKey, "")
+		cfg.Credentials = credentials.NewStaticCredentialsProvider(config.AccessKeyID, config.SecretAccessKey, "")
 	}
 
-	cfg.HTTPClient = &http.Client{
-		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(lb.cfg)),
-		Timeout:   lb.cfg.HTTPClientTimeout,
-	}
-
-	customizers, err := shared.ConvertToAWSConfigOptions[func(*aws.Config)](lb.cfg.AWSConfigOptions)
+	customizers, err := shared.ConvertToAWSConfigOptions[func(*aws.Config)](config.AWSConfigOptions)
 	if err != nil {
 		return aws.Config{}, err
 	}
@@ -373,8 +392,8 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 }
 
 // Update takes config of current helper, updates its config and creates a new helper with updated config.
-// It panics if options change the routing scope or enable/disable key route affinity because those changes require
-// independently owned node sources; create a new Helper instead.
+// It panics if options change the routing scope or enable/disable key route affinity. The returned helper owns
+// independent node sources and must be stopped separately. It also panics if those sources cannot be constructed.
 func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg := lb.cfg
 	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
@@ -389,11 +408,19 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 		(cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone) {
 		panic("sdkv2: Helper.Update cannot enable or disable key route affinity; create a new Helper")
 	}
-
+	topologyDiscoverer, err := newFixedEndpointTopologyDiscoverer(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("sdkv2: update topology discovery config: %v", err))
+	}
+	nodes, affinityNodes, err := newNodeSources(lb.initialNodes, &cfg, topologyDiscoverer)
+	if err != nil {
+		panic(fmt.Sprintf("sdkv2: rebuild live-node sources: %v", err))
+	}
 	updated := &Helper{
-		nodes:             lb.nodes,
-		affinityNodes:     lb.affinityNodes,
-		affinityDiscovery: lb.affinityDiscovery,
+		nodes:             nodes,
+		affinityNodes:     affinityNodes,
+		affinityDiscovery: newAffinityDiscoveryState(cfg.KeyRouteAffinity.Type),
+		initialNodes:      slices.Clone(lb.initialNodes),
 		cfg:               cfg,
 		keyAffinity:       lb.keyAffinity.Clone(),
 	}
@@ -461,7 +488,7 @@ func (lb *Helper) Start() {
 	}
 }
 
-// Stop stops background routines used for periodic node discovery and updates.
+// Stop permanently stops background routines. A stopped helper cannot be restarted.
 func (lb *Helper) Stop() {
 	lb.nodes.Stop()
 	if lb.affinityNodes != nil {
@@ -683,6 +710,7 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 			middleware.InitializeMiddlewareFunc(
 				queryPlanMiddlewareName,
 				func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					lb.triggerTopologyRefresh()
 					var qp *shared.LazyQueryPlan
 					if lb.cfg.KeyRouteAffinity.Type == KeyRouteAffinityNone {
 						qp = lb.newDefaultQueryPlan()
@@ -738,6 +766,12 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 			return stack.Finalize.Add(mw, middleware.Before)
 		}
 		return nil
+	}
+}
+
+func (lb *Helper) triggerTopologyRefresh() {
+	if trigger, ok := lb.nodes.(interface{ TriggerUpdate() }); ok {
+		trigger.TriggerUpdate()
 	}
 }
 

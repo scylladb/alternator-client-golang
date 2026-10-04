@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -58,16 +59,68 @@ var (
 var notFoundErr = new(*smithy.OperationError)
 
 func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
-	body := fetchIntegrationLocalNodes(t)
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("failed to listen on localhost: %v", err)
 	}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/localnodes" {
-			t.Fatalf("unexpected request path %q", r.URL.Path)
+		if target := r.Header.Get("X-Amz-Target"); target != "DynamoDB_20120810.Scan" {
+			t.Errorf("unexpected DynamoDB target %q", target)
+			http.Error(w, "unexpected target", http.StatusBadRequest)
+			return
 		}
-		_, _ = w.Write(body)
+		authorization := r.Header.Get("Authorization")
+		if !strings.Contains(authorization, "Credential=integration-key/") ||
+			!strings.Contains(authorization, "/dynamodb/aws4_request") {
+			t.Errorf("topology Scan was not signed with the configured credentials: %q", authorization)
+			http.Error(w, "unsigned request", http.StatusUnauthorized)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read topology Scan body: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var input struct {
+			TableName string `json:"TableName"`
+		}
+		if err := json.Unmarshal(body, &input); err != nil {
+			t.Errorf("failed to decode topology Scan body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if input.TableName != ".scylla.alternator.system.local" &&
+			input.TableName != ".scylla.alternator.system.peers" {
+			t.Errorf("unexpected topology table %q", input.TableName)
+			http.Error(w, "unexpected table", http.StatusBadRequest)
+			return
+		}
+
+		upstreamURL := "http://" + knownNodes[0] + ":" + strconv.Itoa(httpPort)
+		upstreamRequest, err := http.NewRequestWithContext(
+			r.Context(),
+			http.MethodPost,
+			upstreamURL,
+			strings.NewReader(string(body)),
+		)
+		if err != nil {
+			t.Errorf("failed to create upstream topology request: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		upstreamRequest.Header.Set("X-Amz-Target", "DynamoDB_20120810.Scan")
+		upstreamRequest.Header.Set("Content-Type", "application/x-amz-json-1.0")
+		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(upstreamRequest)
+		if err != nil {
+			t.Errorf("real topology Scan failed: %v", err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = response.Body.Close() }()
+		w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
 	}))
 	server.Listener = listener
 	server.Start()
@@ -88,6 +141,7 @@ func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
 		helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		helper.WithCredentials("integration-key", "integration-secret"),
 	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
@@ -100,24 +154,6 @@ func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
 	if len(h.GetNodes()) == 0 {
 		t.Fatalf("UpdateLiveNodes() did not discover any nodes")
 	}
-}
-
-func fetchIntegrationLocalNodes(t *testing.T) []byte {
-	t.Helper()
-	client := &http.Client{Timeout: 5 * time.Second}
-	response, err := client.Get("http://" + knownNodes[0] + ":" + strconv.Itoa(httpPort) + "/localnodes")
-	if err != nil {
-		t.Fatalf("failed to fetch integration /localnodes: %v", err)
-	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("integration /localnodes returned HTTP %d", response.StatusCode)
-	}
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("failed to read integration /localnodes: %v", err)
-	}
-	return body
 }
 
 func TestRoutingFallback(t *testing.T) {
@@ -519,13 +555,14 @@ func TestKeyRouteAffinityAutodiscovery(t *testing.T) {
 func testDynamoDBOperations(t *testing.T, opts ...helper.Option) { //nolint: thelper // it is not a helper
 
 	const tableName = "test_table"
+	opts = append(opts, helper.WithCredentials("whatever", "secret"))
 	h, err := helper.NewHelper(knownNodes, opts...)
 	if err != nil {
 		t.Errorf("failed to create alternator helper: %v", err)
 	}
 	defer h.Stop()
 
-	ddb, err := h.Update(helper.WithCredentials("whatever", "secret")).NewDynamoDB()
+	ddb, err := h.NewDynamoDB()
 	if err != nil {
 		t.Errorf("failed to create DynamoDB client: %v", err)
 	}

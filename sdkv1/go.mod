@@ -1,4 +1,4 @@
-// Deprecated: use github.com/scylladb/alternator-client-golang/sdkv2 instead; sdkv1 no longer receives new features.
+// Deprecated: use github.com/scylladb/alternator-client-golang/sdkv2 instead; sdkv1 receives maintenance fixes only.
 module github.com/scylladb/alternator-client-golang/sdkv1
 
 go 1.26.0

@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +33,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/scylladb/alternator-client-golang/shared/logx"
 	"github.com/scylladb/alternator-client-golang/shared/logxzap"
@@ -44,7 +44,107 @@ import (
 const (
 	defaultUpdatePeriod          = time.Second * 10
 	defaultIdleConnectionTimeout = 6 * time.Hour
+
+	// AlternatorSystemLocalTable is the DynamoDB virtual-table name for Scylla's system.local table.
+	AlternatorSystemLocalTable = ".scylla.alternator.system.local"
+	// AlternatorSystemPeersTable is the DynamoDB virtual-table name for Scylla's system.peers table.
+	AlternatorSystemPeersTable = ".scylla.alternator.system.peers"
 )
+
+var errTopologyDiscovererNotConfigured = errors.New("topology discoverer is not configured")
+
+var (
+	topologyDiscoverers   sync.Map // map[*ALNConfig]TopologyDiscoverer
+	staticTopologyConfigs sync.Map // set[*ALNConfig]
+)
+
+// TopologyNode describes an Alternator node and its location in the cluster.
+// Address is a bare IP address or DNS hostname without scheme or port.
+type TopologyNode struct {
+	Address    string
+	Datacenter string
+	Rack       string
+	HostID     string
+}
+
+// TopologyDiscoverer reads a complete cluster topology through a candidate
+// Alternator endpoint. Datacenter and Rack are used for client-side scope filtering.
+type TopologyDiscoverer interface {
+	DiscoverTopology(context.Context, url.URL) ([]TopologyNode, error)
+}
+
+// TopologyDiscovererFunc adapts a function to TopologyDiscoverer.
+type TopologyDiscovererFunc func(context.Context, url.URL) ([]TopologyNode, error)
+
+// DiscoverTopology implements TopologyDiscoverer.
+func (f TopologyDiscovererFunc) DiscoverTopology(ctx context.Context, endpoint url.URL) ([]TopologyNode, error) {
+	if f == nil {
+		return nil, errTopologyDiscovererNotConfigured
+	}
+	return f(ctx, endpoint)
+}
+
+// NormalizeTopologyAddress validates and normalizes an IP address or DNS hostname.
+// Empty, unspecified, and malformed values are rejected.
+func NormalizeTopologyAddress(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(value); err == nil {
+		if address.IsUnspecified() {
+			return "", false
+		}
+		return address.String(), true
+	}
+	if !validTopologyHostname(value) {
+		return "", false
+	}
+	return value, true
+}
+
+// TopologyEndpoint returns a clean endpoint for address using the scheme and port of base.
+func TopologyEndpoint(base url.URL, address string) (url.URL, error) {
+	normalized, ok := NormalizeTopologyAddress(address)
+	if !ok {
+		return url.URL{}, fmt.Errorf("invalid topology address %q", address)
+	}
+	base.Path = ""
+	base.RawPath = ""
+	base.RawQuery = ""
+	base.Fragment = ""
+	if port := base.Port(); port != "" {
+		base.Host = net.JoinHostPort(normalized, port)
+	} else if parsed, err := netip.ParseAddr(normalized); err == nil && parsed.Is6() {
+		base.Host = "[" + normalized + "]"
+	} else {
+		base.Host = normalized
+	}
+	return base, nil
+}
+
+func validTopologyHostname(host string) bool {
+	if len(host) > 253 || strings.HasPrefix(host, ".") {
+		return false
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			validCharacter := char <= unicode.MaxASCII &&
+				(unicode.IsLetter(char) || unicode.IsDigit(char) || char == '-' || char == '_')
+			if !validCharacter {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // NodeHealthStoreInterface defines the interface for tracking node health and managing quarantined nodes.
 type NodeHealthStoreInterface interface {
@@ -61,12 +161,16 @@ type NodeHealthStoreInterface interface {
 // AlternatorLiveNodes holds logic that allows to read and remember alternator nodes
 type AlternatorLiveNodes struct {
 	liveNodes          atomic.Pointer[[]url.URL]
+	knownNodes         atomic.Pointer[[]url.URL]
+	topology           atomic.Pointer[map[string]TopologyNode]
 	initialNodes       []url.URL
 	nextLiveNodeIdx    atomic.Uint64
 	cfg                ALNConfig
 	nextUpdate         atomic.Int64
-	idleUpdaterStarted atomic.Bool
+	updaterStarted     atomic.Bool
 	updaterWG          sync.WaitGroup
+	refreshWG          sync.WaitGroup
+	refreshMu          sync.Mutex
 	lifecycleMu        sync.Mutex
 	started            bool
 	stopped            bool
@@ -75,16 +179,18 @@ type AlternatorLiveNodes struct {
 	httpClient         *http.Client
 	updateSignal       chan struct{}
 	nodeHealthStore    NodeHealthStoreInterface
+	topologyDiscoverer TopologyDiscoverer
+	staticTopology     bool
 }
 
 // GetActiveNodes returns nodes that are currently considered healthy.
 func (aln *AlternatorLiveNodes) GetActiveNodes() []url.URL {
-	return aln.nodeHealthStore.GetActiveNodes()
+	return aln.nodesForAvailableScope(aln.nodeHealthStore.GetActiveNodes())
 }
 
 // GetQuarantinedNodes returns nodes currently marked as unhealthy.
 func (aln *AlternatorLiveNodes) GetQuarantinedNodes() []url.URL {
-	return aln.nodeHealthStore.GetQuarantinedNodes()
+	return aln.nodesForAvailableScope(aln.nodeHealthStore.GetQuarantinedNodes())
 }
 
 // ALNConfig a config for `AlternatorLiveNodes`
@@ -93,7 +199,7 @@ type ALNConfig struct {
 	Port         int
 	RoutingScope rt.Scope
 	UpdatePeriod time.Duration
-	// Now often read /localnodes when no requests are going through
+	// Controls topology refreshes when no requests are going through.
 	IdleUpdatePeriod time.Duration
 	// Makes it ignore server certificate errors
 	IgnoreServerCertificateError bool
@@ -126,7 +232,7 @@ func NewDefaultALNConfig() ALNConfig {
 		Port:                          defaultPort,
 		RoutingScope:                  rt.NewClusterScope(),
 		UpdatePeriod:                  defaultUpdatePeriod,
-		IdleUpdatePeriod:              time.Minute, // Don't update by default
+		IdleUpdatePeriod:              time.Minute,
 		TLSSessionCache:               newDefaultTLSSessionCache(),
 		MaxIdleHTTPConnections:        100,
 		MaxIdleHTTPConnectionsPerHost: http.DefaultMaxIdleConnsPerHost,
@@ -169,6 +275,20 @@ func WithALNRoutingScope(routingScope rt.Scope) ALNOption {
 	}
 }
 
+// WithALNTopologyDiscoverer configures the SDK-specific topology discovery implementation.
+func WithALNTopologyDiscoverer(discoverer TopologyDiscoverer) ALNOption {
+	return func(config *ALNConfig) {
+		topologyDiscoverers.Store(config, discoverer)
+	}
+}
+
+// WithALNStaticTopology disables topology discovery and keeps the initial node list unchanged.
+func WithALNStaticTopology() ALNOption {
+	return func(config *ALNConfig) {
+		staticTopologyConfigs.Store(config, struct{}{})
+	}
+}
+
 // WithALNUpdatePeriod configures how often update list of nodes, while requests are running
 func WithALNUpdatePeriod(period time.Duration) ALNOption {
 	return func(config *ALNConfig) {
@@ -176,7 +296,7 @@ func WithALNUpdatePeriod(period time.Duration) ALNOption {
 	}
 }
 
-// WithALNIdleUpdatePeriod controls timeout for idle http connections held by http.Transport
+// WithALNIdleUpdatePeriod controls topology refreshes while no requests are running.
 func WithALNIdleUpdatePeriod(period time.Duration) ALNOption {
 	return func(config *ALNConfig) {
 		config.IdleUpdatePeriod = period
@@ -306,7 +426,9 @@ func WithALNNodeHealthStoreConfig(storeCfg nodeshealth.NodeHealthStoreConfig) AL
 
 // NewAlternatorLiveNodes creates a new `AlternatorLiveNodes` instance configured with the provided initial Alternator nodes,
 //
-//	in a form of ip or dns name (without port) and optional functional configuration options (e.g., AWS region, credentials, TLS).
+//	in a form of IP address or DNS name (without port) and optional functional configuration options.
+//
+// Without WithALNTopologyDiscoverer, the source preserves the initial nodes as a static topology.
 func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*AlternatorLiveNodes, error) {
 	if len(initialNodes) == 0 {
 		return nil, errors.New("liveNodes cannot be empty")
@@ -315,6 +437,12 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	cfg := NewDefaultALNConfig()
 	for _, opt := range options {
 		opt(&cfg)
+	}
+	topologyDiscovererValue, _ := topologyDiscoverers.LoadAndDelete(&cfg)
+	topologyDiscoverer, _ := topologyDiscovererValue.(TopologyDiscoverer)
+	_, staticTopology := staticTopologyConfigs.LoadAndDelete(&cfg)
+	if topologyDiscoverer == nil {
+		staticTopology = true
 	}
 
 	httpClient := &http.Client{
@@ -345,15 +473,18 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 		return nil, err
 	}
 	out := &AlternatorLiveNodes{
-		initialNodes:    initialNodeURLs,
-		cfg:             cfg,
-		ctx:             ctx,
-		stopFn:          cancel,
-		httpClient:      httpClient,
-		nodeHealthStore: nodeHealthStore,
-		updateSignal:    make(chan struct{}, 1),
+		initialNodes:       initialNodeURLs,
+		cfg:                cfg,
+		ctx:                ctx,
+		stopFn:             cancel,
+		httpClient:         httpClient,
+		nodeHealthStore:    nodeHealthStore,
+		updateSignal:       make(chan struct{}, 1),
+		topologyDiscoverer: topologyDiscoverer,
+		staticTopology:     staticTopology,
 	}
 	out.liveNodes.Store(&nodes)
+	out.knownNodes.Store(&nodes)
 	return out, nil
 }
 
@@ -373,21 +504,26 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 	}
 }
 
-func (aln *AlternatorLiveNodes) startIdleUpdater() {
-	if aln.cfg.IdleUpdatePeriod <= 0 {
+func (aln *AlternatorLiveNodes) startUpdater() {
+	if aln.staticTopology {
 		return
 	}
-	if aln.idleUpdaterStarted.CompareAndSwap(false, true) {
+	if aln.updaterStarted.CompareAndSwap(false, true) {
 		aln.updaterWG.Add(1)
 		go func() {
 			defer aln.updaterWG.Done()
-			idleTicker := time.NewTicker(aln.cfg.IdleUpdatePeriod)
-			defer idleTicker.Stop()
+			var idleUpdates <-chan time.Time
+			var idleTicker *time.Ticker
+			if aln.cfg.IdleUpdatePeriod > 0 {
+				idleTicker = time.NewTicker(aln.cfg.IdleUpdatePeriod)
+				idleUpdates = idleTicker.C
+				defer idleTicker.Stop()
+			}
 			for {
 				select {
 				case <-aln.ctx.Done():
 					return
-				case <-idleTicker.C:
+				case <-idleUpdates:
 					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
 					_ = aln.updateLiveNodes(aln.ctx, false)
 				case <-aln.updateSignal:
@@ -399,8 +535,8 @@ func (aln *AlternatorLiveNodes) startIdleUpdater() {
 	}
 }
 
-// Start begins background routines used for periodic node discovery and updates.
-// It is not required to start if automatically on first API call
+// Start begins background routines used for periodic node discovery and health recovery.
+// Request-driven topology refresh starts automatically, but periodic health recovery requires Start.
 func (aln *AlternatorLiveNodes) Start() {
 	aln.lifecycleMu.Lock()
 	defer aln.lifecycleMu.Unlock()
@@ -408,12 +544,12 @@ func (aln *AlternatorLiveNodes) Start() {
 		return
 	}
 	aln.started = true
-	aln.startIdleUpdater()
+	aln.startUpdater()
 	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	aln.nodeHealthStore.Start()
 }
 
-// Stop stops background routines used for periodic node discovery and updates.
+// Stop permanently stops background routines. A stopped source cannot be restarted.
 func (aln *AlternatorLiveNodes) Stop() {
 	aln.lifecycleMu.Lock()
 	defer aln.lifecycleMu.Unlock()
@@ -425,6 +561,7 @@ func (aln *AlternatorLiveNodes) Stop() {
 		aln.stopFn()
 	}
 	aln.updaterWG.Wait()
+	aln.refreshWG.Wait()
 	if aln.started {
 		aln.nodeHealthStore.Stop()
 	}
@@ -432,17 +569,25 @@ func (aln *AlternatorLiveNodes) Stop() {
 
 // NextNode gets next node, check if node list needs to be updated and run updating routine if needed
 func (aln *AlternatorLiveNodes) NextNode() url.URL {
-	aln.lifecycleMu.Lock()
-	if !aln.stopped {
-		aln.startIdleUpdater()
-		aln.triggerUpdate()
-	}
-	aln.lifecycleMu.Unlock()
+	aln.TriggerUpdate()
 	return aln.nextNode()
 }
 
+// TriggerUpdate starts the updater and requests a topology refresh when one is due.
+func (aln *AlternatorLiveNodes) TriggerUpdate() {
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if !aln.stopped && !aln.staticTopology {
+		aln.startUpdater()
+		aln.triggerUpdate()
+	}
+}
+
 func (aln *AlternatorLiveNodes) nextNode() url.URL {
-	nodes := *aln.liveNodes.Load()
+	nodes := aln.GetActiveNodes()
+	if len(nodes) == 0 {
+		nodes = aln.GetQuarantinedNodes()
+	}
 	if len(nodes) == 0 {
 		nodes = aln.initialNodes
 	}
@@ -462,60 +607,76 @@ func (aln *AlternatorLiveNodes) GetNodes() []url.URL {
 	return sortNodesByAddress(result)
 }
 
-func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
-	base := aln.nextNode()
-	newURL := base
-	newURL.Path = path
-	if query != "" {
-		newURL.RawQuery = query
-	}
-	return &newURL
-}
-
 // fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
-func (aln *AlternatorLiveNodes) fetchLiveNodes(ctx context.Context) ([]url.URL, error) {
-	scope := aln.cfg.RoutingScope
-
-	for scope != nil {
-		newNodes, err := aln.getNodesForScope(ctx, scope)
-		if err != nil {
-			return nil, err
-		}
-		if len(newNodes) != 0 {
-			return newNodes, nil
-		}
-		scope = scope.Fallback()
+func (aln *AlternatorLiveNodes) fetchLiveNodes(
+	ctx context.Context,
+) (scopedNodes, allNodes []url.URL, metadata map[string]TopologyNode, err error) {
+	topology, err := aln.discoverTopology(ctx)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return nil, nil
+	allNodes = aln.nodesForScope(topology, rt.NewClusterScope())
+	metadata = make(map[string]TopologyNode, len(allNodes))
+	for _, topologyNode := range topology {
+		node, nodeErr := nodeURL(aln.cfg.Scheme, topologyNode.Address, aln.cfg.Port)
+		if nodeErr == nil {
+			metadata[node.String()] = topologyNode
+		}
+	}
+	return aln.nodesForScopeWithFallback(topology, aln.cfg.RoutingScope), allNodes, metadata, nil
 }
 
-func (aln *AlternatorLiveNodes) getNodesForScope(ctx context.Context, scope rt.Scope) ([]url.URL, error) {
-	clusterScope := rt.IsClusterScope(scope)
+func (aln *AlternatorLiveNodes) nodesForAvailableScope(nodes []url.URL) []url.URL {
+	metadata := aln.topology.Load()
+	if metadata == nil {
+		return slices.Clone(nodes)
+	}
+	for scope := aln.cfg.RoutingScope; scope != nil; scope = scope.Fallback() {
+		matched := make([]url.URL, 0, len(nodes))
+		for _, node := range nodes {
+			topologyNode, ok := (*metadata)[node.String()]
+			if ok && rt.Matches(scope, topologyNode.Datacenter, topologyNode.Rack) {
+				matched = append(matched, node)
+			}
+		}
+		if len(matched) != 0 {
+			return matched
+		}
+	}
+	if nodes == nil {
+		return nil
+	}
+	return []url.URL{}
+}
+
+func (aln *AlternatorLiveNodes) discoverTopology(ctx context.Context) ([]TopologyNode, error) {
+	discoverer := aln.topologyDiscoverer
+	if discoverer == nil {
+		return nil, errTopologyDiscovererNotConfigured
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+
 	plan := NewLazyQueryPlan(aln)
-	var discoveredNodes []url.URL
 	var lastErr error
 	attempted := make(map[string]struct{})
 	for node := plan.Next(); node.Host != ""; node = plan.Next() {
 		attempted[node.String()] = struct{}{}
-		endpoint := node
-		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
-
-		newNodes, err := aln.getNodes(ctx, &endpoint)
+		topology, err := discoverer.DiscoverTopology(ctx, node)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("discover topology through %s: %w", node.String(), err)
 			continue
 		}
-		if len(newNodes) == 0 {
+		if !aln.topologyIsUsable(topology) {
 			continue
 		}
-		if !clusterScope {
-			return newNodes, nil
-		}
-		discoveredNodes = append(discoveredNodes, newNodes...)
-	}
-	if len(discoveredNodes) != 0 {
-		return cloneAndDedupeNodes(discoveredNodes), nil
+		return slices.Clone(topology), nil
 	}
 
 	// Successful discovery replaces the initial entrypoints in the active node set. If every
@@ -525,25 +686,18 @@ func (aln *AlternatorLiveNodes) getNodesForScope(ctx context.Context, scope rt.S
 		if _, ok := attempted[node.String()]; ok {
 			continue
 		}
-		endpoint := node
-		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
-
-		newNodes, err := aln.getNodes(ctx, &endpoint)
+		topology, err := discoverer.DiscoverTopology(ctx, node)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("discover topology through %s: %w", node.String(), err)
 			continue
 		}
-		if len(newNodes) == 0 {
+		if !aln.topologyIsUsable(topology) {
 			continue
 		}
-		if !clusterScope {
-			return newNodes, nil
-		}
-		discoveredNodes = append(discoveredNodes, newNodes...)
-	}
-	if len(discoveredNodes) != 0 {
-		return cloneAndDedupeNodes(discoveredNodes), nil
+		return slices.Clone(topology), nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -551,13 +705,72 @@ func (aln *AlternatorLiveNodes) getNodesForScope(ctx context.Context, scope rt.S
 	return nil, nil
 }
 
+func (aln *AlternatorLiveNodes) topologyIsUsable(topology []TopologyNode) bool {
+	return len(aln.nodesForScope(topology, rt.NewClusterScope())) != 0
+}
+
+func (aln *AlternatorLiveNodes) nodesForScopeWithFallback(topology []TopologyNode, scope rt.Scope) []url.URL {
+	for scope != nil {
+		if nodes := aln.nodesForScope(topology, scope); len(nodes) != 0 {
+			return nodes
+		}
+		scope = scope.Fallback()
+	}
+	return nil
+}
+
+func (aln *AlternatorLiveNodes) nodesForScope(topology []TopologyNode, scope rt.Scope) []url.URL {
+	nodes := make([]url.URL, 0, len(topology))
+	for _, topologyNode := range topology {
+		if !rt.Matches(scope, topologyNode.Datacenter, topologyNode.Rack) {
+			continue
+		}
+
+		node, err := nodeURL(aln.cfg.Scheme, topologyNode.Address, aln.cfg.Port)
+		if err != nil {
+			aln.cfg.Logger.Error(
+				"invalid topology node address",
+				logx.A("node", topologyNode.Address),
+				logx.A("error", err),
+			)
+			continue
+		}
+		if address, err := netip.ParseAddr(node.Hostname()); err == nil && address.IsUnspecified() {
+			aln.cfg.Logger.Error("topology node address is unspecified", logx.A("node", topologyNode.Address))
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	return cloneAndDedupeNodes(nodes)
+}
+
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
+// It is a no-op for a static topology.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
-	return aln.updateLiveNodes(context.Background(), false)
+	if err := aln.beginRefresh(); err != nil {
+		return err
+	}
+	defer aln.refreshWG.Done()
+	if aln.staticTopology {
+		return nil
+	}
+	return aln.updateLiveNodes(aln.ctx, false)
 }
 
 // DiscoverLiveNodes synchronously discovers and publishes a non-empty live-node set.
+// It is a no-op for a static topology unless ctx is already canceled.
 func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
+	if err := aln.beginRefresh(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		aln.refreshWG.Done()
+		return err
+	}
+	if aln.staticTopology {
+		aln.refreshWG.Done()
+		return nil
+	}
 	discoveryCtx, cancel := context.WithCancel(ctx)
 	stopCancel := context.AfterFunc(aln.ctx, cancel)
 	defer func() {
@@ -565,7 +778,9 @@ func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
 		cancel()
 	}()
 
-	if err := aln.updateLiveNodes(discoveryCtx, true); err != nil {
+	err := aln.updateLiveNodes(discoveryCtx, true)
+	aln.refreshWG.Done()
+	if err != nil {
 		return err
 	}
 	aln.lifecycleMu.Lock()
@@ -573,15 +788,30 @@ func (aln *AlternatorLiveNodes) DiscoverLiveNodes(ctx context.Context) error {
 	if aln.stopped {
 		return errors.New("live-node source is stopped")
 	}
-	aln.startIdleUpdater()
+	aln.startUpdater()
 	if aln.cfg.UpdatePeriod > 0 {
 		aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
 	}
 	return nil
 }
 
+func (aln *AlternatorLiveNodes) beginRefresh() error {
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return errors.New("live-node source is stopped")
+	}
+	aln.refreshWG.Add(1)
+	return nil
+}
+
 func (aln *AlternatorLiveNodes) updateLiveNodes(ctx context.Context, requireNodes bool) error {
-	newNodes, err := aln.fetchLiveNodes(ctx)
+	aln.refreshMu.Lock()
+	defer aln.refreshMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	newNodes, allNodes, metadata, err := aln.fetchLiveNodes(ctx)
 	if err != nil {
 		return err
 	}
@@ -594,10 +824,23 @@ func (aln *AlternatorLiveNodes) updateLiveNodes(ctx context.Context, requireNode
 		}
 		return nil
 	}
-	currentNodes := *aln.liveNodes.Load()
+	currentNodes := *aln.knownNodes.Load()
 	hasNewNodes := false
+	verifiedNewNodes := make(map[url.URL]bool)
+	if requireNodes {
+		_, healthDisabled := aln.nodeHealthStore.(*nodeshealth.NodeHealthNoop)
+		for _, node := range allNodes {
+			if slices.Contains(currentNodes, node) {
+				continue
+			}
+			verifiedNewNodes[node] = healthDisabled || checkNodeHealth(ctx, aln.httpClient, aln.cfg.Logger, node)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+	}
 
-	for _, node := range newNodes {
+	for _, node := range allNodes {
 		if !slices.Contains(currentNodes, node) {
 			aln.nodeHealthStore.AddNode(node)
 			hasNewNodes = true
@@ -605,11 +848,14 @@ func (aln *AlternatorLiveNodes) updateLiveNodes(ctx context.Context, requireNode
 	}
 
 	for _, node := range currentNodes {
-		if !slices.Contains(newNodes, node) {
+		if !slices.Contains(allNodes, node) {
 			aln.nodeHealthStore.RemoveNode(node)
 		}
 	}
 	sortNodesByAddress(newNodes)
+	sortNodesByAddress(allNodes)
+	aln.knownNodes.Store(&allNodes)
+	aln.topology.Store(&metadata)
 	aln.liveNodes.Store(&newNodes)
 	if hasNewNodes {
 		if requireNodes {
@@ -620,13 +866,8 @@ func (aln *AlternatorLiveNodes) updateLiveNodes(ctx context.Context, requireNode
 				return errors.New("node health store does not support context-aware release")
 			}
 			contextualHealthStore.TryReleaseQuarantinedNodesWith(
-				func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
-					return checkNodeHealth(ctx, aln.httpClient, aln.cfg.Logger, u)
-				},
+				func(u url.URL, _ nodeshealth.NodeHealthStatus) bool { return verifiedNewNodes[u] },
 			)
-			if err := ctx.Err(); err != nil {
-				return err
-			}
 		} else {
 			aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 		}
@@ -654,41 +895,6 @@ func checkNodeHealth(ctx context.Context, client *http.Client, logger logx.Logge
 		return false
 	}
 	return true
-}
-
-func (aln *AlternatorLiveNodes) getNodes(ctx context.Context, endpoint *url.URL) ([]url.URL, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := aln.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer drainAndCloseResponseBody(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("non-200 response")
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var nodes []string
-	if err := json.Unmarshal(body, &nodes); err != nil {
-		return nil, err
-	}
-
-	var uris []url.URL
-	for _, node := range nodes {
-		uri, err := nodeURL(aln.cfg.Scheme, node, aln.cfg.Port)
-		if err != nil {
-			aln.cfg.Logger.Error("invalid node URI", logx.A("node", node), logx.A("error", err))
-			continue
-		}
-		uris = append(uris, uri)
-	}
-	return sortNodesByAddress(uris), nil
 }
 
 func nodeURL(scheme, host string, port int) (url.URL, error) {
@@ -745,6 +951,9 @@ func cloneAndDedupeNodes(nodes []url.URL) []url.URL {
 // CheckIfRackAndDatacenterSetCorrectly verifies that the rack and datacenter
 // settings are correctly configured and recognized by the Alternator cluster.
 func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err error) {
+	if aln.staticTopology && !rt.IsClusterScope(aln.cfg.RoutingScope) {
+		return errors.New("rack/datacenter validation requires a topology discoverer")
+	}
 	var errs []error
 	defer func() {
 		if err == nil && len(errs) > 0 {
@@ -754,16 +963,20 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 		}
 	}()
 	scope := aln.cfg.RoutingScope
+	if rt.IsClusterScope(scope) {
+		// Cluster scope does not require validation or topology discovery.
+		return nil
+	}
+	topology, err := aln.discoverTopology(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to read topology: %w", err)
+	}
 	for scope != nil {
 		if rt.IsClusterScope(scope) {
 			// Cluster scope does not require validation
 			return nil
 		}
-		newNodes, err := aln.getNodesForScope(context.Background(), scope)
-		if err != nil {
-			return fmt.Errorf("failed to read list of nodes: %w", err)
-		}
-		if len(newNodes) == 0 {
+		if len(aln.nodesForScope(topology, scope)) == 0 {
 			errs = append(
 				errs,
 				fmt.Errorf("scope %s have no nodes, datacenter or rack might be incorrect", scope.String()),
@@ -782,22 +995,19 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 // CheckIfRackDatacenterFeatureIsSupported checks whether the connected Alternator
 // cluster supports rack/datacenter-aware features.
 func (aln *AlternatorLiveNodes) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
-	baseURI := aln.nextAsURLWithPath("/localnodes", "")
-	fakeRackURI := aln.nextAsURLWithPath("/localnodes", "rack=fakeRack")
-
-	hostsWithFakeRack, err := aln.getNodes(context.Background(), fakeRackURI)
+	if aln.staticTopology {
+		return false, nil
+	}
+	topology, err := aln.discoverTopology(context.Background())
 	if err != nil {
 		return false, err
 	}
-	hostsWithoutRack, err := aln.getNodes(context.Background(), baseURI)
-	if err != nil {
-		return false, err
+	if len(topology) == 0 {
+		return false, errors.New("topology discovery returned no nodes")
 	}
-	if len(hostsWithoutRack) == 0 {
-		return false, errors.New("host returned empty list")
-	}
-
-	return len(hostsWithFakeRack) != len(hostsWithoutRack), nil
+	return slices.ContainsFunc(topology, func(node TopologyNode) bool {
+		return node.Datacenter != "" && node.Rack != ""
+	}), nil
 }
 
 // ReportNodeError reports an error that occurred when communicating with a specific node.

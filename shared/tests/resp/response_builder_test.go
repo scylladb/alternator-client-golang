@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/scylladb/alternator-client-golang/shared/tests/ct"
@@ -199,30 +200,6 @@ func TestResponseBuilder_MultipleHeaders(t *testing.T) {
 	}
 }
 
-func TestAlternatorNodesResponse(t *testing.T) {
-	t.Parallel()
-
-	req := httptest.NewRequest("GET", "/localnodes", nil)
-	nodes := []string{"node1.local", "node2.local", "node3.local"}
-
-	resp, err := AlternatorNodesResponse(nodes, req)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if resp.StatusCode != 200 {
-		t.Errorf("expected status 200, got %d", resp.StatusCode)
-	}
-	if resp.Header.Get("Content-Type") != "application/json" {
-		t.Errorf("expected Content-Type application/json, got %s", resp.Header.Get("Content-Type"))
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	expectedBody := `["node1.local","node2.local","node3.local"]`
-	if string(body) != expectedBody {
-		t.Errorf("expected body %s, got %s", expectedBody, string(body))
-	}
-}
-
 func TestHealthCheckResponse(t *testing.T) {
 	t.Parallel()
 
@@ -269,6 +246,64 @@ func TestDynamoDBListTablesResponse(t *testing.T) {
 	}
 }
 
+func TestDynamoDBSystemTableResponses(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest("POST", "/", nil)
+	local, err := DynamoDBSystemLocalResponse(TopologyNode{
+		Address:    "2001:db8::1",
+		Datacenter: "dc1",
+		Rack:       "rack1",
+	}, req)
+	if err != nil {
+		t.Fatalf("DynamoDBSystemLocalResponse returned error: %v", err)
+	}
+	localBody, err := io.ReadAll(local.Body)
+	if err != nil {
+		t.Fatalf("failed to read local response: %v", err)
+	}
+	if !strings.Contains(string(localBody), `"rpc_address":{"S":"2001:db8::1"}`) ||
+		!strings.Contains(string(localBody), `"data_center":{"S":"dc1"}`) {
+		t.Fatalf("unexpected local response body: %s", localBody)
+	}
+
+	peers, err := DynamoDBSystemPeersResponse([]TopologyNode{
+		{Address: "10.0.0.2", Datacenter: "dc1", Rack: "rack2"},
+	}, req)
+	if err != nil {
+		t.Fatalf("DynamoDBSystemPeersResponse returned error: %v", err)
+	}
+	peersBody, err := io.ReadAll(peers.Body)
+	if err != nil {
+		t.Fatalf("failed to read peers response: %v", err)
+	}
+	if !strings.Contains(string(peersBody), `"peer":{"S":"10.0.0.2"}`) ||
+		!strings.Contains(string(peersBody), `"rack":{"S":"rack2"}`) {
+		t.Fatalf("unexpected peers response body: %s", peersBody)
+	}
+}
+
+func TestDynamoDBScanResponseIncludesPaginationKey(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest("POST", "/", nil)
+	response, err := DynamoDBScanResponse(
+		[]map[string]any{{"peer": map[string]string{"S": "10.0.0.2"}}},
+		map[string]any{"peer": map[string]string{"S": "10.0.0.2"}},
+		req,
+	)
+	if err != nil {
+		t.Fatalf("DynamoDBScanResponse returned error: %v", err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	if !strings.Contains(string(body), `"LastEvaluatedKey":{"peer":{"S":"10.0.0.2"}}`) {
+		t.Fatalf("pagination key missing from response: %s", body)
+	}
+}
+
 func TestResponseBuilder_ChainCallPatterns(t *testing.T) {
 	t.Parallel()
 
@@ -276,7 +311,7 @@ func TestResponseBuilder_ChainCallPatterns(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/test", nil)
 
-	// Pattern 1: Alternator node discovery
+	// Pattern 1: JSON response
 	resp1, err := New().
 		OK().
 		ContentType(ct.JSON).
@@ -285,7 +320,7 @@ func TestResponseBuilder_ChainCallPatterns(t *testing.T) {
 		Build()
 
 	if err != nil || resp1.StatusCode != 200 {
-		t.Error("Alternator nodes pattern failed")
+		t.Error("JSON response pattern failed")
 	}
 
 	// Pattern 2: Health check

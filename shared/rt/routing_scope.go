@@ -22,7 +22,10 @@
 // query fragment that can be used to filter candidate “local” nodes.
 package rt
 
-import "fmt"
+import (
+	"fmt"
+	"net/url"
+)
 
 // Scope describes a routing locality target and how to fall back when no
 // nodes match the current scope.
@@ -47,6 +50,31 @@ type Scope interface {
 	// to be consumed by node-selection code (e.g. "dc=us-east&rack=r1",
 	// "dc=us-east", or "").
 	GetLocalNodesQuery() string
+}
+
+// Matches reports whether a node in datacenter and rack belongs to scope.
+// It intentionally interprets GetLocalNodesQuery instead of relying on concrete
+// scope types so existing custom Scope implementations remain compatible.
+func Matches(scope Scope, datacenter, rack string) bool {
+	if scope == nil {
+		return false
+	}
+	values, err := url.ParseQuery(scope.GetLocalNodesQuery())
+	if err != nil {
+		return false
+	}
+	for key := range values {
+		if key != "dc" && key != "rack" {
+			return false
+		}
+	}
+	if datacenters, ok := values["dc"]; ok && (len(datacenters) != 1 || datacenters[0] != datacenter) {
+		return false
+	}
+	if racks, ok := values["rack"]; ok && (len(racks) != 1 || racks[0] != rack) {
+		return false
+	}
+	return true
 }
 
 // RackScope targets a specific rack within a datacenter.
@@ -89,7 +117,7 @@ func (r RackScope) Fallback() Scope {
 
 // GetLocalNodesQuery implements Scope. It returns "dc=<dc>&rack=<rack>".
 func (r RackScope) GetLocalNodesQuery() string {
-	return fmt.Sprintf("dc=%s&rack=%s", r.datacenter, r.rack)
+	return url.Values{"dc": {r.datacenter}, "rack": {r.rack}}.Encode()
 }
 
 var _ Scope = &RackScope{}
@@ -129,7 +157,7 @@ func (d DCScope) Fallback() Scope {
 
 // GetLocalNodesQuery implements Scope. It returns "dc=<dc>".
 func (d DCScope) GetLocalNodesQuery() string {
-	return fmt.Sprintf("dc=%s", d.datacenter)
+	return url.Values{"dc": {d.datacenter}}.Encode()
 }
 
 var _ Scope = &DCScope{}
