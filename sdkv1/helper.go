@@ -18,8 +18,8 @@ ScyllaDB's Alternator, a DynamoDB-compatible API. It wraps dynamic node discover
 routing, and secure configuration options to transparently load balance requests across Alternator nodes.
 
 Deprecated: use package github.com/scylladb/alternator-client-golang/sdkv2 instead.
-AWS SDK for Go v1 support is retained only for legacy users. New features are developed for SDK v2,
-which is the more feature-rich helper for new applications.
+AWS SDK for Go v1 support is retained only for legacy users and receives compatibility and maintenance fixes.
+New user-facing features are developed for SDK v2, which is the more feature-rich helper for new applications.
 
 Key Features:
   - Rack/datacenter-aware load balancing via AlternatorLiveNodes.
@@ -55,6 +55,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"slices"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -236,8 +237,9 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 //
 // Deprecated: use github.com/scylladb/alternator-client-golang/sdkv2.Helper instead.
 type Helper struct {
-	nodes AlternatorNodesSource
-	cfg   shared.Config
+	nodes        AlternatorNodesSource
+	initialNodes []string
+	cfg          shared.Config
 }
 
 // NewHelper creates a new Helper instance configured with the provided initial Alternator nodes, in a form of ip or dns name (without port)
@@ -251,14 +253,20 @@ func NewHelper(initialNodes []string, options ...Option) (*Helper, error) {
 		opt(cfg)
 	}
 
-	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	topologyDiscoverer, err := newFixedEndpointTopologyDiscoverer(*cfg)
+	if err != nil {
+		return nil, err
+	}
+	alnOptions := append(cfg.ToALNOptions(), shared.WithALNTopologyDiscoverer(topologyDiscoverer))
+	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, alnOptions...)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Helper{
-		nodes: nodes,
-		cfg:   *cfg,
+		nodes:        nodes,
+		initialNodes: slices.Clone(initialNodes),
+		cfg:          *cfg,
 	}, nil
 }
 
@@ -275,7 +283,7 @@ func (lb *Helper) GetNodes() []url.URL {
 
 // GetActiveNodes returns the list of currently active Alternator node URLs.
 func (lb *Helper) GetActiveNodes() []url.URL {
-	return lb.nodes.GetNodes()
+	return lb.nodes.GetActiveNodes()
 }
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
@@ -295,13 +303,13 @@ func (lb *Helper) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
 	return lb.nodes.CheckIfRackDatacenterFeatureIsSupported()
 }
 
-// Start begins background routines used for periodic node discovery and updates.
-// It is not required to start if automatically on first API call
+// Start begins background routines used for periodic node discovery and health recovery.
+// Request-driven topology refresh starts automatically, but periodic health recovery requires Start.
 func (lb *Helper) Start() {
 	lb.nodes.Start()
 }
 
-// Stop stops background routines used for periodic node discovery and updates.
+// Stop permanently stops background routines. A stopped helper cannot be restarted.
 func (lb *Helper) Stop() {
 	lb.nodes.Stop()
 }
@@ -313,28 +321,31 @@ func (lb *Helper) GetMaxIdleHTTPConnectionsPerHost() int {
 
 // awsConfig produces a conf for the AWS SDK that will integrate the alternator loadbalancing with the AWS SDK.
 func (lb *Helper) awsConfig() (aws.Config, error) {
-	cfg := aws.Config{
-		Endpoint: aws.String(
-			fmt.Sprintf("%s://%s:%d", lb.cfg.Scheme, "dynamodb.fake.alterntor.cluster.node", lb.cfg.Port),
-		),
-		// Region is used in the signature algorithm so prevent request sent
-		// to one region to be forward by an attacker to a different region.
-		// But Alternator doesn't check it. It can be anything.
-		Region: aws.String(lb.cfg.AWSRegion),
-	}
-
-	if lb.cfg.AccessKeyID != "" && lb.cfg.SecretAccessKey != "" {
-		// The third credential below, the session token, is only used for
-		// temporary credentials, and is not supported by Alternator anyway.
-		cfg.Credentials = credentials.NewStaticCredentials(lb.cfg.AccessKeyID, lb.cfg.SecretAccessKey, "")
-	}
-
-	cfg.HTTPClient = &http.Client{
+	endpoint := fmt.Sprintf("%s://%s:%d", lb.cfg.Scheme, "dynamodb.fake.alterntor.cluster.node", lb.cfg.Port)
+	httpClient := &http.Client{
 		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(lb.cfg)),
 		Timeout:   lb.cfg.HTTPClientTimeout,
 	}
+	return configuredAWSConfig(lb.cfg, endpoint, httpClient)
+}
 
-	customizers, err := shared.ConvertToAWSConfigOptions[func(*aws.Config)](lb.cfg.AWSConfigOptions)
+func configuredAWSConfig(config shared.Config, endpoint string, httpClient *http.Client) (aws.Config, error) {
+	cfg := aws.Config{
+		Endpoint: aws.String(endpoint),
+		// Region is used in the signature algorithm so prevent request sent
+		// to one region to be forward by an attacker to a different region.
+		// But Alternator doesn't check it. It can be anything.
+		Region:     aws.String(config.AWSRegion),
+		HTTPClient: httpClient,
+	}
+
+	if config.AccessKeyID != "" && config.SecretAccessKey != "" {
+		// The third credential below, the session token, is only used for
+		// temporary credentials, and is not supported by Alternator anyway.
+		cfg.Credentials = credentials.NewStaticCredentials(config.AccessKeyID, config.SecretAccessKey, "")
+	}
+
+	customizers, err := shared.ConvertToAWSConfigOptions[func(*aws.Config)](config.AWSConfigOptions)
 	if err != nil {
 		return aws.Config{}, err
 	}
@@ -355,16 +366,28 @@ func (lb *Helper) newAWSSession() (*session.Session, error) {
 	})
 }
 
-// Update takes config of current helper, updates its config and creates a new helper with updated config
+// Update takes config of current helper, updates its config and creates a new helper with updated config.
+// The returned helper owns an independent live-node source and must be stopped separately.
+// It panics if the updated node source cannot be constructed.
 func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg := lb.cfg
 	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	topologyDiscoverer, err := newFixedEndpointTopologyDiscoverer(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("sdkv1: update topology discovery config: %v", err))
+	}
+	alnOptions := append(cfg.ToALNOptions(), shared.WithALNTopologyDiscoverer(topologyDiscoverer))
+	nodes, err := shared.NewAlternatorLiveNodes(lb.initialNodes, alnOptions...)
+	if err != nil {
+		panic(fmt.Sprintf("sdkv1: rebuild live-node source: %v", err))
+	}
 	return &Helper{
-		nodes: lb.nodes,
-		cfg:   cfg,
+		nodes:        nodes,
+		initialNodes: slices.Clone(lb.initialNodes),
+		cfg:          cfg,
 	}
 }
 
@@ -465,6 +488,7 @@ func setRequestNode(ctx context.Context, node url.URL) context.Context {
 
 func (lb *Helper) injectQueryPlan(client *dynamodb.DynamoDB) {
 	client.Handlers.Validate.PushFront(func(r *request.Request) {
+		lb.triggerTopologyRefresh()
 		r.SetContext(context.WithValue(r.Context(), queryPlanKey, shared.NewLazyQueryPlan(lb.nodes)))
 	})
 
@@ -484,4 +508,10 @@ func (lb *Helper) injectQueryPlan(client *dynamodb.DynamoDB) {
 		r.HTTPRequest.URL.Host = node.Host
 		r.HTTPRequest.Host = node.Host
 	})
+}
+
+func (lb *Helper) triggerTopologyRefresh() {
+	if trigger, ok := lb.nodes.(interface{ TriggerUpdate() }); ok {
+		trigger.TriggerUpdate()
+	}
 }

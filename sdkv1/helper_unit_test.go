@@ -44,7 +44,7 @@ func TestOptions(t *testing.T) {
 
 		var (
 			wrapperCalled      atomic.Int32
-			alternatorRequests atomic.Int32
+			topologyRequests   atomic.Int32
 			nodeHealthRequests atomic.Int32
 			dynamodbRequests   atomic.Int32
 			lastRequest        atomic.Pointer[http.Request]
@@ -54,10 +54,10 @@ func TestOptions(t *testing.T) {
 		const port = 8080
 
 		mockTransport := &mocks.MockRoundTripper{
-			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-				alternatorRequests.Add(1)
+			TopologyRequest: func(req *http.Request) (*http.Response, error) {
+				topologyRequests.Add(1)
 				lastRequest.Store(req)
-				return resp.AlternatorNodesResponse(nodes, req)
+				return topologyResponse(nodes)(req)
 			},
 			NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
 				nodeHealthRequests.Add(1)
@@ -89,7 +89,7 @@ func TestOptions(t *testing.T) {
 		}
 		defer h.Stop()
 
-		// Trigger node discovery to make Alternator /localnodes request
+		// Trigger node discovery through the Alternator system tables.
 		err = h.UpdateLiveNodes()
 		if err != nil {
 			t.Fatalf("UpdateLiveNodes returned error: %v", err)
@@ -121,9 +121,9 @@ func TestOptions(t *testing.T) {
 			t.Fatalf("ListTables returned error: %v", err)
 		}
 
-		// wrapper should be called twice, one time for client.ListTables request, another time for AlternatorLiveNodes
-		if wrapperCalled.Load() != 2 {
-			t.Errorf("expected wrapper to be called twice")
+		// The wrapper is installed on health, topology-discovery, and application transports.
+		if wrapperCalled.Load() != 3 {
+			t.Errorf("wrapper called %d times, want 3", wrapperCalled.Load())
 		}
 
 		if len(result.TableNames) != 2 {
@@ -133,9 +133,9 @@ func TestOptions(t *testing.T) {
 			t.Errorf("expected first table name to be 'test-table-1', got %s", *result.TableNames[0])
 		}
 
-		// Verify mock handled both Alternator and DynamoDB requests
-		if alternatorRequests.Load() == 0 {
-			t.Errorf("expected mock to receive Alternator /localnodes requests")
+		// Verify discovery used signed DynamoDB scans.
+		if topologyRequests.Load() < 2 {
+			t.Errorf("mock received %d topology Scan requests, want at least 2", topologyRequests.Load())
 		}
 		if dynamodbRequests.Load() != 1 {
 			t.Errorf("expected mock to receive DynamoDB API requests")
@@ -163,8 +163,8 @@ func TestOptions(t *testing.T) {
 							t.Parallel()
 
 							var (
-								alternatorRequests atomic.Int32
-								dynamodbRequests   []string
+								topologyRequests atomic.Int32
+								dynamodbRequests []string
 							)
 
 							var nodes []string
@@ -174,9 +174,9 @@ func TestOptions(t *testing.T) {
 							}
 
 							mockTransport := &mocks.MockRoundTripper{
-								AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-									alternatorRequests.Add(1)
-									return resp.AlternatorNodesResponse(nodes, req)
+								TopologyRequest: func(req *http.Request) (*http.Response, error) {
+									topologyRequests.Add(1)
+									return topologyResponse(nodes)(req)
 								},
 								NodeHealthRequest: resp.HealthCheckResponse,
 								DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
@@ -216,8 +216,8 @@ func TestOptions(t *testing.T) {
 								t.Fatalf("expected ListTables to fail due to mocked 500 response")
 							}
 
-							if alternatorRequests.Load() == 0 {
-								t.Fatalf("expected Alternator discovery call to happen")
+							if topologyRequests.Load() < 2 {
+								t.Fatalf("received %d topology Scan requests, want at least 2", topologyRequests.Load())
 							}
 
 							maxRetriesVal := aws.IntValue(maxRetries)
@@ -276,15 +276,15 @@ func TestOptions(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				var (
-					alternatorRequests atomic.Int32
-					capturedHeaders    atomic.Pointer[http.Header]
+					topologyRequests atomic.Int32
+					capturedHeaders  atomic.Pointer[http.Header]
 				)
 
 				nodes := []string{"node1.local"}
 				mockTransport := &mocks.MockRoundTripper{
-					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-						alternatorRequests.Add(1)
-						return resp.AlternatorNodesResponse(nodes, req)
+					TopologyRequest: func(req *http.Request) (*http.Response, error) {
+						topologyRequests.Add(1)
+						return topologyResponse(nodes)(req)
 					},
 					NodeHealthRequest: resp.HealthCheckResponse,
 					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
@@ -323,8 +323,8 @@ func TestOptions(t *testing.T) {
 					t.Fatalf("ListTables returned error: %v", err)
 				}
 
-				if alternatorRequests.Load() == 0 {
-					t.Fatal("expected Alternator discovery call to happen")
+				if topologyRequests.Load() < 2 {
+					t.Fatalf("received %d topology Scan requests, want at least 2", topologyRequests.Load())
 				}
 
 				headers := capturedHeaders.Load()
@@ -364,18 +364,18 @@ func TestOptions(t *testing.T) {
 				t.Parallel()
 
 				var (
-					alternatorRequests atomic.Int32
-					dynamodbRequests   atomic.Int32
-					capturedHeaders    atomic.Pointer[http.Header]
-					capturedBody       atomic.Pointer[[]byte]
+					topologyRequests atomic.Int32
+					dynamodbRequests atomic.Int32
+					capturedHeaders  atomic.Pointer[http.Header]
+					capturedBody     atomic.Pointer[[]byte]
 				)
 
 				nodes := []string{"node1.local"}
 
 				mockTransport := &mocks.MockRoundTripper{
-					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-						alternatorRequests.Add(1)
-						return resp.AlternatorNodesResponse(nodes, req)
+					TopologyRequest: func(req *http.Request) (*http.Response, error) {
+						topologyRequests.Add(1)
+						return topologyResponse(nodes)(req)
 					},
 					NodeHealthRequest: resp.HealthCheckResponse,
 					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
@@ -442,6 +442,9 @@ func TestOptions(t *testing.T) {
 				if dynamodbRequests.Load() != 1 {
 					t.Errorf("Expected 1 DynamoDB request, got %d", dynamodbRequests.Load())
 				}
+				if topologyRequests.Load() < 2 {
+					t.Errorf("received %d topology Scan requests, want at least 2", topologyRequests.Load())
+				}
 
 				// Verify body was decompressed correctly
 				body := capturedBody.Load()
@@ -476,6 +479,36 @@ func TestOptions(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestHelperUpdateRebuildsSourceForTopologyDiscoveryConfigChanges(t *testing.T) {
+	t.Parallel()
+
+	h, err := NewHelper([]string{"seed.local"}, WithCredentials("key", "secret"))
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	t.Cleanup(h.Stop)
+
+	tests := []struct {
+		name   string
+		option Option
+	}{
+		{name: "credentials", option: WithCredentials("rotated", "rotated-secret")},
+		{name: "region", option: WithAWSRegion("rotated-region")},
+		{name: "HTTP timeout", option: WithHTTPClientTimeout(time.Second)},
+		{name: "AWS config", option: WithAWSConfigOptions(func(*aws.Config) {})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			updated := h.Update(tt.option)
+			t.Cleanup(updated.Stop)
+			if updated.nodes == h.nodes {
+				t.Fatal("topology discovery config change reused the original node source")
+			}
+		})
+	}
 }
 
 func TestDynamoDBNonOKResponsesKeepConnectionReusable(t *testing.T) {
@@ -568,4 +601,41 @@ func splitTestServerHostPort(t *testing.T, server *httptest.Server) (string, int
 		t.Fatalf("failed to parse server port: %v", err)
 	}
 	return host, port
+}
+
+func topologyResponse(nodes []string) func(*http.Request) (*http.Response, error) {
+	return func(req *http.Request) (*http.Response, error) {
+		table, ok, err := mocks.TopologyTableFromRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("request is not a topology Scan")
+		}
+
+		const (
+			datacenter = "dc1"
+			rack       = "rack1"
+		)
+		if table == resp.SystemLocalTable {
+			return resp.DynamoDBSystemLocalResponse(resp.TopologyNode{
+				Address:    req.URL.Hostname(),
+				Datacenter: datacenter,
+				Rack:       rack,
+			}, req)
+		}
+
+		peers := make([]resp.TopologyNode, 0, len(nodes))
+		for _, node := range nodes {
+			if node == req.URL.Hostname() {
+				continue
+			}
+			peers = append(peers, resp.TopologyNode{
+				Address:    node,
+				Datacenter: datacenter,
+				Rack:       rack,
+			})
+		}
+		return resp.DynamoDBSystemPeersResponse(peers, req)
+	}
 }

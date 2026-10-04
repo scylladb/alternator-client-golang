@@ -16,357 +16,171 @@ package shared
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
-
-	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 )
 
-func TestAlternatorLiveNodes_DNSAddressFamilies(t *testing.T) {
-	tests := []struct {
-		name        string
-		listenIPs   []string
-		dnsIPs      []string
-		learnedIPs  []string
-		wantFailure bool
-	}{
-		{
-			name:       "IPv6-only DNS",
-			listenIPs:  []string{"::1"},
-			dnsIPs:     []string{"::1"},
-			learnedIPs: []string{"::1"},
-		},
-		{
-			name:       "dual-stack DNS with both families reachable",
-			listenIPs:  []string{"127.0.0.1", "::1"},
-			dnsIPs:     []string{"127.0.0.1", "::1"},
-			learnedIPs: []string{"127.0.0.1", "::1"},
-		},
-		{
-			name:       "broken IPv6 record falls back to IPv4",
-			listenIPs:  []string{"127.0.0.1"},
-			dnsIPs:     []string{"2001:db8::dead", "127.0.0.1"},
-			learnedIPs: []string{"127.0.0.1"},
-		},
-		{
-			name:       "broken IPv4 record falls back to IPv6",
-			listenIPs:  []string{"::1"},
-			dnsIPs:     []string{"192.0.2.123", "::1"},
-			learnedIPs: []string{"::1"},
-		},
-		{
-			name:        "all DNS records unavailable",
-			dnsIPs:      []string{"192.0.2.123", "2001:db8::dead"},
-			wantFailure: true,
-		},
+func TestAlternatorLiveNodesPassesLogicalDNSEntrypointToDiscoverer(t *testing.T) {
+	t.Parallel()
+
+	var gotEndpoint url.URL
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"entrypoint.test"},
+		WithALNPort(8043),
+		WithALNScheme("https"),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(_ context.Context, endpoint url.URL) ([]TopologyNode, error) {
+				gotEndpoint = endpoint
+				return []TopologyNode{{Address: "node-a.internal"}}, nil
+			},
+		)),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	if gotEndpoint.String() != "https://entrypoint.test:8043" {
+		t.Fatalf("discovery endpoint got %q, want logical DNS entrypoint", gotEndpoint.String())
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"node-a.internal"}) {
+		t.Fatalf("discovered nodes got %v, want [node-a.internal]", got)
+	}
+}
+
+func TestAlternatorLiveNodesIPv6LiteralDiscoversAndRoutesRequests(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			listeners, port := listenOnAddressFamilies(t, tt.listenIPs)
-			var discoveryRequests atomic.Int32
-			var operationRequests atomic.Int32
-			servers := startAddressFamilyServers(
-				t,
-				listeners,
-				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					switch r.URL.Path {
-					case "/localnodes":
-						discoveryRequests.Add(1)
-						_ = json.NewEncoder(w).Encode(tt.learnedIPs)
-					case "/":
-						operationRequests.Add(1)
-						_, _ = w.Write([]byte("OK"))
-					default:
-						http.Error(w, "unexpected path", http.StatusNotFound)
+	var operationRequests atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != listener.Addr().String() {
+			t.Errorf("request Host header got %q, want %q", r.Host, listener.Addr().String())
+		}
+		operationRequests.Add(1)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	_, port := splitServerHostPort(t, server.URL)
+	var discoveryCalls atomic.Int32
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"::1"},
+		WithALNPort(port),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(_ context.Context, endpoint url.URL) ([]TopologyNode, error) {
+				discoveryCalls.Add(1)
+				wantEndpoint := "http://" + listener.Addr().String()
+				if endpoint.String() != wantEndpoint {
+					t.Fatalf("IPv6 discovery endpoint got %q, want %q", endpoint.String(), wantEndpoint)
+				}
+				return []TopologyNode{{Address: "::1"}}, nil
+			},
+		)),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	wantURL := "http://" + listener.Addr().String()
+	initialNode := aln.NextNode()
+	if got := initialNode.String(); got != wantURL {
+		t.Fatalf("initial IPv6 node URL got %q, want %q", got, wantURL)
+	}
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	discoveredNode := aln.NextNode()
+	if got := discoveredNode.String(); got != wantURL {
+		t.Fatalf("discovered IPv6 node URL got %q, want %q", got, wantURL)
+	}
+
+	routedNode := aln.NextNode()
+	response, err := aln.httpClient.Get(routedNode.String())
+	if err != nil {
+		t.Fatalf("request through discovered IPv6 node failed: %v", err)
+	}
+	drainAndCloseResponseBody(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("request through discovered IPv6 node returned HTTP %d", response.StatusCode)
+	}
+	if discoveryCalls.Load() != 1 {
+		t.Fatalf("discovery calls got %d, want 1", discoveryCalls.Load())
+	}
+	if operationRequests.Load() != 1 {
+		t.Fatalf("operation requests got %d, want 1", operationRequests.Load())
+	}
+}
+
+func TestAlternatorLiveNodesFallsBackToOriginalIPv6Entrypoint(t *testing.T) {
+	t.Parallel()
+
+	var firstRefresh atomic.Bool
+	firstRefresh.Store(true)
+	var seedCalls atomic.Int32
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"2001:db8::1"},
+		WithALNPort(8080),
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(_ context.Context, endpoint url.URL) ([]TopologyNode, error) {
+				if firstRefresh.Load() {
+					return []TopologyNode{{Address: "2001:db8::2"}}, nil
+				}
+				switch endpoint.Hostname() {
+				case "2001:db8::2":
+					return nil, errors.New("learned endpoint unavailable")
+				case "2001:db8::1":
+					seedCalls.Add(1)
+					if endpoint.Host != "[2001:db8::1]:8080" {
+						t.Fatalf("IPv6 seed authority got %q", endpoint.Host)
 					}
-				}),
-			)
-			for _, server := range servers {
-				defer server.Close()
-			}
-
-			if port == 0 {
-				port = unusedLoopbackPort(t)
-			}
-			resolver := resolverReturning(t, "entrypoint.test", tt.dnsIPs)
-			dialer := &net.Dialer{
-				Timeout:       300 * time.Millisecond,
-				FallbackDelay: 10 * time.Millisecond,
-				Resolver:      resolver,
-			}
-			nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-			nodeHealthConfig.Disabled = true
-			aln, err := NewAlternatorLiveNodes(
-				[]string{"entrypoint.test"},
-				WithALNPort(port),
-				WithALNUpdatePeriod(0),
-				WithALNIdleUpdatePeriod(-1),
-				WithALNHTTPClientTimeout(time.Second),
-				WithALNNodeHealthStoreConfig(nodeHealthConfig),
-				WithALNHTTPTransportWrapper(func(roundTripper http.RoundTripper) http.RoundTripper {
-					transport := roundTripper.(*http.Transport)
-					transport.Proxy = nil
-					transport.DialContext = dialer.DialContext
-					return transport
-				}),
-			)
-			if err != nil {
-				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-			}
-			defer aln.Stop()
-
-			err = aln.UpdateLiveNodes()
-			if tt.wantFailure {
-				if err == nil {
-					t.Fatal("UpdateLiveNodes succeeded with no reachable DNS records")
+					return []TopologyNode{{Address: "2001:db8::3"}}, nil
+				default:
+					t.Fatalf("unexpected discovery endpoint %q", endpoint.String())
+					return nil, nil
 				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("UpdateLiveNodes returned error: %v", err)
-			}
-			if discoveryRequests.Load() == 0 {
-				t.Fatal("DNS entrypoint did not receive /localnodes request")
-			}
-
-			gotHosts := hostnames(aln.GetNodes())
-			slices.Sort(gotHosts)
-			wantHosts := slices.Clone(tt.learnedIPs)
-			slices.Sort(wantHosts)
-			if !slices.Equal(gotHosts, wantHosts) {
-				t.Fatalf("discovered hosts got %v, want %v", gotHosts, wantHosts)
-			}
-			for _, node := range aln.GetNodes() {
-				response, requestErr := aln.httpClient.Get(node.String())
-				if requestErr != nil {
-					t.Fatalf("normal request through learned node %s failed: %v", node.String(), requestErr)
-				}
-				drainAndCloseResponseBody(response.Body)
-				if response.StatusCode != http.StatusOK {
-					t.Fatalf(
-						"normal request through learned node %s returned HTTP %d",
-						node.String(),
-						response.StatusCode,
-					)
-				}
-			}
-			if got, want := operationRequests.Load(), int32(len(tt.learnedIPs)); got != want {
-				t.Fatalf("normal operation requests got %d, want %d", got, want)
-			}
-		})
-	}
-}
-
-func listenOnAddressFamilies(t *testing.T, ips []string) ([]net.Listener, int) {
-	t.Helper()
-	if len(ips) == 0 {
-		return nil, 0
-	}
-
-	listeners := make([]net.Listener, 0, len(ips))
-	port := 0
-	for _, ip := range ips {
-		network := "tcp4"
-		if net.ParseIP(ip).To4() == nil {
-			network = "tcp6"
-		}
-		listener, err := net.Listen(network, net.JoinHostPort(ip, strconv.Itoa(port)))
-		if err != nil {
-			for _, opened := range listeners {
-				_ = opened.Close()
-			}
-			if network == "tcp6" {
-				t.Skipf("IPv6 loopback is unavailable: %v", err)
-			}
-			t.Fatalf("failed to listen on %s: %v", ip, err)
-		}
-		listeners = append(listeners, listener)
-		if port == 0 {
-			_, portString, splitErr := net.SplitHostPort(listener.Addr().String())
-			if splitErr != nil {
-				t.Fatalf("failed to split listener address: %v", splitErr)
-			}
-			port, err = strconv.Atoi(portString)
-			if err != nil {
-				t.Fatalf("failed to parse listener port: %v", err)
-			}
-		}
-	}
-	return listeners, port
-}
-
-func startAddressFamilyServers(t *testing.T, listeners []net.Listener, handler http.Handler) []*httptest.Server {
-	t.Helper()
-	servers := make([]*httptest.Server, 0, len(listeners))
-	for _, listener := range listeners {
-		server := httptest.NewUnstartedServer(handler)
-		server.Listener = listener
-		server.Start()
-		servers = append(servers, server)
-	}
-	return servers
-}
-
-func unusedLoopbackPort(t *testing.T) int {
-	t.Helper()
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+			},
+		)),
+	)
 	if err != nil {
-		t.Fatalf("failed to reserve a loopback port: %v", err)
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
 	}
-	_, portString, err := net.SplitHostPort(listener.Addr().String())
-	_ = listener.Close()
-	if err != nil {
-		t.Fatalf("failed to split reserved loopback address: %v", err)
-	}
-	port, err := strconv.Atoi(portString)
-	if err != nil {
-		t.Fatalf("failed to parse reserved loopback port: %v", err)
-	}
-	return port
-}
+	defer aln.Stop()
 
-func resolverReturning(t *testing.T, hostname string, ips []string) *net.Resolver {
-	t.Helper()
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(_ context.Context, network, _ string) (net.Conn, error) {
-			client, server := net.Pipe()
-			tcp := strings.HasPrefix(network, "tcp")
-			go serveDNSQuery(t, server, tcp, hostname, ips)
-			if tcp {
-				return client, nil
-			}
-			return &pipePacketConn{Conn: client}, nil
-		},
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("first UpdateLiveNodes returned error: %v", err)
 	}
-}
-
-type pipePacketConn struct {
-	net.Conn
-}
-
-func (c *pipePacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	n, err := c.Read(buffer)
-	return n, c.RemoteAddr(), err
-}
-
-func (c *pipePacketConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
-	return c.Write(buffer)
-}
-
-func serveDNSQuery(t *testing.T, conn net.Conn, tcp bool, hostname string, ips []string) {
-	t.Helper()
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(time.Second))
-	query := make([]byte, 2048)
-	n, err := conn.Read(query)
-	if err != nil {
-		return
+	firstRefresh.Store(false)
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("recovery UpdateLiveNodes returned error: %v", err)
 	}
-	query = query[:n]
-	if tcp {
-		response, responseErr := dnsResponse(query[2:], hostname, ips)
-		if responseErr != nil {
-			t.Errorf("failed to create DNS response: %v", responseErr)
-			return
-		}
-		framed := make([]byte, len(response)+2)
-		binary.BigEndian.PutUint16(framed[:2], uint16(len(response)))
-		copy(framed[2:], response)
-		_, _ = conn.Write(framed)
-		return
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"2001:db8::3"}) {
+		t.Fatalf("recovery nodes got %v, want [2001:db8::3]", got)
 	}
-	response, responseErr := dnsResponse(query, hostname, ips)
-	if responseErr != nil {
-		t.Errorf("failed to create DNS response: %v", responseErr)
-		return
+	if seedCalls.Load() != 1 {
+		t.Fatalf("original seed calls got %d, want 1", seedCalls.Load())
 	}
-	_, _ = conn.Write(response)
-}
-
-func dnsResponse(query []byte, hostname string, ips []string) ([]byte, error) {
-	if len(query) < 17 {
-		return nil, fmt.Errorf("short DNS query")
-	}
-	offset := 12
-	var labels []string
-	for {
-		if offset >= len(query) {
-			return nil, fmt.Errorf("truncated DNS name")
-		}
-		length := int(query[offset])
-		offset++
-		if length == 0 {
-			break
-		}
-		if offset+length > len(query) {
-			return nil, fmt.Errorf("truncated DNS label")
-		}
-		labels = append(labels, string(query[offset:offset+length]))
-		offset += length
-	}
-	if offset+4 > len(query) {
-		return nil, fmt.Errorf("truncated DNS question")
-	}
-	if got := joinDNSLabels(labels); got != hostname {
-		return nil, fmt.Errorf("DNS query for %q, want %q", got, hostname)
-	}
-	questionEnd := offset + 4
-	queryType := binary.BigEndian.Uint16(query[offset : offset+2])
-
-	var answers [][]byte
-	for _, value := range ips {
-		ip := net.ParseIP(value)
-		var record []byte
-		switch queryType {
-		case 1:
-			record = ip.To4()
-		case 28:
-			if ip.To4() == nil {
-				record = ip.To16()
-			}
-		}
-		if record != nil {
-			answers = append(answers, record)
-		}
-	}
-
-	response := make([]byte, 12, 12+questionEnd-12+len(answers)*28)
-	copy(response[:2], query[:2])
-	binary.BigEndian.PutUint16(response[2:4], 0x8180)
-	binary.BigEndian.PutUint16(response[4:6], 1)
-	binary.BigEndian.PutUint16(response[6:8], uint16(len(answers)))
-	response = append(response, query[12:questionEnd]...)
-	for _, answer := range answers {
-		header := make([]byte, 12)
-		binary.BigEndian.PutUint16(header[0:2], 0xc00c)
-		binary.BigEndian.PutUint16(header[2:4], queryType)
-		binary.BigEndian.PutUint16(header[4:6], 1)
-		binary.BigEndian.PutUint16(header[10:12], uint16(len(answer)))
-		response = append(response, header...)
-		response = append(response, answer...)
-	}
-	return response, nil
-}
-
-func joinDNSLabels(labels []string) string {
-	if len(labels) == 0 {
-		return ""
-	}
-	out := labels[0]
-	for _, label := range labels[1:] {
-		out += "." + label
-	}
-	return out
 }

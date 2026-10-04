@@ -25,6 +25,20 @@ import (
 	"github.com/scylladb/alternator-client-golang/shared/tests/ct"
 )
 
+const (
+	// SystemLocalTable is the Alternator virtual-table name for system.local.
+	SystemLocalTable = ".scylla.alternator.system.local"
+	// SystemPeersTable is the Alternator virtual-table name for system.peers.
+	SystemPeersTable = ".scylla.alternator.system.peers"
+)
+
+// TopologyNode describes a row returned by the Alternator system-table test helpers.
+type TopologyNode struct {
+	Address    string
+	Datacenter string
+	Rack       string
+}
+
 // Builder provides a fluent API for building HTTP responses for testing.
 // It supports chaining methods to construct responses with various status codes,
 // headers, and body content.
@@ -157,8 +171,8 @@ func (rb *Builder) Build() (*http.Response, error) {
 
 // Common response patterns for convenience
 
-// AlternatorNodesResponse creates a response for /localnodes endpoint
-// with the given list of node hostnames.
+// AlternatorNodesResponse builds the legacy node-list response retained for test compatibility.
+// Production topology discovery no longer uses this endpoint shape.
 func AlternatorNodesResponse(nodes []string, req *http.Request) (*http.Response, error) {
 	return New().
 		OK().
@@ -188,6 +202,61 @@ func DynamoDBListTablesResponse(tableNames []string, req *http.Request) (*http.R
 		Body(body).
 		Request(req).
 		Build()
+}
+
+// DynamoDBScanResponse creates a mock DynamoDB Scan response.
+func DynamoDBScanResponse(
+	items []map[string]any,
+	lastEvaluatedKey map[string]any,
+	req *http.Request,
+) (*http.Response, error) {
+	body := map[string]any{
+		"Count":        len(items),
+		"ScannedCount": len(items),
+		"Items":        items,
+	}
+	if len(lastEvaluatedKey) != 0 {
+		body["LastEvaluatedKey"] = lastEvaluatedKey
+	}
+	return New().
+		OK().
+		ContentType(ct.DynamoDBJSON).
+		JSONBody(body).
+		Request(req).
+		Build()
+}
+
+// DynamoDBSystemLocalResponse creates a Scan response for system.local.
+func DynamoDBSystemLocalResponse(node TopologyNode, req *http.Request) (*http.Response, error) {
+	items := []map[string]any{
+		{
+			"key":               stringAttribute("local"),
+			"rpc_address":       stringAttribute(node.Address),
+			"broadcast_address": stringAttribute(node.Address),
+			"data_center":       stringAttribute(node.Datacenter),
+			"rack":              stringAttribute(node.Rack),
+		},
+	}
+	return DynamoDBScanResponse(items, nil, req)
+}
+
+// DynamoDBSystemPeersResponse creates a Scan response for system.peers.
+func DynamoDBSystemPeersResponse(nodes []TopologyNode, req *http.Request) (*http.Response, error) {
+	items := make([]map[string]any, 0, len(nodes))
+	for _, node := range nodes {
+		items = append(items, map[string]any{
+			"peer":         stringAttribute(node.Address),
+			"rpc_address":  stringAttribute(node.Address),
+			"preferred_ip": stringAttribute(node.Address),
+			"data_center":  stringAttribute(node.Datacenter),
+			"rack":         stringAttribute(node.Rack),
+		})
+	}
+	return DynamoDBScanResponse(items, nil, req)
+}
+
+func stringAttribute(value string) map[string]string {
+	return map[string]string{"S": value}
 }
 
 // DynamoDBPutItemResponse creates a mock DynamoDB PutItem response

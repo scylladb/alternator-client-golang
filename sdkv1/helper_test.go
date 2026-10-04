@@ -21,10 +21,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"slices"
 	"strconv"
@@ -32,7 +32,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
@@ -51,16 +50,34 @@ var (
 var notFoundErr = new(*dynamodb.ResourceNotFoundException)
 
 func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
-	body := fetchIntegrationLocalNodes(t)
+	target, err := url.Parse("http://" + knownNodes[0] + ":" + strconv.Itoa(httpPort))
+	if err != nil {
+		t.Fatalf("failed to build integration target: %v", err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var topologyRequests atomic.Int32
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("failed to listen on localhost: %v", err)
 	}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/localnodes" {
-			t.Fatalf("unexpected request path %q", r.URL.Path)
+		if r.URL.Path != "/" {
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.Error(w, "unexpected request path", http.StatusBadRequest)
+			return
 		}
-		_, _ = w.Write(body)
+		if r.Method != http.MethodPost || r.Header.Get("X-Amz-Target") != "DynamoDB_20120810.Scan" {
+			t.Errorf("unexpected topology request %s %q", r.Method, r.Header.Get("X-Amz-Target"))
+			http.Error(w, "unexpected topology request", http.StatusBadRequest)
+			return
+		}
+		if authorization := r.Header.Get("Authorization"); !strings.HasPrefix(authorization, "AWS4-HMAC-SHA256 ") {
+			t.Errorf("topology request is not SigV4-signed: %q", authorization)
+			http.Error(w, "unsigned topology request", http.StatusBadRequest)
+			return
+		}
+		topologyRequests.Add(1)
+		proxy.ServeHTTP(w, r)
 	}))
 	server.Listener = listener
 	server.Start()
@@ -81,6 +98,7 @@ func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
 		helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		helper.WithCredentials("whatever", "secret"),
 	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
@@ -93,30 +111,16 @@ func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
 	if len(h.GetNodes()) == 0 {
 		t.Fatalf("UpdateLiveNodes() did not discover any nodes")
 	}
-}
-
-func fetchIntegrationLocalNodes(t *testing.T) []byte {
-	t.Helper()
-	client := &http.Client{Timeout: 5 * time.Second}
-	response, err := client.Get("http://" + knownNodes[0] + ":" + strconv.Itoa(httpPort) + "/localnodes")
-	if err != nil {
-		t.Fatalf("failed to fetch integration /localnodes: %v", err)
+	if topologyRequests.Load() < 2 {
+		t.Fatalf("received %d topology Scan requests, want at least 2", topologyRequests.Load())
 	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("integration /localnodes returned HTTP %d", response.StatusCode)
-	}
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("failed to read integration /localnodes: %v", err)
-	}
-	return body
 }
 
 func TestRoutingFallback(t *testing.T) {
 	h, err := helper.NewHelper(
 		knownNodes,
 		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
 		helper.WithRoutingScope(rt.NewDCScope("wrongDC", rt.NewDCScope("datacenter1", nil))),
 	)
 	if err != nil {
@@ -150,7 +154,12 @@ func TestRoutingFallback(t *testing.T) {
 }
 
 func TestCheckIfRackAndDatacenterSetCorrectly_WrongDC(t *testing.T) {
-	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("wrongDC"))
+	h, err := helper.NewHelper(
+		knownNodes,
+		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
+		helper.WithDatacenter("wrongDC"),
+	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
 	}
@@ -162,7 +171,12 @@ func TestCheckIfRackAndDatacenterSetCorrectly_WrongDC(t *testing.T) {
 }
 
 func TestCheckIfRackAndDatacenterSetCorrectly_CorrectDC(t *testing.T) {
-	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("datacenter1"))
+	h, err := helper.NewHelper(
+		knownNodes,
+		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
+		helper.WithDatacenter("datacenter1"),
+	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
 	}
@@ -177,6 +191,7 @@ func TestCheckIfRackAndDatacenterSetCorrectly_WrongRack(t *testing.T) {
 	h, err := helper.NewHelper(
 		knownNodes,
 		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
 		helper.WithDatacenter("datacenter1"),
 		helper.WithRack("wrongRack"),
 	)
@@ -194,6 +209,7 @@ func TestCheckIfRackAndDatacenterSetCorrectly_CorrectRack(t *testing.T) {
 	h, err := helper.NewHelper(
 		knownNodes,
 		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
 		helper.WithDatacenter("datacenter1"),
 		helper.WithRack("rack1"),
 	)
@@ -208,7 +224,12 @@ func TestCheckIfRackAndDatacenterSetCorrectly_CorrectRack(t *testing.T) {
 }
 
 func TestCheckIfRackDatacenterFeatureIsSupported(t *testing.T) {
-	h, err := helper.NewHelper(knownNodes, helper.WithPort(httpPort), helper.WithDatacenter("datacenter1"))
+	h, err := helper.NewHelper(
+		knownNodes,
+		helper.WithPort(httpPort),
+		helper.WithCredentials("whatever", "secret"),
+		helper.WithDatacenter("datacenter1"),
+	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
 	}
@@ -442,6 +463,7 @@ func TestTLSSessionCache(t *testing.T) {
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
 		helper.WithMaxIdleHTTPConnections(-1), // Make http client not to persist https connection
+		helper.WithCredentials("whatever", "secret"),
 	}
 	t.Run("AlternatorLiveNodes", func(t *testing.T) {
 		cache := newSessionCache()
@@ -513,13 +535,14 @@ func testDynamoDBOperations(t *testing.T, opts ...helper.Option) {
 	t.Helper()
 
 	const tableName = "test_table"
+	opts = append(opts, helper.WithCredentials("whatever", "secret"))
 	h, err := helper.NewHelper(knownNodes, opts...)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
 	}
 	defer h.Stop()
 
-	ddb, err := h.Update(helper.WithCredentials("whatever", "secret")).NewDynamoDB()
+	ddb, err := h.NewDynamoDB()
 	if err != nil {
 		t.Fatalf("failed to create DynamoDB client: %v", err)
 	}

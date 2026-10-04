@@ -186,6 +186,7 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNPort(c.Port),
 		WithALNScheme(c.Scheme),
 		WithALNUpdatePeriod(c.NodesListUpdatePeriod),
+		WithALNIdleUpdatePeriod(c.IdleNodesListUpdatePeriod),
 		WithALNIgnoreServerCertificateError(c.IgnoreServerCertificateError),
 		WithALNMaxIdleHTTPConnections(c.MaxIdleHTTPConnections),
 		WithALNMaxIdleHTTPConnectionsPerHost(c.MaxIdleHTTPConnectionsPerHost),
@@ -194,10 +195,6 @@ func (c *Config) ToALNOptions() []ALNOption {
 		WithALNRoutingScope(c.RoutingScope),
 		WithALNLogger(c.Logger),
 		WithALNNodeHealthStoreConfig(c.NodeHealthStoreConfig),
-	}
-
-	if c.IdleNodesListUpdatePeriod != 0 {
-		out = append(out, WithALNIdleUpdatePeriod(c.IdleNodesListUpdatePeriod))
 	}
 
 	if c.ServerCACertificatePool != nil {
@@ -597,6 +594,15 @@ func NewHTTPTransport(config Config) http.RoundTripper {
 	}
 
 	return transport
+}
+
+// NewTopologyHTTPTransport creates a DynamoDB transport for signed topology reads.
+// Request-body compression and header filtering run after SigV4 signing, so they
+// are disabled here to avoid changing signed request material in transit.
+func NewTopologyHTTPTransport(config Config) http.RoundTripper {
+	config.RequestCompression = nil
+	config.OptimizeHeaders = nil
+	return NewHTTPTransport(config)
 }
 
 // CloneAWSConfigOptions returns a shallow copy of AWSConfigOptions slice

@@ -58,7 +58,7 @@ func TestOptions(t *testing.T) {
 
 		var (
 			wrapperCalled      atomic.Int32
-			alternatorRequests atomic.Int32
+			topologyRequests   atomic.Int32
 			nodeHealthRequests atomic.Int32
 			dynamodbRequests   atomic.Int32
 			lastRequest        atomic.Pointer[http.Request]
@@ -68,10 +68,10 @@ func TestOptions(t *testing.T) {
 		const port = 8080
 
 		mockTransport := &mocks.MockRoundTripper{
-			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-				alternatorRequests.Add(1)
+			TopologyRequest: func(req *http.Request) (*http.Response, error) {
+				topologyRequests.Add(1)
 				lastRequest.Store(req)
-				return resp.AlternatorNodesResponse(nodes, req)
+				return topologyResponse(topologyNodes(nodes), req)
 			},
 			NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
 				nodeHealthRequests.Add(1)
@@ -136,9 +136,9 @@ func TestOptions(t *testing.T) {
 			t.Fatalf("ListTables returned error: %v", err)
 		}
 
-		// wrapper should be called twice, one time for client.ListTables request, another time for AlternatorLiveNodes
-		if wrapperCalled.Load() != 2 {
-			t.Errorf("expected wrapper to be called twice")
+		// The wrapper is used by the topology, health-check, and public DynamoDB clients.
+		if wrapperCalled.Load() != 3 {
+			t.Errorf("wrapper called %d times, want 3", wrapperCalled.Load())
 		}
 
 		// Verify we got the mocked DynamoDB response
@@ -149,9 +149,9 @@ func TestOptions(t *testing.T) {
 			t.Errorf("expected first table name to be 'test-table-1', got %s", result.TableNames[0])
 		}
 
-		// Verify mock handled both Alternator and DynamoDB requests
-		if alternatorRequests.Load() == 0 {
-			t.Errorf("expected mock to receive Alternator /localnodes requests")
+		// Verify mock handled both system-table topology and application requests.
+		if topologyRequests.Load() < 2 {
+			t.Errorf("topology requests = %d, want at least 2", topologyRequests.Load())
 		}
 		if dynamodbRequests.Load() != 1 {
 			t.Errorf("expected mock to receive DynamoDB API requests")
@@ -173,8 +173,8 @@ func TestOptions(t *testing.T) {
 							t.Parallel()
 
 							var (
-								alternatorRequests atomic.Int32
-								dynamodbRequests   []string
+								topologyRequests atomic.Int32
+								dynamodbRequests []string
 							)
 
 							var nodes []string
@@ -184,9 +184,9 @@ func TestOptions(t *testing.T) {
 							}
 
 							mockTransport := &mocks.MockRoundTripper{
-								AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-									alternatorRequests.Add(1)
-									return resp.AlternatorNodesResponse(nodes, req)
+								TopologyRequest: func(req *http.Request) (*http.Response, error) {
+									topologyRequests.Add(1)
+									return topologyResponse(topologyNodes(nodes), req)
 								},
 								NodeHealthRequest: resp.HealthCheckResponse,
 								DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
@@ -226,8 +226,8 @@ func TestOptions(t *testing.T) {
 								t.Fatalf("expected ListTables to fail due to mocked 500 response")
 							}
 
-							if alternatorRequests.Load() == 0 {
-								t.Fatalf("expected Alternator discovery call to happen")
+							if topologyRequests.Load() < 2 {
+								t.Fatalf("topology requests = %d, want at least 2", topologyRequests.Load())
 							}
 
 							expectedRetries := maxRetries
@@ -284,15 +284,15 @@ func TestOptions(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				var (
-					alternatorRequests atomic.Int32
-					capturedHeaders    atomic.Pointer[http.Header]
+					topologyRequests atomic.Int32
+					capturedHeaders  atomic.Pointer[http.Header]
 				)
 
 				nodes := []string{"node1.local"}
 				mockTransport := &mocks.MockRoundTripper{
-					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-						alternatorRequests.Add(1)
-						return resp.AlternatorNodesResponse(nodes, req)
+					TopologyRequest: func(req *http.Request) (*http.Response, error) {
+						topologyRequests.Add(1)
+						return topologyResponse(topologyNodes(nodes), req)
 					},
 					NodeHealthRequest: resp.HealthCheckResponse,
 					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
@@ -331,8 +331,8 @@ func TestOptions(t *testing.T) {
 					t.Fatalf("ListTables returned error: %v", err)
 				}
 
-				if alternatorRequests.Load() == 0 {
-					t.Fatal("expected Alternator discovery call to happen")
+				if topologyRequests.Load() < 2 {
+					t.Fatalf("topology requests = %d, want at least 2", topologyRequests.Load())
 				}
 
 				headers := capturedHeaders.Load()
@@ -372,19 +372,12 @@ func TestOptions(t *testing.T) {
 				t.Parallel()
 
 				var (
-					alternatorRequests atomic.Int32
-					dynamodbRequests   atomic.Int32
-					capturedHeaders    atomic.Pointer[http.Header]
-					capturedBody       atomic.Pointer[[]byte]
+					dynamodbRequests atomic.Int32
+					capturedHeaders  atomic.Pointer[http.Header]
+					capturedBody     atomic.Pointer[[]byte]
 				)
 
-				nodes := []string{"node1.local"}
-
 				mockTransport := &mocks.MockRoundTripper{
-					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-						alternatorRequests.Add(1)
-						return resp.AlternatorNodesResponse(nodes, req)
-					},
 					NodeHealthRequest: resp.HealthCheckResponse,
 					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
 						dynamodbRequests.Add(1)
@@ -419,6 +412,8 @@ func TestOptions(t *testing.T) {
 					WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 					WithCredentials("test-key", "test-secret"),
 					WithRequestCompression(NewGzipConfig().GzipRequestCompressor()),
+					WithNodesListUpdatePeriod(0),
+					WithIdleNodesListUpdatePeriod(0),
 				}
 
 				if tc.optimizeHeaders {
@@ -430,10 +425,6 @@ func TestOptions(t *testing.T) {
 					t.Fatalf("NewHelper returned error: %v", err)
 				}
 				defer h.Stop()
-
-				if err := h.UpdateLiveNodes(); err != nil {
-					t.Fatalf("UpdateLiveNodes returned error: %v", err)
-				}
 
 				client, err := h.NewDynamoDB()
 				if err != nil {
@@ -1245,9 +1236,7 @@ func TestOptions(t *testing.T) {
 				nodes := []string{"node1.local", "node2.local", "node3.local"}
 
 				mockTransport := &mocks.MockRoundTripper{
-					AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-						return resp.AlternatorNodesResponse(nodes, req)
-					},
+					TopologyRequest:   topologyRequest(topologyNodes(nodes)),
 					NodeHealthRequest: resp.HealthCheckResponse,
 					DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
 						operation, _ := req.Context().Value(operationCtxKey).(string)
@@ -1405,21 +1394,25 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		var routed routedNodes
 		clusterDiscovery := make(chan struct{}, 1)
 		var clusterDiscoveries atomic.Int32
+		topology := []resp.TopologyNode{
+			{Address: clusterNodes[0], Datacenter: datacenter, Rack: "rack1"},
+			{Address: clusterNodes[1], Datacenter: datacenter, Rack: "rack2"},
+			{Address: clusterNodes[2], Datacenter: datacenter, Rack: "rack3"},
+		}
 		mockTransport := &mocks.MockRoundTripper{
-			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-				switch req.URL.RawQuery {
-				case "":
+			TopologyRequest: func(req *http.Request) (*http.Response, error) {
+				table, _, err := mocks.TopologyTableFromRequest(req)
+				if err != nil {
+					return nil, err
+				}
+				if table == resp.SystemPeersTable {
 					clusterDiscoveries.Add(1)
 					select {
 					case clusterDiscovery <- struct{}{}:
 					default:
 					}
-					return resp.AlternatorNodesResponse(clusterNodes, req)
-				case fmt.Sprintf("dc=%s&rack=%s", datacenter, rack):
-					return resp.AlternatorNodesResponse([]string{rackNode}, req)
-				default:
-					return nil, fmt.Errorf("unexpected localnodes query %q", req.URL.RawQuery)
 				}
+				return topologyResponse(topology, req)
 			},
 			NodeHealthRequest: resp.HealthCheckResponse,
 			DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
@@ -1490,8 +1483,8 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		if _, err := client.UpdateItem(context.Background(), update); err != nil {
 			t.Fatalf("second UpdateItem returned error: %v", err)
 		}
-		if got := clusterDiscoveries.Load(); got != 1 {
-			t.Fatalf("two affinity requests caused %d cluster discoveries, want only initial discovery", got)
+		if got := clusterDiscoveries.Load(); got < 1 {
+			t.Fatalf("affinity requests caused %d cluster discoveries, want at least the initial discovery", got)
 		}
 
 		if _, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
@@ -1531,17 +1524,13 @@ func TestBatchWriteKeyRouteAffinityFirstRequestConvergesAcrossRacks(t *testing.T
 		t.Helper()
 
 		var routedNode string
+		topology := []resp.TopologyNode{
+			{Address: clusterNodes[0], Datacenter: datacenter, Rack: "rack1"},
+			{Address: clusterNodes[1], Datacenter: datacenter, Rack: "rack2"},
+			{Address: clusterNodes[2], Datacenter: datacenter, Rack: "rack3"},
+		}
 		mockTransport := &mocks.MockRoundTripper{
-			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-				switch req.URL.RawQuery {
-				case "":
-					return resp.AlternatorNodesResponse(clusterNodes, req)
-				case fmt.Sprintf("dc=%s&rack=%s", datacenter, rack):
-					return resp.AlternatorNodesResponse([]string{rackNode}, req)
-				default:
-					return nil, fmt.Errorf("unexpected localnodes query %q", req.URL.RawQuery)
-				}
-			},
+			TopologyRequest:   topologyRequest(topology),
 			NodeHealthRequest: resp.HealthCheckResponse,
 			DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
 				if target := req.Header.Get("X-Amz-Target"); target != "DynamoDB_20120810.BatchWriteItem" {
@@ -1607,7 +1596,7 @@ func TestAffinityDiscoveryFailureDoesNotSendScopedWrite(t *testing.T) {
 
 	var dynamoRequests atomic.Int32
 	mockTransport := &mocks.MockRoundTripper{
-		AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+		TopologyRequest: func(req *http.Request) (*http.Response, error) {
 			<-req.Context().Done()
 			return nil, req.Context().Err()
 		},
@@ -1632,7 +1621,7 @@ func TestAffinityDiscoveryFailureDoesNotSendScopedWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHelper returned error: %v", err)
 	}
-	defer h.Stop()
+	t.Cleanup(h.Stop)
 	client, err := h.NewDynamoDB()
 	if err != nil {
 		t.Fatalf("NewDynamoDB returned error: %v", err)
@@ -1666,9 +1655,10 @@ func TestAffinityDiscoveryHealthChecksRespectRequestDeadline(t *testing.T) {
 
 	var dynamoRequests atomic.Int32
 	mockTransport := &mocks.MockRoundTripper{
-		AlternatorRequest: func(req *http.Request) (*http.Response, error) {
-			return resp.AlternatorNodesResponse([]string{"rack1-node.local", "rack2-node.local"}, req)
-		},
+		TopologyRequest: topologyRequest([]resp.TopologyNode{
+			{Address: "rack1-node.local", Datacenter: "dc1", Rack: "rack1"},
+			{Address: "rack2-node.local", Datacenter: "dc1", Rack: "rack2"},
+		}),
 		NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
 			<-req.Context().Done()
 			return nil, req.Context().Err()
@@ -1765,7 +1755,7 @@ func TestAffinityDiscoveryWaiterUsesFlightResultAndSingleDeadline(t *testing.T) 
 	})
 }
 
-func TestHelperUpdatePreservesSourcesAndRejectsAffinityToggle(t *testing.T) {
+func TestHelperUpdateRebuildsSourcesAndRejectsAffinityToggle(t *testing.T) {
 	t.Parallel()
 
 	scoped := &batchWriteAffinityNodeSource{
@@ -1785,6 +1775,7 @@ func TestHelperUpdatePreservesSourcesAndRejectsAffinityToggle(t *testing.T) {
 		nodes:             scoped,
 		affinityNodes:     cluster,
 		affinityDiscovery: &affinityDiscoveryState{ready: true},
+		initialNodes:      []string{"seed.local"},
 		cfg:               *cfg,
 		keyAffinity: keyAffinity{pkInfoPerTable: map[string]string{
 			"orders": "order_id",
@@ -1796,11 +1787,12 @@ func TestHelperUpdatePreservesSourcesAndRejectsAffinityToggle(t *testing.T) {
 			"audit": "audit_id",
 		}),
 	))
-	if updated.nodes != scoped || updated.affinityNodes != cluster {
-		t.Fatal("same-topology Update replaced a node source")
+	t.Cleanup(updated.Stop)
+	if updated.nodes == scoped || updated.affinityNodes == cluster {
+		t.Fatal("Update reused an original node source")
 	}
-	if updated.affinityDiscovery != h.affinityDiscovery {
-		t.Fatal("same-topology Update replaced affinity discovery state")
+	if updated.affinityDiscovery == h.affinityDiscovery {
+		t.Fatal("Update reused affinity discovery state")
 	}
 	if got := updated.GetPartitionKeyName("orders"); got != "order_id" {
 		t.Fatalf("preserved partition key name = %q, want order_id", got)
@@ -1811,18 +1803,20 @@ func TestHelperUpdatePreservesSourcesAndRejectsAffinityToggle(t *testing.T) {
 	assertNodeSourceState(t, scoped, []string{"rack-active"}, []string{"rack-quarantined"})
 	assertNodeSourceState(t, cluster, []string{"cluster-active"}, []string{"cluster-quarantined"})
 
+	updatedScoped := updated.nodes
+	updatedCluster := updated.affinityNodes
 	requirePanicContains(t, "cannot enable or disable key route affinity", func() {
 		updated.Update(WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityNone)))
 	})
-	if updated.nodes != scoped || updated.affinityNodes != cluster {
-		t.Fatal("rejected affinity toggle changed a node source")
+	if updated.nodes != updatedScoped || updated.affinityNodes != updatedCluster {
+		t.Fatal("rejected affinity toggle changed the updated node sources")
 	}
 	assertNodeSourceState(t, scoped, []string{"rack-active"}, []string{"rack-quarantined"})
 	assertNodeSourceState(t, cluster, []string{"cluster-active"}, []string{"cluster-quarantined"})
 
 	disabledCfg := shared.NewDefaultConfig()
 	disabledCfg.RoutingScope = rt.NewRackScope("dc1", "rack1", nil)
-	disabled := &Helper{nodes: scoped, cfg: *disabledCfg}
+	disabled := &Helper{nodes: scoped, initialNodes: []string{"seed.local"}, cfg: *disabledCfg}
 	requirePanicContains(t, "cannot enable or disable key route affinity", func() {
 		disabled.Update(WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)))
 	})
@@ -1863,6 +1857,36 @@ func TestHelperUpdateRejectsRoutingScopeChangeAndPreservesSources(t *testing.T) 
 	assertNodeSourceState(t, cluster, []string{"cluster-active"}, []string{"cluster-quarantined"})
 }
 
+func TestHelperUpdateRebuildsSourcesForTopologyDiscoveryConfigChanges(t *testing.T) {
+	t.Parallel()
+
+	h, err := NewHelper([]string{"seed.local"}, WithCredentials("key", "secret"))
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	t.Cleanup(h.Stop)
+
+	tests := []struct {
+		name   string
+		option Option
+	}{
+		{name: "credentials", option: WithCredentials("rotated", "rotated-secret")},
+		{name: "region", option: WithAWSRegion("rotated-region")},
+		{name: "HTTP timeout", option: WithHTTPClientTimeout(time.Second)},
+		{name: "AWS config", option: WithAWSConfigOptions(func(*aws.Config) {})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			updated := h.Update(tt.option)
+			t.Cleanup(updated.Stop)
+			if updated.nodes == h.nodes {
+				t.Fatal("topology discovery config change reused the original node source")
+			}
+		})
+	}
+}
+
 func TestHelperUpdateSharedSourcesCanBeStoppedMoreThanOnce(t *testing.T) {
 	t.Parallel()
 
@@ -1875,7 +1899,7 @@ func TestHelperUpdateSharedSourcesCanBeStoppedMoreThanOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHelper returned error: %v", err)
 	}
-	updated := h.Update(WithCredentials("test-key", "test-secret"))
+	updated := h.Update()
 	h.Start()
 	updated.Start()
 	updated.Stop()
@@ -1896,7 +1920,7 @@ func TestHelperUpdateSharedSourcesConcurrentStartStop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewHelper returned error: %v", err)
 		}
-		updated := h.Update(WithCredentials("test-key", "test-secret"))
+		updated := h.Update()
 
 		var wg sync.WaitGroup
 		wg.Add(4)
@@ -2742,6 +2766,48 @@ func (s batchWriteAffinityNodeSource) Start() {
 }
 
 func (s batchWriteAffinityNodeSource) Stop() {
+}
+
+func topologyNodes(addresses []string) []resp.TopologyNode {
+	nodes := make([]resp.TopologyNode, 0, len(addresses))
+	for _, address := range addresses {
+		nodes = append(nodes, resp.TopologyNode{Address: address})
+	}
+	return nodes
+}
+
+func topologyRequest(nodes []resp.TopologyNode) func(*http.Request) (*http.Response, error) {
+	return func(req *http.Request) (*http.Response, error) {
+		return topologyResponse(nodes, req)
+	}
+}
+
+func topologyResponse(nodes []resp.TopologyNode, req *http.Request) (*http.Response, error) {
+	table, ok, err := mocks.TopologyTableFromRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("request is not a topology Scan")
+	}
+
+	local := resp.TopologyNode{Address: req.URL.Hostname()}
+	peers := make([]resp.TopologyNode, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Address == req.URL.Hostname() {
+			local = node
+			continue
+		}
+		peers = append(peers, node)
+	}
+	switch table {
+	case resp.SystemLocalTable:
+		return resp.DynamoDBSystemLocalResponse(local, req)
+	case resp.SystemPeersTable:
+		return resp.DynamoDBSystemPeersResponse(peers, req)
+	default:
+		return nil, fmt.Errorf("unexpected topology table %q", table)
+	}
 }
 
 func batchWriteTestNodes() []url.URL {

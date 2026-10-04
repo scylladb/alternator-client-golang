@@ -15,7 +15,8 @@
 package shared
 
 import (
-	"io"
+	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +36,36 @@ import (
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
 
+func TestAlternatorLiveNodesDefaultsToStaticTopologyWithoutDiscoverer(t *testing.T) {
+	t.Parallel()
+
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed-b.local", "seed-a.local"},
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+	if !aln.staticTopology {
+		t.Fatal("missing discoverer did not select static topology mode")
+	}
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("static UpdateLiveNodes returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := aln.DiscoverLiveNodes(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("static DiscoverLiveNodes error = %v, want context cancellation", err)
+	}
+	aln.Stop()
+	if err := aln.UpdateLiveNodes(); err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("static UpdateLiveNodes after Stop error = %v, want stopped", err)
+	}
+}
+
 func TestAlternatorLiveNodesConcurrentStartStopIsTerminal(t *testing.T) {
 	t.Parallel()
 
@@ -42,6 +73,7 @@ func TestAlternatorLiveNodesConcurrentStartStopIsTerminal(t *testing.T) {
 		aln, err := NewAlternatorLiveNodes(
 			[]string{"node.local"},
 			WithALNIdleUpdatePeriod(-1),
+			WithALNTopologyDiscoverer(staticTopologyDiscoverer("node.local")),
 			WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 				return liveNodesRoundTripFunc(resp.HealthCheckResponse)
 			}),
@@ -67,21 +99,26 @@ func TestAlternatorLiveNodesConcurrentStartStopIsTerminal(t *testing.T) {
 	}
 }
 
-func TestAlternatorLiveNodesNextNodeDoesNotStartDisabledIdleUpdater(t *testing.T) {
+func TestAlternatorLiveNodesRequestRefreshWorksWithoutIdleTicker(t *testing.T) {
 	t.Parallel()
 
-	var requests atomic.Int32
+	var calls atomic.Int32
+	refreshed := make(chan struct{}, 1)
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"node.local"},
 		WithALNUpdatePeriod(time.Minute),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				requests.Add(1)
-				return resp.AlternatorNodesResponse([]string{"node.local"}, req)
-			})
-		}),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) {
+				calls.Add(1)
+				select {
+				case refreshed <- struct{}{}:
+				default:
+				}
+				return []TopologyNode{{Address: "node.local"}}, nil
+			},
+		)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -89,37 +126,39 @@ func TestAlternatorLiveNodesNextNodeDoesNotStartDisabledIdleUpdater(t *testing.T
 	defer aln.Stop()
 
 	_ = aln.NextNode()
-	if aln.idleUpdaterStarted.Load() {
-		t.Fatal("NextNode started updater while idle updates were disabled")
+	if !aln.updaterStarted.Load() {
+		t.Fatal("NextNode did not start request-driven updater")
 	}
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("NextNode made %d discovery requests while idle updates were disabled", got)
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		t.Fatal("request-driven refresh did not run with idle updates disabled")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("NextNode made %d discovery calls, want 1", got)
 	}
 }
 
 func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 	t.Parallel()
 
-	requestStarted := make(chan struct{})
-	requestCanceled := make(chan struct{})
+	discoveryStarted := make(chan struct{})
+	discoveryCanceled := make(chan struct{})
 	allowReturn := make(chan struct{})
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"node.local"},
 		WithALNUpdatePeriod(time.Minute),
 		WithALNIdleUpdatePeriod(time.Hour),
-		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path != "/localnodes" {
-					return resp.HealthCheckResponse(req)
-				}
-				close(requestStarted)
-				<-req.Context().Done()
-				close(requestCanceled)
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(ctx context.Context, _ url.URL) ([]TopologyNode, error) {
+				close(discoveryStarted)
+				<-ctx.Done()
+				close(discoveryCanceled)
 				<-allowReturn
-				return resp.AlternatorNodesResponse([]string{"published-after-stop.local"}, req)
-			})
-		}),
+				return []TopologyNode{{Address: "published-after-stop.local"}}, nil
+			},
+		)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -128,7 +167,7 @@ func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 	aln.nextUpdate.Store(0)
 	_ = aln.NextNode()
 	select {
-	case <-requestStarted:
+	case <-discoveryStarted:
 	case <-time.After(time.Second):
 		t.Fatal("background refresh did not start")
 	}
@@ -139,13 +178,13 @@ func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 		close(stopDone)
 	}()
 	select {
-	case <-requestCanceled:
+	case <-discoveryCanceled:
 	case <-time.After(time.Second):
-		t.Fatal("Stop did not cancel the blocked discovery request")
+		t.Fatal("Stop did not cancel blocked topology discovery")
 	}
 	select {
 	case <-stopDone:
-		t.Fatal("Stop returned before the blocked updater exited")
+		t.Fatal("Stop returned before blocked discovery exited")
 	default:
 	}
 	close(allowReturn)
@@ -155,9 +194,139 @@ func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
 		t.Fatal("Stop did not join the canceled updater")
 	}
 
-	nodes := aln.GetNodes()
-	if len(nodes) != 1 || nodes[0].Hostname() != "node.local" {
-		t.Fatalf("canceled refresh published nodes after Stop: %v", nodes)
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"node.local"}) {
+		t.Fatalf("canceled refresh published nodes after Stop: %v", got)
+	}
+}
+
+func TestAlternatorLiveNodesStopCancelsAndJoinsManualRefresh(t *testing.T) {
+	t.Parallel()
+
+	discoveryStarted := make(chan struct{})
+	discoverer := TopologyDiscovererFunc(func(ctx context.Context, _ url.URL) ([]TopologyNode, error) {
+		close(discoveryStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"node.local"},
+		WithALNIdleUpdatePeriod(-1),
+		WithALNTopologyDiscoverer(discoverer),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- aln.UpdateLiveNodes() }()
+	select {
+	case <-discoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("manual refresh did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		aln.Stop()
+		close(stopDone)
+	}()
+	select {
+	case err := <-refreshDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("manual refresh error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the manual refresh")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not join the manual refresh")
+	}
+	if err := aln.UpdateLiveNodes(); err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("UpdateLiveNodes after Stop error = %v, want stopped", err)
+	}
+}
+
+func TestAlternatorLiveNodesSerializesConcurrentRefreshes(t *testing.T) {
+	t.Parallel()
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	discoverer := TopologyDiscovererFunc(func(context.Context, url.URL) ([]TopologyNode, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			observed := maximum.Load()
+			if current <= observed || maximum.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		return []TopologyNode{{Address: "node.local"}}, nil
+	})
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"node.local"},
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(discoverer),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := aln.UpdateLiveNodes(); err != nil {
+				t.Errorf("UpdateLiveNodes returned error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := maximum.Load(); got != 1 {
+		t.Fatalf("maximum concurrent discoveries = %d, want 1", got)
+	}
+}
+
+func TestDiscoverLiveNodesCancellationDoesNotPublish(t *testing.T) {
+	t.Parallel()
+
+	healthStarted := make(chan struct{})
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"old.local"},
+		WithALNIdleUpdatePeriod(-1),
+		WithALNTopologyDiscoverer(staticTopologyDiscoverer("new.local")),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				close(healthStarted)
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	discoveryDone := make(chan error, 1)
+	go func() { discoveryDone <- aln.DiscoverLiveNodes(ctx) }()
+	select {
+	case <-healthStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DiscoverLiveNodes did not start its health probe")
+	}
+	cancel()
+	if err := <-discoveryDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("DiscoverLiveNodes error = %v, want context cancellation", err)
+	}
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"old.local"}) {
+		t.Fatalf("canceled discovery published nodes: %v", got)
 	}
 }
 
@@ -167,21 +336,28 @@ func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T
 	healthStarted := make(chan struct{})
 	healthCanceled := make(chan struct{})
 	allowHealthReturn := make(chan struct{})
-	var healthCalls atomic.Int32
+	var firstProbe sync.Once
+	var firstCancellation sync.Once
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"node.local"},
 		WithALNUpdatePeriod(time.Minute),
 		WithALNIdleUpdatePeriod(time.Hour),
 		WithALNHTTPClientTimeout(0),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) {
+				return []TopologyNode{{Address: "node.local"}, {Address: "new-node.local"}}, nil
+			},
+		)),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path == "/localnodes" {
-					return resp.AlternatorNodesResponse([]string{"node.local", "new-node.local"}, req)
-				}
-				if healthCalls.Add(1) == 1 {
+				blocked := false
+				firstProbe.Do(func() {
+					blocked = true
 					close(healthStarted)
+				})
+				if blocked {
 					<-req.Context().Done()
-					close(healthCanceled)
+					firstCancellation.Do(func() { close(healthCanceled) })
 					<-allowHealthReturn
 				}
 				return nil, req.Context().Err()
@@ -208,7 +384,7 @@ func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T
 	select {
 	case <-healthCanceled:
 	case <-time.After(time.Second):
-		t.Fatal("Stop did not cancel the blocked background health request")
+		t.Fatal("Stop did not cancel the blocked health request")
 	}
 	select {
 	case <-stopDone:
@@ -229,30 +405,101 @@ func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T
 	}
 }
 
-func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T) {
+func TestAlternatorLiveNodesFiltersCompleteTopologyByScope(t *testing.T) {
 	t.Parallel()
 
-	var fallbackRequests atomic.Int32
+	topology := []TopologyNode{
+		{Address: "local.dc1", Datacenter: "dc1", Rack: "rack1"},
+		{Address: "peer-a.dc1", Datacenter: "dc1", Rack: "rack1"},
+		{Address: "peer-b.dc1", Datacenter: "dc1", Rack: "rack2"},
+		{Address: "peer-a.dc2", Datacenter: "dc2", Rack: "rack1"},
+	}
+	tests := []struct {
+		name  string
+		scope rt.Scope
+		want  []string
+	}{
+		{
+			name:  "cluster includes local and peers",
+			scope: rt.NewClusterScope(),
+			want:  []string{"local.dc1", "peer-a.dc1", "peer-a.dc2", "peer-b.dc1"},
+		},
+		{name: "datacenter", scope: rt.NewDCScope("dc1", nil), want: []string{"local.dc1", "peer-a.dc1", "peer-b.dc1"}},
+		{name: "rack", scope: rt.NewRackScope("dc1", "rack1", nil), want: []string{"local.dc1", "peer-a.dc1"}},
+		{
+			name:  "rack falls back to datacenter",
+			scope: rt.NewRackScope("dc1", "missing", rt.NewDCScope("dc1", nil)),
+			want:  []string{"local.dc1", "peer-a.dc1", "peer-b.dc1"},
+		},
+		{
+			name:  "datacenter falls back to cluster",
+			scope: rt.NewDCScope("missing", rt.NewClusterScope()),
+			want:  []string{"local.dc1", "peer-a.dc1", "peer-a.dc2", "peer-b.dc1"},
+		},
+		{name: "no match keeps initial nodes", scope: rt.NewDCScope("missing", nil), want: []string{"seed.local"}},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			aln, err := NewAlternatorLiveNodes(
+				[]string{"seed.local"},
+				WithALNPort(8043),
+				WithALNScheme("https"),
+				WithALNRoutingScope(tt.scope),
+				WithALNUpdatePeriod(0),
+				WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+				WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+					func(_ context.Context, endpoint url.URL) ([]TopologyNode, error) {
+						calls.Add(1)
+						if endpoint.String() != "https://seed.local:8043" {
+							t.Fatalf("discovery endpoint got %q", endpoint.String())
+						}
+						return slices.Clone(topology), nil
+					},
+				)),
+			)
+			if err != nil {
+				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+			}
+			defer aln.Stop()
+
+			if err := aln.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes returned error: %v", err)
+			}
+			if got := hostnames(aln.GetNodes()); !slices.Equal(got, tt.want) {
+				t.Fatalf("GetNodes got %v, want %v", got, tt.want)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("discovery calls got %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestAlternatorLiveNodesFallsBackWhenPreferredScopeIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	topology := []TopologyNode{
+		{Address: "rack1.local", Datacenter: "dc1", Rack: "rack1"},
+		{Address: "rack2.local", Datacenter: "dc1", Rack: "rack2"},
+	}
 	aln, err := NewAlternatorLiveNodes(
-		[]string{"node1.local", "node2.local"},
-		WithALNPort(8080),
-		WithALNRoutingScope(rt.NewDCScope("wrong", rt.NewDCScope("target", nil))),
+		[]string{"seed.local"},
+		WithALNRoutingScope(rt.NewRackScope("dc1", "rack1", rt.NewDCScope("dc1", nil))),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) { return topology, nil },
+		)),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path == "" || req.URL.Path == "/" {
-					return resp.HealthCheckResponse(req)
+				if req.URL.Hostname() == "rack1.local" {
+					return nil, errors.New("rack1 unavailable")
 				}
-				switch req.URL.RawQuery {
-				case "dc=wrong":
-					return resp.AlternatorNodesResponse(nil, req)
-				case "dc=target":
-					fallbackRequests.Add(1)
-					return resp.AlternatorNodesResponse([]string{"node3.local"}, req)
-				default:
-					t.Fatalf("unexpected /localnodes query %q", req.URL.RawQuery)
-					return nil, nil
-				}
+				return resp.HealthCheckResponse(req)
 			})
 		}),
 	)
@@ -260,111 +507,36 @@ func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T)
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
 	}
 	defer aln.Stop()
-	if got, want := aln.cfg.RoutingScope.String(), "Datacenter(dc=wrong)"; got != want {
-		t.Fatalf("RoutingScope got %q, want %q", got, want)
-	}
 
 	if err := aln.UpdateLiveNodes(); err != nil {
 		t.Fatalf("UpdateLiveNodes returned error: %v", err)
 	}
-
-	got := hostnames(aln.GetNodes())
-	if !slices.Equal(got, []string{"node3.local"}) {
-		t.Fatalf("GetNodes got %v, want [node3.local]", got)
+	if got := hostnames(aln.GetActiveNodes()); !slices.Equal(got, []string{"rack2.local"}) {
+		t.Fatalf("active fallback nodes got %v, want [rack2.local]", got)
 	}
-	if fallbackRequests.Load() == 0 {
-		t.Fatalf("expected discovery request for fallback scope")
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"rack1.local"}) {
+		t.Fatalf("preferred topology nodes got %v, want [rack1.local]", got)
 	}
 }
 
-func TestAlternatorLiveNodes_ClusterScopeMergesSeedNodes(t *testing.T) {
+func TestAlternatorLiveNodesStopsAfterFirstUsableTopologySnapshot(t *testing.T) {
 	t.Parallel()
 
-	var dc1Requests atomic.Int32
-	var dc2Requests atomic.Int32
-
+	var calls atomic.Int32
 	aln, err := NewAlternatorLiveNodes(
-		[]string{"dc1-node1.local", "dc2-node1.local"},
-		WithALNPort(8080),
-		WithALNRoutingScope(rt.NewClusterScope()),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path == "" || req.URL.Path == "/" {
-					return resp.HealthCheckResponse(req)
-				}
-				if req.URL.Path != "/localnodes" {
-					t.Fatalf("unexpected request path %q", req.URL.Path)
-				}
-				if req.URL.RawQuery != "" {
-					t.Fatalf("unexpected /localnodes query %q", req.URL.RawQuery)
-				}
-				switch req.URL.Hostname() {
-				case "dc1-node1.local":
-					dc1Requests.Add(1)
-					return resp.AlternatorNodesResponse([]string{"dc1-node1.local", "dc1-node2.local"}, req)
-				case "dc2-node1.local":
-					dc2Requests.Add(1)
-					return resp.AlternatorNodesResponse([]string{"dc2-node1.local", "dc2-node2.local"}, req)
-				default:
-					t.Fatalf("unexpected discovery host %q", req.URL.Hostname())
-					return nil, nil
-				}
-			})
-		}),
-	)
-	if err != nil {
-		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-	}
-	defer aln.Stop()
-
-	if err := aln.UpdateLiveNodes(); err != nil {
-		t.Fatalf("UpdateLiveNodes returned error: %v", err)
-	}
-
-	got := hostnames(aln.GetNodes())
-	want := []string{"dc1-node1.local", "dc1-node2.local", "dc2-node1.local", "dc2-node2.local"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("GetNodes got %v, want %v", got, want)
-	}
-	if dc1Requests.Load() == 0 {
-		t.Fatalf("expected discovery request for dc1 seed")
-	}
-	if dc2Requests.Load() == 0 {
-		t.Fatalf("expected discovery request for dc2 seed")
-	}
-}
-
-func TestAlternatorLiveNodes_DNSEntrypointDiscoversDNSNodeRecords(t *testing.T) {
-	t.Parallel()
-
-	var requests atomic.Int32
-	listener, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("failed to listen on localhost: %v", err)
-	}
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		if r.URL.Path != "/localnodes" {
-			t.Fatalf("unexpected request path %q", r.URL.Path)
-		}
-		if !strings.HasPrefix(r.Host, "localhost:") {
-			t.Fatalf("request Host header got %q, want localhost:<port>", r.Host)
-		}
-		_, _ = w.Write([]byte(`["localhost","node-a.internal"]`))
-	}))
-	server.Listener = listener
-	server.Start()
-	defer server.Close()
-
-	_, port := splitServerHostPort(t, server.URL)
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.Disabled = true
-	aln, err := NewAlternatorLiveNodes(
-		[]string{"localhost"},
-		WithALNPort(port),
+		[]string{"seed-a.local", "seed-b.local"},
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) {
+				calls.Add(1)
+				return []TopologyNode{
+					{Address: "node-a.local", Datacenter: "dc1", Rack: "r1"},
+					{Address: "node-b.local", Datacenter: "dc2", Rack: "r2"},
+				}, nil
+			},
+		)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -374,129 +546,184 @@ func TestAlternatorLiveNodes_DNSEntrypointDiscoversDNSNodeRecords(t *testing.T) 
 	if err := aln.UpdateLiveNodes(); err != nil {
 		t.Fatalf("UpdateLiveNodes returned error: %v", err)
 	}
-
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("DNS seed should be contacted once, got %d requests", got)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("complete topology should stop candidate iteration; got %d calls", got)
 	}
-	got := hostnames(aln.GetNodes())
-	want := []string{"localhost", "node-a.internal"}
-	if !slices.Equal(got, want) {
+	if got, want := hostnames(aln.GetNodes()), []string{"node-a.local", "node-b.local"}; !slices.Equal(got, want) {
 		t.Fatalf("GetNodes got %v, want %v", got, want)
 	}
 }
 
-func TestAlternatorLiveNodes_IPv6LiteralDiscoversAndRoutesRequests(t *testing.T) {
-	listener, err := net.Listen("tcp6", "[::1]:0")
-	if err != nil {
-		t.Skipf("IPv6 loopback is unavailable: %v", err)
-	}
+func TestAlternatorLiveNodesSkipsTopologyWithoutUsableAddresses(t *testing.T) {
+	t.Parallel()
 
-	var discoveryRequests atomic.Int32
-	var operationRequests atomic.Int32
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Host != listener.Addr().String() {
-			t.Errorf("request Host header got %q, want %q", r.Host, listener.Addr().String())
-		}
-		switch r.URL.Path {
-		case "/localnodes":
-			discoveryRequests.Add(1)
-			_, _ = w.Write([]byte(`["::1"]`))
-		case "/":
-			operationRequests.Add(1)
-			_, _ = w.Write([]byte("OK"))
-		default:
-			t.Errorf("unexpected request path %q", r.URL.Path)
-			http.Error(w, "unexpected path", http.StatusNotFound)
-		}
-	}))
-	server.Listener = listener
-	server.Start()
-	defer server.Close()
-
-	_, port := splitServerHostPort(t, server.URL)
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.Disabled = true
+	var calls atomic.Int32
 	aln, err := NewAlternatorLiveNodes(
-		[]string{"::1"},
-		WithALNPort(port),
+		[]string{"seed-a.local", "seed-b.local"},
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) {
+				if calls.Add(1) == 1 {
+					return []TopologyNode{{Address: ""}, {Address: "0.0.0.0"}, {Address: "::"}}, nil
+				}
+				return []TopologyNode{{Address: "usable.local"}}, nil
+			},
+		)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
 	}
 	defer aln.Stop()
 
-	wantURL := "http://" + listener.Addr().String()
-	initialNode := aln.NextNode()
-	if got := initialNode.String(); got != wantURL {
-		t.Fatalf("initial IPv6 node URL got %q, want %q", got, wantURL)
-	}
 	if err := aln.UpdateLiveNodes(); err != nil {
 		t.Fatalf("UpdateLiveNodes returned error: %v", err)
 	}
-	discoveredNode := aln.NextNode()
-	if got := discoveredNode.String(); got != wantURL {
-		t.Fatalf("discovered IPv6 node URL got %q, want %q", got, wantURL)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("discovery calls got %d, want 2", got)
 	}
-
-	routedNode := aln.NextNode()
-	response, err := aln.httpClient.Get(routedNode.String())
-	if err != nil {
-		t.Fatalf("request through discovered IPv6 node failed: %v", err)
-	}
-	drainAndCloseResponseBody(response.Body)
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("request through discovered IPv6 node returned HTTP %d", response.StatusCode)
-	}
-	if got := discoveryRequests.Load(); got != 1 {
-		t.Fatalf("discovery requests got %d, want 1", got)
-	}
-	if got := operationRequests.Load(); got != 1 {
-		t.Fatalf("operation requests got %d, want 1", got)
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"usable.local"}) {
+		t.Fatalf("GetNodes got %v, want [usable.local]", got)
 	}
 }
 
-func TestAlternatorLiveNodes_FallsBackToOriginalIPv6Entrypoint(t *testing.T) {
+func TestAlternatorLiveNodesRetriesInitialSeedAfterLearnedCandidate(t *testing.T) {
 	t.Parallel()
 
-	var seedRequests atomic.Int32
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.Disabled = true
+	tests := []struct {
+		name       string
+		learnedErr error
+	}{
+		{name: "learned candidate error", learnedErr: errors.New("learned node unavailable")},
+		{name: "learned candidate empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var firstRefresh atomic.Bool
+			firstRefresh.Store(true)
+			var secondCallsMu sync.Mutex
+			var secondCalls []string
+			aln, err := NewAlternatorLiveNodes(
+				[]string{"seed.local"},
+				WithALNUpdatePeriod(0),
+				WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+				WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+					func(_ context.Context, endpoint url.URL) ([]TopologyNode, error) {
+						if firstRefresh.Load() {
+							return []TopologyNode{{Address: "learned.local"}}, nil
+						}
+						secondCallsMu.Lock()
+						secondCalls = append(secondCalls, endpoint.Hostname())
+						secondCallsMu.Unlock()
+						switch endpoint.Hostname() {
+						case "learned.local":
+							return nil, tt.learnedErr
+						case "seed.local":
+							return []TopologyNode{{Address: "recovered.local"}}, nil
+						default:
+							t.Fatalf("unexpected discovery candidate %q", endpoint.Hostname())
+							return nil, nil
+						}
+					},
+				)),
+			)
+			if err != nil {
+				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+			}
+			defer aln.Stop()
+
+			if err := aln.UpdateLiveNodes(); err != nil {
+				t.Fatalf("first UpdateLiveNodes returned error: %v", err)
+			}
+			firstRefresh.Store(false)
+			if err := aln.UpdateLiveNodes(); err != nil {
+				t.Fatalf("recovery UpdateLiveNodes returned error: %v", err)
+			}
+			if got, want := hostnames(aln.GetNodes()), []string{"recovered.local"}; !slices.Equal(got, want) {
+				t.Fatalf("recovered nodes got %v, want %v", got, want)
+			}
+			secondCallsMu.Lock()
+			gotCalls := slices.Clone(secondCalls)
+			secondCallsMu.Unlock()
+			if !slices.Equal(gotCalls, []string{"learned.local", "seed.local"}) {
+				t.Fatalf("recovery candidates got %v, want learned then initial seed", gotCalls)
+			}
+		})
+	}
+}
+
+func TestAlternatorLiveNodesSanitizesSortsAndDeduplicatesTopology(t *testing.T) {
+	t.Parallel()
+
+	topology := []TopologyNode{
+		{Address: "b.local"},
+		{Address: "::1"},
+		{Address: "[::1]"},
+		{Address: "192.0.2.2"},
+		{Address: "2001:db8::2"},
+		{Address: "b.local"},
+		{Address: ""},
+		{Address: "bad host"},
+		{Address: "0.0.0.0"},
+		{Address: "::"},
+		{Address: "[::]"},
+	}
 	aln, err := NewAlternatorLiveNodes(
-		[]string{"2001:db8::1"},
-		WithALNPort(8080),
+		[]string{"seed.local"},
+		WithALNScheme("https"),
+		WithALNPort(8043),
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path != "/localnodes" {
-					t.Fatalf("unexpected request path %q", req.URL.Path)
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) { return topology, nil },
+		)),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	if err := aln.UpdateLiveNodes(); err != nil {
+		t.Fatalf("UpdateLiveNodes returned error: %v", err)
+	}
+	got := aln.GetNodes()
+	want := []string{
+		"https://192.0.2.2:8043",
+		"https://[2001:db8::2]:8043",
+		"https://[::1]:8043",
+		"https://b.local:8043",
+	}
+	gotStrings := make([]string, 0, len(got))
+	for _, node := range got {
+		gotStrings = append(gotStrings, node.String())
+	}
+	if !slices.Equal(gotStrings, want) {
+		t.Fatalf("sanitized nodes got %v, want %v", gotStrings, want)
+	}
+}
+
+func TestAlternatorLiveNodesDiscoveryErrorDoesNotPartiallyPublish(t *testing.T) {
+	t.Parallel()
+
+	var fail atomic.Bool
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed.local"},
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) {
+				if fail.Load() {
+					return []TopologyNode{{Address: "partial.local"}}, errors.New("peers query failed")
 				}
-				switch req.URL.Hostname() {
-				case "2001:db8::1":
-					if req.URL.Host != "[2001:db8::1]:8080" {
-						t.Fatalf("IPv6 entrypoint authority got %q, want %q", req.URL.Host, "[2001:db8::1]:8080")
-					}
-					if seedRequests.Add(1) == 1 {
-						return resp.AlternatorNodesResponse([]string{"2001:db8::2"}, req)
-					}
-					return resp.AlternatorNodesResponse([]string{"2001:db8::3"}, req)
-				case "2001:db8::2":
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       io.NopCloser(strings.NewReader("malformed")),
-						Header:     make(http.Header),
-						Request:    req,
-					}, nil
-				default:
-					t.Fatalf("unexpected discovery host %q", req.URL.Hostname())
-					return nil, nil
-				}
-			})
-		}),
+				return []TopologyNode{{Address: "stable.local"}}, nil
+			},
+		)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -506,17 +733,206 @@ func TestAlternatorLiveNodes_FallsBackToOriginalIPv6Entrypoint(t *testing.T) {
 	if err := aln.UpdateLiveNodes(); err != nil {
 		t.Fatalf("first UpdateLiveNodes returned error: %v", err)
 	}
-	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"2001:db8::2"}) {
-		t.Fatalf("first discovery got %v, want [2001:db8::2]", got)
+	fail.Store(true)
+	if err := aln.UpdateLiveNodes(); err == nil || !strings.Contains(err.Error(), "peers query failed") {
+		t.Fatalf("failing UpdateLiveNodes error got %v", err)
 	}
+	if got, want := hostnames(aln.GetNodes()), []string{"stable.local"}; !slices.Equal(got, want) {
+		t.Fatalf("failed refresh changed published nodes to %v, want %v", got, want)
+	}
+}
+
+func TestAlternatorLiveNodesEmptyTopologyPublicationSemantics(t *testing.T) {
+	t.Parallel()
+
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed.local"},
+		WithALNUpdatePeriod(0),
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) { return nil, nil },
+		)),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
 	if err := aln.UpdateLiveNodes(); err != nil {
-		t.Fatalf("recovery UpdateLiveNodes returned error: %v", err)
+		t.Fatalf("best-effort UpdateLiveNodes returned error for empty topology: %v", err)
 	}
-	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"2001:db8::3"}) {
-		t.Fatalf("recovery discovery got %v, want [2001:db8::3]", got)
+	err = aln.DiscoverLiveNodes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "returned no nodes") {
+		t.Fatalf("required DiscoverLiveNodes error got %v", err)
 	}
-	if got := seedRequests.Load(); got != 2 {
-		t.Fatalf("original IPv6 entrypoint requests got %d, want 2", got)
+	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"seed.local"}) {
+		t.Fatalf("empty topology changed nodes to %v", got)
+	}
+}
+
+func TestAlternatorLiveNodesRoutingValidationUsesTopologyMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		scope          rt.Scope
+		topology       []TopologyNode
+		discoveryError error
+		without        bool
+		wantError      string
+		wantCalls      int32
+	}{
+		{name: "cluster needs no discovery", scope: rt.NewClusterScope()},
+		{
+			name:      "rack match",
+			scope:     rt.NewRackScope("dc1", "r1", nil),
+			topology:  []TopologyNode{{Address: "node.local", Datacenter: "dc1", Rack: "r1"}},
+			wantCalls: 1,
+		},
+		{
+			name:      "datacenter match",
+			scope:     rt.NewDCScope("dc1", nil),
+			topology:  []TopologyNode{{Address: "node.local", Datacenter: "dc1", Rack: "r2"}},
+			wantCalls: 1,
+		},
+		{
+			name:      "fallback match",
+			scope:     rt.NewRackScope("dc1", "missing", rt.NewDCScope("dc1", nil)),
+			topology:  []TopologyNode{{Address: "node.local", Datacenter: "dc1", Rack: "r2"}},
+			wantCalls: 1,
+		},
+		{
+			name:      "scope mismatch",
+			scope:     rt.NewRackScope("dc1", "missing", nil),
+			topology:  []TopologyNode{{Address: "node.local", Datacenter: "dc1", Rack: "r2"}},
+			wantError: "have no nodes",
+			wantCalls: 1,
+		},
+		{
+			name:           "discovery error",
+			scope:          rt.NewDCScope("dc1", nil),
+			discoveryError: errors.New("query failed"),
+			wantError:      "query failed",
+			wantCalls:      1,
+		},
+		{name: "missing discoverer uses static topology", scope: rt.NewDCScope("dc1", nil), without: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			options := []ALNOption{
+				WithALNRoutingScope(tt.scope),
+				WithALNUpdatePeriod(0),
+				WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+			}
+			if !tt.without {
+				options = append(options, WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+					func(context.Context, url.URL) ([]TopologyNode, error) {
+						calls.Add(1)
+						return tt.topology, tt.discoveryError
+					},
+				)))
+			}
+			aln, err := NewAlternatorLiveNodes([]string{"seed.local"}, options...)
+			if tt.without {
+				if err != nil {
+					t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+				}
+				if err := aln.CheckIfRackAndDatacenterSetCorrectly(); err == nil {
+					t.Fatal("static scoped validation unexpectedly succeeded without topology metadata")
+				}
+				aln.Stop()
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+			}
+			defer aln.Stop()
+
+			err = aln.CheckIfRackAndDatacenterSetCorrectly()
+			if tt.wantError == "" && err != nil {
+				t.Fatalf("validation returned error: %v", err)
+			}
+			if tt.wantError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantError)) {
+				t.Fatalf("validation error got %v, want substring %q", err, tt.wantError)
+			}
+			if got := calls.Load(); got != tt.wantCalls {
+				t.Fatalf("discovery calls got %d, want %d", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestAlternatorLiveNodesRackDatacenterFeatureSupportUsesMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		topology  []TopologyNode
+		err       error
+		want      bool
+		wantError bool
+	}{
+		{
+			name:     "supported",
+			topology: []TopologyNode{{Address: "node.local", Datacenter: "dc1", Rack: "r1"}},
+			want:     true,
+		},
+		{
+			name: "one complete record is supported",
+			topology: []TopologyNode{
+				{Address: "node-a.local"},
+				{Address: "node-b.local", Datacenter: "dc1", Rack: "r1"},
+			},
+			want: true,
+		},
+		{name: "rack missing", topology: []TopologyNode{{Address: "node.local", Datacenter: "dc1"}}},
+		{name: "datacenter missing", topology: []TopologyNode{{Address: "node.local", Rack: "r1"}}},
+		{name: "empty topology", wantError: true},
+		{name: "discovery error", err: errors.New("query failed"), wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			aln, err := NewAlternatorLiveNodes(
+				[]string{"seed.local"},
+				WithALNUpdatePeriod(0),
+				WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+				WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+					func(context.Context, url.URL) ([]TopologyNode, error) {
+						calls.Add(1)
+						return tt.topology, tt.err
+					},
+				)),
+			)
+			if err != nil {
+				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+			}
+			defer aln.Stop()
+
+			got, err := aln.CheckIfRackDatacenterFeatureIsSupported()
+			if tt.wantError && err == nil {
+				t.Fatal("feature support check succeeded, want error")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("feature support check returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("feature support got %v, want %v", got, tt.want)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("feature support discovery calls got %d, want 1", calls.Load())
+			}
+		})
 	}
 }
 
@@ -539,13 +955,13 @@ func TestNodeURLFormatsHostAndPort(t *testing.T) {
 			t.Parallel()
 			got, err := nodeURL("https", tt.host, 8043)
 			if err != nil {
-				t.Fatalf("nodeURL() returned error: %v", err)
+				t.Fatalf("nodeURL returned error: %v", err)
 			}
 			if got.String() != tt.want {
-				t.Fatalf("nodeURL().String() got %q, want %q", got.String(), tt.want)
+				t.Fatalf("nodeURL string got %q, want %q", got.String(), tt.want)
 			}
 			if got.Hostname() != tt.host {
-				t.Fatalf("nodeURL().Hostname() got %q, want %q", got.Hostname(), tt.host)
+				t.Fatalf("nodeURL hostname got %q, want %q", got.Hostname(), tt.host)
 			}
 		})
 	}
@@ -554,48 +970,25 @@ func TestNodeURLFormatsHostAndPort(t *testing.T) {
 func TestNewAlternatorLiveNodesRejectsMalformedHost(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewAlternatorLiveNodes([]string{"bad host"}); err == nil {
-		t.Fatal("NewAlternatorLiveNodes() accepted a malformed host")
-	}
-}
-
-func TestAlternatorLiveNodesSkipsMalformedDiscoveredHost(t *testing.T) {
-	t.Parallel()
-
-	aln, err := NewAlternatorLiveNodes(
-		[]string{"seed.local"},
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				return resp.AlternatorNodesResponse([]string{"bad host", "::1"}, req)
-			})
-		}),
-	)
-	if err != nil {
-		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-	}
-	defer aln.Stop()
-
-	if err := aln.UpdateLiveNodes(); err != nil {
-		t.Fatalf("UpdateLiveNodes returned error: %v", err)
-	}
-	if got := hostnames(aln.GetNodes()); !slices.Equal(got, []string{"::1"}) {
-		t.Fatalf("discovered hosts got %v, want [::1]", got)
+	if _, err := NewAlternatorLiveNodes(
+		[]string{"bad host"},
+		WithALNTopologyDiscoverer(staticTopologyDiscoverer("node.local")),
+	); err == nil {
+		t.Fatal("NewAlternatorLiveNodes accepted a malformed host")
 	}
 }
 
 func TestAlternatorLiveNodesKeepsIndependentInitialNodesWhenHealthDisabled(t *testing.T) {
 	t.Parallel()
 
-	healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	healthConfig.Disabled = true
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"seed-a.local", "seed-b.local"},
-		WithALNNodeHealthStoreConfig(healthConfig),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				return resp.AlternatorNodesResponse([]string{"seed-b.local"}, req)
-			})
-		}),
+		WithALNNodeHealthStoreConfig(disabledNodeHealthConfig()),
+		WithALNTopologyDiscoverer(TopologyDiscovererFunc(
+			func(context.Context, url.URL) ([]TopologyNode, error) {
+				return []TopologyNode{{Address: "seed-b.local"}}, nil
+			},
+		)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -605,122 +998,12 @@ func TestAlternatorLiveNodesKeepsIndependentInitialNodesWhenHealthDisabled(t *te
 	if err := aln.UpdateLiveNodes(); err != nil {
 		t.Fatalf("UpdateLiveNodes returned error: %v", err)
 	}
-	if got := hostnames(aln.initialNodes); !slices.Equal(got, []string{"seed-a.local", "seed-b.local"}) {
-		t.Fatalf("initial nodes were mutated to %v", got)
+	if got, want := hostnames(aln.initialNodes), []string{"seed-a.local", "seed-b.local"}; !slices.Equal(got, want) {
+		t.Fatalf("initial nodes were mutated to %v, want %v", got, want)
 	}
 }
 
-func TestAlternatorLiveNodes_CheckIfRackAndDatacenterSetCorrectlyRetriesSeedNodes(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		scope rt.Scope
-		query string
-	}{
-		{
-			name:  "datacenter",
-			scope: rt.NewDCScope("dc1", nil),
-			query: "dc=dc1",
-		},
-		{
-			name:  "rack",
-			scope: rt.NewRackScope("dc1", "rack1", nil),
-			query: "dc=dc1&rack=rack1",
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			var targetRequests atomic.Int32
-
-			aln, err := NewAlternatorLiveNodes(
-				[]string{"dc1-node.local", "dc2-node.local"},
-				WithALNPort(8080),
-				WithALNRoutingScope(tt.scope),
-				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-						if req.URL.Path == "" || req.URL.Path == "/" {
-							return resp.HealthCheckResponse(req)
-						}
-						if req.URL.Path != "/localnodes" {
-							t.Fatalf("unexpected request path %q", req.URL.Path)
-						}
-						if req.URL.RawQuery != tt.query {
-							t.Fatalf("unexpected /localnodes query %q, want %q", req.URL.RawQuery, tt.query)
-						}
-						switch req.URL.Hostname() {
-						case "dc1-node.local":
-							targetRequests.Add(1)
-							return resp.AlternatorNodesResponse([]string{"dc1-node.local"}, req)
-						case "dc2-node.local":
-							return resp.AlternatorNodesResponse(nil, req)
-						default:
-							t.Fatalf("unexpected validation host %q", req.URL.Hostname())
-							return nil, nil
-						}
-					})
-				}),
-			)
-			if err != nil {
-				t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-			}
-			defer aln.Stop()
-
-			if err := aln.CheckIfRackAndDatacenterSetCorrectly(); err != nil {
-				t.Fatalf("CheckIfRackAndDatacenterSetCorrectly returned error: %v", err)
-			}
-			if targetRequests.Load() == 0 {
-				t.Fatalf("expected validation request for target seed")
-			}
-		})
-	}
-}
-
-func TestAlternatorLiveNodes_NonOKDiscoveryResponseKeepsConnectionReusable(t *testing.T) {
-	t.Parallel()
-
-	var requests atomic.Int32
-	server, connections := newCountingHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/localnodes" {
-			t.Fatalf("unexpected request path %q", r.URL.Path)
-		}
-		if requests.Add(1) == 1 {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("temporary failure"))
-			return
-		}
-		_, _ = w.Write([]byte(`["127.0.0.1"]`))
-	}))
-	defer server.Close()
-
-	host, port := splitServerHostPort(t, server.URL)
-	aln, err := NewAlternatorLiveNodes(
-		[]string{host},
-		WithALNPort(port),
-		WithALNUpdatePeriod(0),
-		WithALNIdleUpdatePeriod(-1),
-	)
-	if err != nil {
-		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-	}
-	defer aln.Stop()
-
-	if err := aln.UpdateLiveNodes(); err == nil {
-		t.Fatalf("expected first UpdateLiveNodes to fail")
-	}
-	if err := aln.UpdateLiveNodes(); err != nil {
-		t.Fatalf("second UpdateLiveNodes returned error: %v", err)
-	}
-	if got := connections.Load(); got != 1 {
-		t.Fatalf("expected non-200 discovery response to leave connection reusable, got %d connections", got)
-	}
-}
-
-func TestAlternatorLiveNodes_NonOKHealthResponseKeepsConnectionReusable(t *testing.T) {
+func TestAlternatorLiveNodesNonOKHealthResponseKeepsConnectionReusable(t *testing.T) {
 	t.Parallel()
 
 	var requests atomic.Int32
@@ -746,6 +1029,7 @@ func TestAlternatorLiveNodes_NonOKHealthResponseKeepsConnectionReusable(t *testi
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
 		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithALNTopologyDiscoverer(staticTopologyDiscoverer(host)),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -767,6 +1051,22 @@ type liveNodesRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f liveNodesRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func staticTopologyDiscoverer(addresses ...string) TopologyDiscoverer {
+	return TopologyDiscovererFunc(func(context.Context, url.URL) ([]TopologyNode, error) {
+		nodes := make([]TopologyNode, 0, len(addresses))
+		for _, address := range addresses {
+			nodes = append(nodes, TopologyNode{Address: address})
+		}
+		return nodes, nil
+	})
+}
+
+func disabledNodeHealthConfig() nodeshealth.NodeHealthStoreConfig {
+	config := nodeshealth.DefaultNodeHealthStoreConfig()
+	config.Disabled = true
+	return config
 }
 
 func hostnames(nodes []url.URL) []string {
