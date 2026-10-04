@@ -1,0 +1,14 @@
+# requirement	setting	value
+COMP-REQ-001	request_algorithm	NONE
+COMP-REQ-001	minimum_request_size_bytes	1024
+COMP-REQ-001	response_algorithm_count	0
+HEAD-REQ-001	header_optimization_enabled	false
+AFF-REQ-001	affinity_enabled	false
+HEALTH-REQ-001	active_failure_threshold	10
+HEALTH-REQ-001	down_recovery_threshold	3
+HEALTH-REQ-001	quarantine_promotion_threshold	10
+HEALTH-REQ-001	quarantine_failure_threshold	3
+HEALTH-REQ-001	background_probe_period_ms	30000
+HEALTH-REQ-001	probe_concurrency	4
+HEALTH-REQ-001	probe_timeout_ms	5000
+HEALTH-REQ-001	health_disabled	false

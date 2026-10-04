@@ -16,6 +16,7 @@ package sdkv2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -35,6 +37,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/klauspost/compress/gzip"
 
 	"github.com/scylladb/alternator-client-golang/shared"
@@ -231,11 +235,22 @@ func TestOptions(t *testing.T) {
 							if maxRetries == 0 {
 								expectedRetries = 3
 							}
-							if expectedRetries > numberOfNodes {
-								expectedRetries = numberOfNodes
-							}
 							if got := len(dynamodbRequests); got != expectedRetries {
 								t.Fatalf("expected exactly %d DynamoDB attempts, got %d", expectedRetries, got)
+							}
+							for cycleStart := 0; cycleStart < len(dynamodbRequests); cycleStart += numberOfNodes {
+								cycleEnd := min(cycleStart+numberOfNodes, len(dynamodbRequests))
+								seen := make(map[string]struct{}, cycleEnd-cycleStart)
+								for _, host := range dynamodbRequests[cycleStart:cycleEnd] {
+									if _, duplicate := seen[host]; duplicate {
+										t.Fatalf(
+											"traffic cycle %v repeated endpoint %q",
+											dynamodbRequests[cycleStart:cycleEnd],
+											host,
+										)
+									}
+									seen[host] = struct{}{}
+								}
 							}
 						})
 					}
@@ -482,13 +497,13 @@ func TestOptions(t *testing.T) {
 		}
 	})
 
-	t.Run("WithNodeHealthStoreConfig", func(t *testing.T) {
+	t.Run("NodeHealth", func(t *testing.T) {
 		t.Parallel()
 
-		t.Run("Disabled", func(t *testing.T) {
+		t.Run("LegacyDisabledConfig", func(t *testing.T) {
 			t.Parallel()
 
-			healthConfig := nodeshealth.NodeHealthStoreConfig{
+			healthConfig := nodeshealth.NodeHealthStoreConfig{ //nolint:staticcheck // Legacy compatibility test.
 				Disabled: true,
 			}
 
@@ -543,8 +558,18 @@ func TestOptions(t *testing.T) {
 			}
 
 			t.Run("NodesNeverQuarantined", func(t *testing.T) {
-				// Initially only node1 is known - with disabled tracking it should be active
-				assertNodesStatus(t, h.nodes, []url.URL{node1}, nil)
+				// First-use discovery is asynchronous and may already have expanded the ring.
+				// Regardless of that race, disabled health exposes every current member as active.
+				if len(h.GetQuarantinedNodes()) != 0 || len(h.GetDownNodes()) != 0 {
+					t.Fatalf(
+						"disabled health exposed quarantine=%v down=%v",
+						h.GetQuarantinedNodes(),
+						h.GetDownNodes(),
+					)
+				}
+				if status := h.GetNodeHealthStatus(node1); status == nil || status.State() != nodeshealth.StateActive {
+					t.Fatalf("disabled seed status got %v, want ACTIVE", status)
+				}
 
 				// Trigger node discovery - mock will return 3 nodes
 				if err := h.UpdateLiveNodes(); err != nil {
@@ -597,13 +622,10 @@ func TestOptions(t *testing.T) {
 			})
 		})
 
-		t.Run("BasicFunctionality", func(t *testing.T) {
+		t.Run("StateMachineFunctionality", func(t *testing.T) {
 			t.Parallel()
 
-			// Custom config with faster reset interval for testing and disabled update intervals to ensure it does not
-			healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-			healthConfig.Scoring.ResetInterval = 1 * time.Second
-			healthConfig.QuarantineReleasePeriod = -1 // Disable automatic release checks
+			healthConfig := adapterNodeHealthConfig()
 
 			connRefusedErr := &net.OpError{Err: syscall.ECONNREFUSED}
 
@@ -613,10 +635,7 @@ func TestOptions(t *testing.T) {
 			node3 := url.URL{Scheme: "http", Host: "node3.local:8080"}
 			node4 := url.URL{Scheme: "http", Host: "node4.local:8080"}
 
-			// Include all nodes in the mock (even though we'll only discover 3 initially)
 			allMockNodes := []url.URL{node1, node2, node3}
-
-			// Default DynamoDB response for healthy nodes
 			defaultDynamoDBResp := func(req *http.Request) (*http.Response, error) {
 				tableNames := []string{"test-table"}
 				return resp.DynamoDBListTablesResponse(tableNames, req)
@@ -632,141 +651,80 @@ func TestOptions(t *testing.T) {
 				}),
 				WithScheme("http"),
 				WithPort(8080),
-				WithNodeHealthStoreConfig(healthConfig),
-				WithIdleNodesListUpdatePeriod(0), // Disable automatic node list updates
-				WithAWSConfigOptions(
-					func(cfg *aws.Config) {
-						cfg.RetryMaxAttempts = 3 // Allow some retries to make sure that query does not fail
-					}),
+				WithNodeHealthConfig(healthConfig),
+				WithNodesListUpdatePeriod(time.Hour),
+				WithIdleNodesListUpdatePeriod(time.Hour),
 			)
 			if err != nil {
 				t.Fatalf("NewHelper failed: %v", err)
 			}
 			defer h.Stop()
 
-			// Enforce seed for reproducibility
-			h.queryPlanSeed = 8
+			assertHelperNodeHealth(t, h, nil, []url.URL{node1}, nil)
 
-			ddb, err := h.NewDynamoDB(func(options *dynamodb.Options) {
-				options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
-					options.MaxAttempts = 3
-					options.MaxBackoff = 0
-				})
-			})
-			if err != nil {
-				t.Fatalf("NewDynamoDB returned error: %s", err.Error())
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes failed: %v", err)
 			}
+			// Only the endpoint that supplied /localnodes is directly validated.
+			assertHelperNodeHealth(t, h, []url.URL{node1}, []url.URL{node2, node3}, nil)
 
-			t.Run("Phase-1:Node2-Down", func(t *testing.T) {
-				assertNodesStatus(t, h.nodes, []url.URL{}, []url.URL{node1})
+			released, err := h.ProbeQuarantinedNodes(context.Background())
+			if err != nil {
+				t.Fatalf("ProbeQuarantinedNodes failed: %v", err)
+			}
+			if diff := cmp.Diff([]url.URL{node3}, released); diff != "" {
+				t.Fatalf("unexpected successful probes (-want +got):\n%s", diff)
+			}
+			// Failed quarantine probes are neutral; successful ones promote directly.
+			assertHelperNodeHealth(t, h, []url.URL{node1, node3}, []url.URL{node2}, nil)
 
-				// Trigger node discovery - mock will return 3 nodes
-				// it will also try to get them out of quarant
-				if err := h.UpdateLiveNodes(); err != nil {
-					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-				}
+			mockTransport.SetNodeHealthy(node2, nil)
+			if _, err := h.ProbeQuarantinedNodes(context.Background()); err != nil {
+				t.Fatalf("second ProbeQuarantinedNodes failed: %v", err)
+			}
+			assertHelperNodeHealth(t, h, []url.URL{node1, node2, node3}, nil, nil)
 
-				mockTransport.GetNodeHealthCounter(node1)
+			source := h.nodes.(nodeHealthNodesSource)
+			if !source.ReportNodeTrafficObservation(
+				node3,
+				source.GetNodeHealthGeneration(node3),
+				nodeshealth.ObservationTrafficFailure,
+			) {
+				t.Fatal("traffic failure was not accepted")
+			}
+			assertHelperNodeHealth(t, h, []url.URL{node1, node2}, nil, []url.URL{node3})
 
-				assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
-			})
+			mockTransport.SetNodeError(node4, connRefusedErr)
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes after adding node4 failed: %v", err)
+			}
+			assertHelperNodeHealth(t, h, []url.URL{node1, node2}, []url.URL{node4}, []url.URL{node3})
 
-			t.Run("Phase2:Node2-UP", func(t *testing.T) {
-				// Node 2 become functional
-				mockTransport.SetNodeHealthy(node2, nil)
+			mockTransport.SetNodeHealthy(node3, nil)
+			mockTransport.SetNodeHealthy(node4, nil)
+			liveNodes := h.nodes.(*shared.AlternatorLiveNodes)
+			if !liveNodes.ReportNodeObservation(node3, nodeshealth.ObservationProbeSuccess) {
+				t.Fatal("down recovery probe was not accepted")
+			}
+			if _, err := h.ProbeQuarantinedNodes(context.Background()); err != nil {
+				t.Fatalf("recovery ProbeQuarantinedNodes failed: %v", err)
+			}
+			assertHelperNodeHealth(t, h, []url.URL{node1, node2, node3, node4}, nil, nil)
 
-				if err := h.UpdateLiveNodes(); err != nil {
-					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-				}
-
-				// Quarantined node should stay in quarantine
-				assertNodesStatus(t, h.nodes, []url.URL{node1, node3}, []url.URL{node2})
-
-				// Test if quarantined nodes are up
-				h.nodes.TryReleaseQuarantinedNodes()
-
-				// Quarantined node should become active
-				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3}, []url.URL{})
-			})
-
-			t.Run("Phase-3-Node3-DOWN", func(t *testing.T) {
-				// Now node 3 is down
-				mockTransport.SetNodeError(node3, connRefusedErr)
-
-				for range 10 {
-					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
-						Limit: aws.Int32(5),
-					})
-					// Error should not happen, because it should hit broken node and retry on next one
-					if err != nil {
-						t.Fatalf("ListTables - failed, while should not: %s", err.Error())
-					}
-				}
-
-				// Node3 should go into quarantine because requests failed to many times on it
-				assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3})
-			})
-
-			t.Run("Phase4:Node4-ADDED", func(t *testing.T) {
-				// Node 4 was provisioned but it fails at start
-				mockTransport.SetNodeError(node4, connRefusedErr)
-
-				// Make client pick it up from alternator
-				if err := h.UpdateLiveNodes(); err != nil {
-					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-				}
-
-				// Node 4 should be added, but stay in quarantine
-				assertNodesStatus(t, h.nodes, []url.URL{node1, node2}, []url.URL{node3, node4})
-
-				// At this point two nodes down, but MaxAttempts=3, so requests should keep running without failures
-				for range 6 {
-					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
-						Limit: aws.Int32(5),
-					})
-					// Error should not happen, because it should hit broken node and retry on next one
-					if err != nil {
-						t.Fatalf("ListTables - failed, while should not: %s", err.Error())
-					}
-				}
-			})
-
-			t.Run("Phase5:Node4-UP", func(t *testing.T) {
-				// Node 4 was provisioned but it fails at start
-				mockTransport.SetNodeHealthy(node4, nil)
-				mockTransport.SetNodeHealthy(node3, nil)
-
-				h.nodes.TryReleaseQuarantinedNodes()
-
-				// Node 4 should be released from quarantine
-				assertNodesStatus(t, h.nodes, []url.URL{node1, node2, node3, node4}, []url.URL{})
-			})
-
-			t.Run("Phase6:Node1-REMOVED(between UpdateLiveNodes)", func(t *testing.T) {
-				mockTransport.DeleteNode(node1)
-
-				for range 6 {
-					_, err = ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{
-						Limit: aws.Int32(5),
-					})
-					// Error should not happen, because it should hit broken node and retry on next one
-					if err != nil {
-						t.Fatalf("ListTables - failed, while should not: %s", err.Error())
-					}
-				}
-
-				// Node 1 was removed from the cluster, but it wasn't discovered yet by `UpdateLiveNodes`
-				// so it should stay in quarantined list.
-				assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{node1})
-
-				err = h.UpdateLiveNodes()
-				if err != nil {
-					t.Fatalf("UpdateLiveNodes failed: %s", err.Error())
-				}
-
-				// Node 1 is gone completely
-				assertNodesStatus(t, h.nodes, []url.URL{node2, node3, node4}, []url.URL{})
-			})
+			mockTransport.DeleteNode(node1)
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatalf("UpdateLiveNodes after removing node1 failed: %v", err)
+			}
+			assertHelperNodeHealth(t, h, []url.URL{node2, node3, node4}, nil, nil)
+			if status := h.GetNodeHealthStatus(node1); status == nil || status.State() != nodeshealth.StateActive {
+				t.Fatalf("removed node history was not retained: %v", status)
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := h.Shutdown(shutdownCtx); err != nil {
+				t.Fatalf("Shutdown returned error: %v", err)
+			}
+			h.Stop() // Compatibility alias remains idempotent after Shutdown.
 		})
 	})
 
@@ -1303,6 +1261,7 @@ func TestOptions(t *testing.T) {
 				opts := []Option{
 					WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return mockTransport }),
 					WithCredentials("test-key", "test-secret"),
+					WithoutNodeHealth(),
 				}
 				if tc.cfg() != nil {
 					opts = append(opts, tc.cfg())
@@ -1325,6 +1284,14 @@ func TestOptions(t *testing.T) {
 
 				const requestsPerOperation = 8
 				const testKey = "same-key"
+				partitionHash, err := HashAttributeValue(&types.AttributeValueMemberS{Value: testKey})
+				if err != nil {
+					t.Fatalf("HashAttributeValue returned error: %v", err)
+				}
+				expectedAffinityNode := shared.FirstNodeWithSeed(
+					h.GetDiscoveredNodes(),
+					partitionHash,
+				).Host
 
 				for opName, opFn := range operations {
 					optimized := slices.Contains(tc.optimizedOps, opName)
@@ -1353,10 +1320,15 @@ func TestOptions(t *testing.T) {
 					}
 
 					if slices.Contains(tc.optimizedOps, opName) {
-						firstNode := nodes[0]
 						for i, node := range nodes {
-							if node != firstNode {
-								t.Errorf("request %d for %s went to %s, expected %s", i, opName, node, firstNode)
+							if node != expectedAffinityNode {
+								t.Errorf(
+									"request %d for %s went to %s, expected %s from complete discovered ring",
+									i,
+									opName,
+									node,
+									expectedAffinityNode,
+								)
 							}
 						}
 					} else {
@@ -1380,9 +1352,1229 @@ func TestOptions(t *testing.T) {
 	})
 }
 
-func TestDynamoDBNonOKResponsesKeepConnectionReusable(t *testing.T) {
+func TestRoundTripperWithoutAttemptDelegatesUnchanged(t *testing.T) {
 	t.Parallel()
 
+	req, err := http.NewRequest(http.MethodPost, "http://original.example.test/operation?x=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "original-authority.example.test"
+	originalURL := *req.URL
+	originalHost := req.Host
+	wantResponse := &http.Response{
+		StatusCode: http.StatusNoContent,
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+		Request:    req,
+	}
+	var calls atomic.Int32
+	transport := (&Helper{}).wrapHTTPTransport(roundTripFunc(func(got *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if got != req {
+			t.Errorf("delegated request pointer changed: got %p, want %p", got, req)
+		}
+		if *got.URL != originalURL || got.Host != originalHost {
+			t.Errorf(
+				"delegated destination changed: got URL=%s Host=%q, want URL=%s Host=%q",
+				got.URL,
+				got.Host,
+				originalURL.String(),
+				originalHost,
+			)
+		}
+		return wantResponse, nil
+	}))
+
+	gotResponse, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip returned error: %v", err)
+	}
+	if gotResponse != wantResponse {
+		t.Fatalf("RoundTrip returned response %p, want %p", gotResponse, wantResponse)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("original transport calls = %d, want 1", got)
+	}
+}
+
+func TestDataPlaneRedirectIsFinalSingleHealthObservation(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node.local:8080"}
+	var physicalAttempts atomic.Int32
+	h, err := NewHelper(
+		[]string{node.Hostname()},
+		WithNodeHealthConfig(adapterNodeHealthConfig()),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				physicalAttempts.Add(1)
+				header := make(http.Header)
+				header.Set("Location", "http://redirect.invalid/next")
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Status:     "302 Found",
+					Header:     header,
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	t.Cleanup(h.Stop)
+
+	before := h.GetNodeHealthStatus(node)
+	if before == nil {
+		t.Fatal("initial node health status is nil")
+	}
+	awsConfig, err := h.awsConfig()
+	if err != nil {
+		t.Fatalf("awsConfig returned error: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://placeholder.invalid/operation", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := middleware.WithStackValue(
+		req.Context(),
+		requestNodeKey,
+		shared.RouteAttempt{Node: node, Generation: before.Generation()},
+	)
+	response, err := awsConfig.HTTPClient.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("redirect response returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = response.Body.Close() })
+	if response.StatusCode != http.StatusFound {
+		t.Fatalf("response status = %d, want 302", response.StatusCode)
+	}
+	if got := physicalAttempts.Load(); got != 1 {
+		t.Fatalf("physical attempts = %d, want 1", got)
+	}
+	after := h.GetNodeHealthStatus(node)
+	if after == nil || after.ConsecutiveSuccesses() != 1 || after.ConsecutiveFailures() != 0 {
+		t.Fatalf("node status after redirect = %v, want one traffic success", after)
+	}
+}
+
+func TestHTTPAttemptHealthClassification(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name               string
+		status             int
+		transportErr       error
+		malformedGzip      bool
+		wantSuccesses      int
+		wantFailures       int
+		wantTransportError bool
+	}{
+		{name: "HTTP200", status: http.StatusOK, wantSuccesses: 1},
+		{name: "ApplicationError", status: http.StatusBadRequest, wantSuccesses: 1},
+		{name: "HTTP429", status: http.StatusTooManyRequests, wantSuccesses: 1},
+		{name: "HTTP500Neutral", status: http.StatusInternalServerError},
+		{name: "HTTP502Neutral", status: http.StatusBadGateway},
+		{name: "HTTP503Neutral", status: http.StatusServiceUnavailable},
+		{name: "HTTP504Neutral", status: http.StatusGatewayTimeout},
+		{
+			name:               "HTTPResponseWinsOverTransportError",
+			status:             http.StatusBadRequest,
+			transportErr:       errors.New("error returned with response"),
+			wantSuccesses:      1,
+			wantTransportError: true,
+		},
+		{
+			name:               "NoResponseTransportFailure",
+			transportErr:       errors.New("dial failed"),
+			wantFailures:       1,
+			wantTransportError: true,
+		},
+		{
+			name:               "MalformedCompressedHTTP200",
+			status:             http.StatusOK,
+			malformedGzip:      true,
+			wantSuccesses:      1,
+			wantTransportError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			node := url.URL{Scheme: "http", Host: "node.local:8080"}
+			healthConfig := adapterNodeHealthConfig()
+			healthConfig.ActiveFailureThreshold = 2
+			healthConfig.QuarantineFailureThreshold = 2
+			healthConfig.QuarantinePromotionThreshold = 2
+			var physicalAttempts atomic.Int32
+
+			options := []Option{
+				WithNodeHealthConfig(healthConfig),
+				WithNodesListUpdatePeriod(time.Hour),
+				WithIdleNodesListUpdatePeriod(time.Hour),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						physicalAttempts.Add(1)
+						if tc.transportErr != nil && tc.status == 0 {
+							return nil, tc.transportErr
+						}
+						header := make(http.Header)
+						body := `{}`
+						if tc.malformedGzip {
+							header.Set("Content-Encoding", "gzip")
+							body = "not-a-gzip-stream"
+						}
+						return &http.Response{
+							StatusCode: tc.status,
+							Status:     fmt.Sprintf("%d test", tc.status),
+							Header:     header,
+							Body:       io.NopCloser(strings.NewReader(body)),
+							Request:    req,
+						}, tc.transportErr
+					})
+				}),
+			}
+			if tc.malformedGzip {
+				options = append(options, WithResponseCompression(ResponseCompressionGzip))
+			}
+
+			h, err := NewHelper([]string{node.Hostname()}, options...)
+			if err != nil {
+				t.Fatalf("NewHelper returned error: %v", err)
+			}
+			t.Cleanup(h.Stop)
+
+			before := h.GetNodeHealthStatus(node)
+			if before == nil || before.State() != nodeshealth.StateQuarantined {
+				t.Fatalf("initial status = %v, want QUARANTINED", before)
+			}
+			awsConfig, err := h.awsConfig()
+			if err != nil {
+				t.Fatalf("awsConfig returned error: %v", err)
+			}
+			req, err := http.NewRequest(http.MethodPost, "http://placeholder.invalid/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := middleware.WithStackValue(
+				req.Context(),
+				requestNodeKey,
+				shared.RouteAttempt{Node: node, Generation: before.Generation()},
+			)
+			response, requestErr := awsConfig.HTTPClient.Do(req.WithContext(ctx))
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			if tc.wantTransportError && requestErr == nil {
+				t.Fatal("physical request unexpectedly succeeded")
+			}
+			if !tc.wantTransportError && requestErr != nil {
+				t.Fatalf("physical request returned error: %v", requestErr)
+			}
+			if got := physicalAttempts.Load(); got != 1 {
+				t.Fatalf("physical attempts = %d, want 1", got)
+			}
+
+			after := h.GetNodeHealthStatus(node)
+			if after == nil {
+				t.Fatal("node health status disappeared")
+			}
+			if after.State() != nodeshealth.StateQuarantined ||
+				after.ConsecutiveSuccesses() != tc.wantSuccesses ||
+				after.ConsecutiveFailures() != tc.wantFailures {
+				t.Fatalf(
+					"status = %v, want QUARANTINED successes=%d failures=%d",
+					after,
+					tc.wantSuccesses,
+					tc.wantFailures,
+				)
+			}
+			if tc.wantSuccesses == 0 && tc.wantFailures == 0 && after.Updated() != before.Updated() {
+				t.Fatalf("neutral response changed update time from %s to %s", before.Updated(), after.Updated())
+			}
+		})
+	}
+}
+
+func TestHTTPClientOverridesCannotBypassHealthClassification(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		response  func(*http.Request) (*http.Response, error)
+		wantFails int
+		wantOKs   int
+		directDo  bool
+		locations []string
+		unchanged bool
+	}{
+		{
+			name: "HTTP200",
+			response: func(req *http.Request) (*http.Response, error) {
+				return resp.DynamoDBListTablesResponse(nil, req)
+			},
+			wantOKs: 1,
+		},
+		{
+			name: "HTTP503Neutral",
+			response: func(req *http.Request) (*http.Response, error) {
+				return resp.New().ServiceUnavailable().Body("unavailable").Request(req).Build()
+			},
+		},
+		{
+			name: "NoResponseFailure",
+			response: func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("dial failed")
+			},
+			wantFails: 1,
+		},
+		{
+			name: "OpaqueNoResponseFailure",
+			response: func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("dial failed")
+			},
+			wantFails: 1,
+			directDo:  true,
+		},
+		{
+			name: "HTTPResponseWinsOverError",
+			response: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Status:     "400 Bad Request",
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+					Request:    req,
+				}, errors.New("response and error")
+			},
+			wantOKs:  1,
+			directDo: true,
+		},
+		{
+			name: "HTTP302RedirectTargetFailure",
+			response: func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host == "redirected.invalid" {
+					return nil, errors.New("redirect target failed")
+				}
+				header := make(http.Header)
+				header.Set("Location", "http://redirected.invalid/")
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Status:     "302 Found",
+					Header:     header,
+					Body:       http.NoBody,
+					Request:    req,
+				}, nil
+			},
+			wantOKs: 1,
+			// Per-operation HTTP client overrides run after APIOptions and cannot be
+			// prepared through the AWS SDK v2 public hooks.
+			locations: []string{"config", "service", "client"},
+			unchanged: true,
+		},
+	} {
+		locations := tc.locations
+		if len(locations) == 0 {
+			locations = []string{"config", "service", "client", "operation"}
+		}
+		for _, location := range locations {
+			t.Run(tc.name+"/"+location, func(t *testing.T) {
+				t.Parallel()
+				node := url.URL{Scheme: "http", Host: "node.local:8080"}
+				healthConfig := adapterNodeHealthConfig()
+				healthConfig.ActiveFailureThreshold = 2
+				healthConfig.QuarantineFailureThreshold = 2
+				healthConfig.QuarantinePromotionThreshold = 2
+				var physical atomic.Int32
+				do := func(req *http.Request) (*http.Response, error) {
+					physical.Add(1)
+					return tc.response(req)
+				}
+				standardClient := &http.Client{Transport: roundTripFunc(do)}
+				var customClient dynamodb.HTTPClient = standardClient
+				if tc.directDo {
+					customClient = httpDoFunc(do)
+				}
+				newRetryer := func() aws.Retryer {
+					return retry.NewStandard(func(options *retry.StandardOptions) {
+						options.MaxAttempts = 1
+					})
+				}
+				options := []Option{
+					WithNodeHealthConfig(healthConfig),
+					WithNodesListUpdatePeriod(0),
+					WithIdleNodesListUpdatePeriod(-1),
+					WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+						return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+							if req.Method == http.MethodGet {
+								return nil, errors.New("discovery unavailable")
+							}
+							t.Fatal("helper transport handled a request meant for the HTTPClient override")
+							return nil, nil
+						})
+					}),
+				}
+				if location == "config" || location == "service" {
+					options = append(options, WithAWSConfigOptions(func(config *aws.Config) {
+						if location == "config" {
+							config.HTTPClient = customClient
+							config.Retryer = newRetryer
+							return
+						}
+						config.ServiceOptions = append(config.ServiceOptions, func(service string, raw any) {
+							if service != dynamodb.ServiceID {
+								return
+							}
+							serviceOptions := raw.(*dynamodb.Options)
+							serviceOptions.HTTPClient = customClient
+							serviceOptions.Retryer = newRetryer()
+						})
+					}))
+				}
+				h, err := NewHelper([]string{node.Hostname()}, options...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(h.Stop)
+				var clientOptions []func(*dynamodb.Options)
+				if location == "client" {
+					clientOptions = append(clientOptions, func(options *dynamodb.Options) {
+						options.HTTPClient = customClient
+						options.Retryer = newRetryer()
+					})
+				}
+				client, err := h.NewDynamoDB(clientOptions...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var operationOptions []func(*dynamodb.Options)
+				if location == "operation" {
+					operationOptions = append(operationOptions, func(options *dynamodb.Options) {
+						options.HTTPClient = customClient
+						options.Retryer = newRetryer()
+					})
+				}
+				_, _ = client.ListTables(context.Background(), &dynamodb.ListTablesInput{}, operationOptions...)
+				if physical.Load() != 1 {
+					t.Fatalf("physical calls = %d, want 1", physical.Load())
+				}
+				if tc.unchanged && standardClient.CheckRedirect != nil {
+					t.Fatal("caller-owned HTTP client was mutated")
+				}
+				after := h.GetNodeHealthStatus(node)
+				if after.ConsecutiveFailures() != tc.wantFails || after.ConsecutiveSuccesses() != tc.wantOKs {
+					t.Fatalf("status = %v, want failures=%d successes=%d", after, tc.wantFails, tc.wantOKs)
+				}
+			})
+		}
+	}
+}
+
+func TestHTTPClientOverrideClassificationSurvivesDeserializeOutputReplacement(t *testing.T) {
+	t.Parallel()
+
+	healthConfig := adapterNodeHealthConfig()
+	h, err := NewHelper(
+		[]string{"node-a.local", "node-b.local"},
+		WithNodeHealthConfig(healthConfig),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				t.Fatal("helper transport handled a request meant for the operation HTTP client")
+				return nil, nil
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Stop)
+	h.queryPlanSeed = 37
+
+	client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 2
+			options.MaxBackoff = 0
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu            sync.Mutex
+		physicalHosts []string
+	)
+	_, err = client.ListTables(
+		context.Background(),
+		&dynamodb.ListTablesInput{},
+		func(options *dynamodb.Options) {
+			options.HTTPClient = httpDoFunc(func(req *http.Request) (*http.Response, error) {
+				mu.Lock()
+				physicalHosts = append(physicalHosts, req.URL.Host)
+				mu.Unlock()
+				return nil, errors.New("dial failed")
+			})
+			options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(
+					middleware.DeserializeMiddlewareFunc(
+						"replaceDeserializeOutputAfterSend",
+						func(
+							ctx context.Context,
+							in middleware.DeserializeInput,
+							next middleware.DeserializeHandler,
+						) (middleware.DeserializeOutput, middleware.Metadata, error) {
+							_, metadata, deserializeErr := next.HandleDeserialize(ctx, in)
+							return middleware.DeserializeOutput{}, metadata,
+								fmt.Errorf("instrumented deserialize: %w", deserializeErr)
+						},
+					),
+					middleware.After,
+				)
+			})
+		},
+	)
+	if err == nil {
+		t.Fatal("ListTables unexpectedly succeeded")
+	}
+	mu.Lock()
+	hosts := append([]string(nil), physicalHosts...)
+	mu.Unlock()
+	if len(hosts) != 2 || hosts[0] == hosts[1] {
+		t.Fatalf("physical hosts = %v, want two distinct retry routes", hosts)
+	}
+	for _, node := range h.GetDiscoveredNodes() {
+		status := h.GetNodeHealthStatus(node)
+		if status == nil || status.State() != nodeshealth.StateDown || status.ConsecutiveFailures() != 1 {
+			t.Fatalf("status for %v = %v, want DOWN with one failure", node, status)
+		}
+	}
+}
+
+func TestBorrowedHelperHTTPClientCannotConsumeAnotherHelpersAttempt(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node.local:8080"}
+	healthConfig := adapterNodeHealthConfig()
+	healthConfig.QuarantinePromotionThreshold = 2
+	helperA, err := NewHelper(
+		[]string{node.Hostname()},
+		WithNodeHealthConfig(healthConfig),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				return resp.DynamoDBListTablesResponse(nil, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(helperA.Stop)
+	clientA, err := helperA.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 1
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	borrowedClient := clientA.Options().HTTPClient
+
+	helperB, err := NewHelper(
+		[]string{node.Hostname()},
+		WithNodeHealthConfig(healthConfig),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithAWSConfigOptions(func(config *aws.Config) {
+			config.HTTPClient = borrowedClient
+		}),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				t.Fatal("helper B transport handled a request meant for the borrowed client")
+				return nil, nil
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(helperB.Stop)
+	clientB, err := helperB.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 1
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientB.ListTables(context.Background(), &dynamodb.ListTablesInput{}); err != nil {
+		t.Fatal(err)
+	}
+
+	statusA := helperA.GetNodeHealthStatus(node)
+	if statusA == nil || statusA.ConsecutiveSuccesses() != 0 || statusA.ConsecutiveFailures() != 0 {
+		t.Fatalf("helper A status = %v, want unchanged quarantine", statusA)
+	}
+	statusB := helperB.GetNodeHealthStatus(node)
+	if statusB == nil || statusB.State() != nodeshealth.StateQuarantined ||
+		statusB.ConsecutiveSuccesses() != 1 || statusB.ConsecutiveFailures() != 0 {
+		t.Fatalf("helper B status = %v, want one traffic success", statusB)
+	}
+}
+
+func TestSDKPipelineFallbackIgnoresPreTransportDeserializeError(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node.local:8080"}
+	var physicalAttempts atomic.Int32
+	h, err := NewHelper(
+		[]string{node.Hostname()},
+		WithNodeHealthConfig(adapterNodeHealthConfig()),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				physicalAttempts.Add(1)
+				return resp.DynamoDBListTablesResponse(nil, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Stop)
+	client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 1
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localErr := errors.New("local deserialize rejection")
+	_, err = client.ListTables(
+		context.Background(),
+		&dynamodb.ListTablesInput{},
+		func(options *dynamodb.Options) {
+			options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(
+					middleware.DeserializeMiddlewareFunc(
+						"rejectBeforeHTTP",
+						func(
+							context.Context,
+							middleware.DeserializeInput,
+							middleware.DeserializeHandler,
+						) (middleware.DeserializeOutput, middleware.Metadata, error) {
+							return middleware.DeserializeOutput{}, middleware.Metadata{}, localErr
+						},
+					),
+					middleware.After,
+				)
+			})
+		},
+	)
+	if !errors.Is(err, localErr) {
+		t.Fatalf("ListTables error = %v, want %v", err, localErr)
+	}
+	if got := physicalAttempts.Load(); got != 0 {
+		t.Fatalf("physical attempts = %d, want zero", got)
+	}
+	status := h.GetNodeHealthStatus(node)
+	if status == nil || status.State() != nodeshealth.StateQuarantined ||
+		status.ConsecutiveFailures() != 0 || status.ConsecutiveSuccesses() != 0 {
+		t.Fatalf("status after local middleware error = %v, want unchanged quarantine", status)
+	}
+}
+
+func TestRetryRechecksPendingAttemptHealthBeforePhysicalTransmission(t *testing.T) {
+	t.Parallel()
+
+	var (
+		middlewareCalls  atomic.Int32
+		physicalAttempts atomic.Int32
+		physicalHost     string
+		pendingNode      url.URL
+		newlyActive      url.URL
+	)
+	h, err := NewHelper(
+		[]string{"node-a.local", "node-b.local"},
+		WithCredentials("access-key", "secret-key"),
+		WithNodeHealthConfig(adapterNodeHealthConfig()),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				physicalAttempts.Add(1)
+				physicalHost = req.URL.Host
+				return resp.DynamoDBListTablesResponse(nil, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Stop)
+	liveNodes := h.nodes.(*shared.AlternatorLiveNodes)
+	discovered := h.GetDiscoveredNodes()
+	if len(discovered) != 2 {
+		t.Fatalf("discovered nodes = %v, want two", discovered)
+	}
+
+	client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 2
+			options.MaxBackoff = 0
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryErr := errors.New("retry before transport")
+	_, err = client.ListTables(
+		context.Background(),
+		&dynamodb.ListTablesInput{},
+		func(options *dynamodb.Options) {
+			options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(
+					middleware.DeserializeMiddlewareFunc(
+						"retryBeforeHTTP",
+						func(
+							ctx context.Context,
+							in middleware.DeserializeInput,
+							next middleware.DeserializeHandler,
+						) (middleware.DeserializeOutput, middleware.Metadata, error) {
+							if middlewareCalls.Add(1) != 1 {
+								return next.HandleDeserialize(ctx, in)
+							}
+							attempt, attemptErr := getRequestAttemptFromContext(ctx)
+							if attemptErr != nil {
+								return middleware.DeserializeOutput{}, middleware.Metadata{}, attemptErr
+							}
+							pendingNode = attempt.Node
+							for _, candidate := range discovered {
+								if candidate == pendingNode {
+									continue
+								}
+								newlyActive = candidate
+								break
+							}
+							if newlyActive.Host == "" {
+								return middleware.DeserializeOutput{}, middleware.Metadata{},
+									errors.New("no alternate endpoint")
+							}
+							if !liveNodes.ReportNodeObservation(
+								newlyActive,
+								nodeshealth.ObservationProbeSuccess,
+							) {
+								return middleware.DeserializeOutput{}, middleware.Metadata{},
+									errors.New("failed to promote alternate endpoint")
+							}
+							return middleware.DeserializeOutput{}, middleware.Metadata{},
+								&smithyhttp.RequestSendError{Err: retryErr}
+						},
+					),
+					middleware.After,
+				)
+			})
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListTables returned error: %v", err)
+	}
+	if got := middlewareCalls.Load(); got != 2 {
+		t.Fatalf("middleware calls = %d, want two", got)
+	}
+	if got := physicalAttempts.Load(); got != 1 {
+		t.Fatalf("physical attempts = %d, want one", got)
+	}
+	if physicalHost != newlyActive.Host {
+		t.Fatalf("physical host = %q, want newly active host %q", physicalHost, newlyActive.Host)
+	}
+	status := h.GetNodeHealthStatus(pendingNode)
+	if status == nil || status.State() != nodeshealth.StateQuarantined ||
+		status.ConsecutiveFailures() != 0 || status.ConsecutiveSuccesses() != 0 {
+		t.Fatalf("untransmitted pending status = %v, want unchanged quarantine", status)
+	}
+}
+
+func TestRetryReselectsPendingActiveAttemptBeforePhysicalTransmission(t *testing.T) {
+	t.Parallel()
+
+	const queryPlanSeed = int64(37)
+	var (
+		middlewareCalls  atomic.Int32
+		physicalAttempts atomic.Int32
+		physicalHost     string
+	)
+	h, err := NewHelper(
+		[]string{"node-a.local", "node-b.local"},
+		WithCredentials("access-key", "secret-key"),
+		WithNodeHealthConfig(adapterNodeHealthConfig()),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				physicalAttempts.Add(1)
+				physicalHost = req.URL.Host
+				return resp.DynamoDBListTablesResponse(nil, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Stop)
+	liveNodes := h.nodes.(*shared.AlternatorLiveNodes)
+	h.queryPlanSeed = queryPlanSeed
+
+	expectedPlan := shared.NewLazyQueryPlanWithSeed(h.nodes, queryPlanSeed)
+	earlier, ok := expectedPlan.NextAttempt()
+	if !ok {
+		t.Fatal("expected plan returned no earlier route")
+	}
+	pending, ok := expectedPlan.NextAttempt()
+	if !ok {
+		t.Fatal("expected plan returned no pending route")
+	}
+	if !liveNodes.ReportNodeObservation(pending.Node, nodeshealth.ObservationProbeSuccess) {
+		t.Fatal("failed to activate pending endpoint")
+	}
+
+	client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 2
+			options.MaxBackoff = 0
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryErr := errors.New("retry before transport")
+	_, err = client.ListTables(
+		context.Background(),
+		&dynamodb.ListTablesInput{},
+		func(options *dynamodb.Options) {
+			options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(
+					middleware.DeserializeMiddlewareFunc(
+						"activateEarlierRouteBeforeRetry",
+						func(
+							ctx context.Context,
+							in middleware.DeserializeInput,
+							next middleware.DeserializeHandler,
+						) (middleware.DeserializeOutput, middleware.Metadata, error) {
+							if middlewareCalls.Add(1) != 1 {
+								return next.HandleDeserialize(ctx, in)
+							}
+							attempt, attemptErr := getRequestAttemptFromContext(ctx)
+							if attemptErr != nil {
+								return middleware.DeserializeOutput{}, middleware.Metadata{}, attemptErr
+							}
+							if attempt.Node != pending.Node {
+								return middleware.DeserializeOutput{}, middleware.Metadata{}, fmt.Errorf(
+									"initial route = %v, want active endpoint %v",
+									attempt.Node,
+									pending.Node,
+								)
+							}
+							if !liveNodes.ReportNodeObservation(
+								earlier.Node,
+								nodeshealth.ObservationProbeSuccess,
+							) {
+								return middleware.DeserializeOutput{}, middleware.Metadata{},
+									errors.New("failed to activate earlier endpoint")
+							}
+							return middleware.DeserializeOutput{}, middleware.Metadata{},
+								&smithyhttp.RequestSendError{Err: retryErr}
+						},
+					),
+					middleware.After,
+				)
+			})
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListTables returned error: %v", err)
+	}
+	if got := middlewareCalls.Load(); got != 2 {
+		t.Fatalf("middleware calls = %d, want two", got)
+	}
+	if got := physicalAttempts.Load(); got != 1 {
+		t.Fatalf("physical attempts = %d, want one", got)
+	}
+	if physicalHost != earlier.Node.Host {
+		t.Fatalf("physical host = %q, want earlier active host %q", physicalHost, earlier.Node.Host)
+	}
+}
+
+func TestSDKPipelineFallbackDoesNotDoubleCountObservedTransport(t *testing.T) {
+	t.Parallel()
+	node := url.URL{Scheme: "http", Host: "node.local:8080"}
+	healthConfig := adapterNodeHealthConfig()
+	healthConfig.QuarantinePromotionThreshold = 2
+	h, err := NewHelper(
+		[]string{node.Hostname()},
+		WithNodeHealthConfig(healthConfig),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				return resp.DynamoDBListTablesResponse(nil, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Stop)
+	client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 1
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListTables(context.Background(), &dynamodb.ListTablesInput{}); err != nil {
+		t.Fatal(err)
+	}
+	status := h.GetNodeHealthStatus(node)
+	if status == nil || status.State() != nodeshealth.StateQuarantined || status.ConsecutiveSuccesses() != 1 {
+		t.Fatalf("status = %v, want one exactly-counted quarantine success", status)
+	}
+}
+
+func TestHTTPAttemptRefreshesGenerationEveryPhysicalAttempt(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node.local:8080"}
+	var observedGenerations []uint64
+	h, err := NewHelper(
+		[]string{node.Hostname()},
+		WithNodeHealthConfig(adapterNodeHealthConfig()),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNRESET}
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewHelper returned error: %v", err)
+	}
+	t.Cleanup(h.Stop)
+
+	liveNodes := h.nodes.(*shared.AlternatorLiveNodes)
+	if !liveNodes.ReportNodeObservation(node, nodeshealth.ObservationProbeSuccess) {
+		t.Fatal("initial promotion failed")
+	}
+
+	h.cfg.HTTPAttemptObserver = func(req *http.Request, _ *http.Response, _ error) {
+		attempt, attemptErr := getRequestAttemptFromContext(req.Context())
+		if attemptErr != nil {
+			t.Errorf("raw observer could not read route attempt: %v", attemptErr)
+			return
+		}
+		observedGenerations = append(observedGenerations, attempt.Generation)
+		if len(observedGenerations) == 1 {
+			if !liveNodes.ReportNodeObservation(node, nodeshealth.ObservationProbeSuccess) {
+				t.Error("down recovery observation was not accepted")
+			}
+			if !liveNodes.ReportNodeObservation(node, nodeshealth.ObservationProbeSuccess) {
+				t.Error("quarantine validation observation was not accepted")
+			}
+		}
+	}
+	ddb, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 2
+			options.MaxBackoff = 0
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewDynamoDB returned error: %v", err)
+	}
+	if _, err := ddb.ListTables(context.Background(), &dynamodb.ListTablesInput{}); err == nil {
+		t.Fatal("ListTables unexpectedly succeeded")
+	}
+
+	if diff := cmp.Diff([]uint64{0, 1}, observedGenerations); diff != "" {
+		t.Fatalf("raw attempt generations differ (-want +got):\n%s", diff)
+	}
+	status := h.GetNodeHealthStatus(node)
+	if status == nil || status.State() != nodeshealth.StateDown || status.Generation() != 2 {
+		t.Fatalf("final node status = %v, want DOWN generation 2", status)
+	}
+}
+
+func TestRetryAttemptAccountingAroundCompression(t *testing.T) {
+	t.Run("RequestCompressionFailureAdvancesRouteAndReportsFailure", func(t *testing.T) {
+		const queryPlanSeed = int64(37)
+		var (
+			compressionCalls         atomic.Int32
+			physicalAttempts         atomic.Int32
+			compressionFailureAtSend atomic.Bool
+			physicalHost             string
+			h                        *Helper
+			failedRoute              url.URL
+		)
+		healthConfig := adapterNodeHealthConfig()
+		healthConfig.QuarantinePromotionThreshold = 2
+		healthConfig.QuarantineFailureThreshold = 2
+		var err error
+		h, err = NewHelper(
+			[]string{"node-a.local", "node-b.local"},
+			WithCredentials("access-key", "secret-key"),
+			WithNodeHealthConfig(healthConfig),
+			WithNodesListUpdatePeriod(0),
+			WithIdleNodesListUpdatePeriod(-1),
+			WithRequestCompression(func(body io.ReadCloser) (io.ReadCloser, string, int64, error) {
+				if compressionCalls.Add(1) == 1 {
+					return body, "", 0, errors.New("local request compression failure")
+				}
+				return body, "", -1, nil
+			}),
+			WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+				return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodGet {
+						return nil, errors.New("discovery unavailable")
+					}
+					physicalAttempts.Add(1)
+					physicalHost = req.URL.Host
+					status := h.GetNodeHealthStatus(failedRoute)
+					compressionFailureAtSend.Store(status != nil &&
+						status.State() == nodeshealth.StateQuarantined &&
+						status.ConsecutiveFailures() == 1)
+					return resp.DynamoDBListTablesResponse(nil, req)
+				})
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewHelper returned error: %v", err)
+		}
+		t.Cleanup(h.Stop)
+		h.queryPlanSeed = queryPlanSeed
+
+		expectedPlan := shared.NewLazyQueryPlanWithSeed(h.nodes, queryPlanSeed)
+		expected, ok := expectedPlan.NextAttempt()
+		if !ok {
+			t.Fatal("expected plan returned no route")
+		}
+		failedRoute = expected.Node
+		expectedRetry, ok := expectedPlan.NextAttempt()
+		if !ok {
+			t.Fatal("expected plan returned no retry route")
+		}
+		client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+			options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+				options.MaxAttempts = 2
+				options.MaxBackoff = 0
+			})
+		})
+		if err != nil {
+			t.Fatalf("NewDynamoDB returned error: %v", err)
+		}
+		if _, err := client.ListTables(context.Background(), &dynamodb.ListTablesInput{}); err != nil {
+			t.Fatalf("ListTables returned error: %v", err)
+		}
+
+		if got := compressionCalls.Load(); got != 2 {
+			t.Fatalf("request compression calls = %d, want 2", got)
+		}
+		if got := physicalAttempts.Load(); got != 1 {
+			t.Fatalf("physical attempts = %d, want 1", got)
+		}
+		if physicalHost != expectedRetry.Node.Host {
+			t.Fatalf(
+				"physical host after local retry = %q, want next route %q",
+				physicalHost,
+				expectedRetry.Node.Host,
+			)
+		}
+		if !compressionFailureAtSend.Load() {
+			t.Fatal("request-compression failure was not reported before retry transmission")
+		}
+		failedStatus := h.GetNodeHealthStatus(expected.Node)
+		if failedStatus == nil || failedStatus.State() != nodeshealth.StateQuarantined ||
+			failedStatus.ConsecutiveFailures() != 1 {
+			t.Fatalf("failed compression route status = %v, want QUARANTINED with one failure", failedStatus)
+		}
+		retryStatus := h.GetNodeHealthStatus(expectedRetry.Node)
+		if retryStatus == nil || retryStatus.State() != nodeshealth.StateQuarantined ||
+			retryStatus.ConsecutiveFailures() != 0 || retryStatus.ConsecutiveSuccesses() != 1 {
+			t.Fatalf("successful retry route status = %v, want QUARANTINED with one success", retryStatus)
+		}
+	})
+
+	t.Run("ResponseDecompressionFailureCompletesAndAdvancesRoute", func(t *testing.T) {
+		var (
+			mu            sync.Mutex
+			physicalHosts []string
+		)
+		h, err := NewHelper(
+			[]string{"node-a.local", "node-b.local"},
+			WithCredentials("access-key", "secret-key"),
+			WithNodeHealthConfig(adapterNodeHealthConfig()),
+			WithNodesListUpdatePeriod(0),
+			WithIdleNodesListUpdatePeriod(-1),
+			WithResponseCompression(ResponseCompressionGzip),
+			WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+				return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodGet {
+						return nil, errors.New("discovery unavailable")
+					}
+					mu.Lock()
+					physicalHosts = append(physicalHosts, req.URL.Host)
+					attemptNumber := len(physicalHosts)
+					mu.Unlock()
+					if attemptNumber == 1 {
+						header := make(http.Header)
+						header.Set("Content-Encoding", "gzip")
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Status:     "200 OK",
+							Header:     header,
+							Body:       io.NopCloser(strings.NewReader("not-a-gzip-stream")),
+							Request:    req,
+						}, nil
+					}
+					return resp.DynamoDBListTablesResponse(nil, req)
+				})
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewHelper returned error: %v", err)
+		}
+		t.Cleanup(h.Stop)
+		client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+			options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+				options.MaxAttempts = 2
+				options.MaxBackoff = 0
+			})
+		})
+		if err != nil {
+			t.Fatalf("NewDynamoDB returned error: %v", err)
+		}
+		if _, err := client.ListTables(context.Background(), &dynamodb.ListTablesInput{}); err != nil {
+			t.Fatalf("ListTables returned error: %v", err)
+		}
+
+		mu.Lock()
+		gotHosts := append([]string(nil), physicalHosts...)
+		mu.Unlock()
+		if len(gotHosts) != 2 {
+			t.Fatalf("physical hosts = %v, want two attempts", gotHosts)
+		}
+		if gotHosts[0] == gotHosts[1] {
+			t.Fatalf("response decompression failure reused completed route: %v", gotHosts)
+		}
+		if got := len(h.GetActiveNodes()); got != 2 {
+			t.Fatalf("active nodes after two raw HTTP 200 responses = %d, want 2", got)
+		}
+	})
+}
+
+func TestRequestCompressionFailureWithCancellationReportsFailure(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var physicalCalls atomic.Int32
+	h, err := NewHelper(
+		[]string{"node-a.local", "node-b.local"},
+		WithNodeHealthConfig(adapterNodeHealthConfig()),
+		WithNodesListUpdatePeriod(0),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithRequestCompression(func(body io.ReadCloser) (io.ReadCloser, string, int64, error) {
+			cancel()
+			return body, "", 0, errors.New("compression failed while caller canceled")
+		}),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return nil, errors.New("discovery unavailable")
+				}
+				physicalCalls.Add(1)
+				return resp.DynamoDBListTablesResponse(nil, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.Stop)
+	client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+		options.Retryer = retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = 2
+			options.MaxBackoff = 0
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListTables(ctx, &dynamodb.ListTablesInput{}); err == nil {
+		t.Fatal("ListTables unexpectedly succeeded")
+	}
+	if physicalCalls.Load() != 0 {
+		t.Fatalf("physical calls = %d, want zero", physicalCalls.Load())
+	}
+	down := 0
+	for _, node := range h.GetDiscoveredNodes() {
+		status := h.GetNodeHealthStatus(node)
+		if status == nil {
+			t.Fatalf("missing status for %v", node)
+		}
+		if status.State() == nodeshealth.StateDown {
+			down++
+			if status.ConsecutiveFailures() != 1 || status.ConsecutiveSuccesses() != 0 {
+				t.Fatalf("failed compression route %v status = %v, want one failure", node, status)
+			}
+			continue
+		}
+		if status.State() != nodeshealth.StateQuarantined ||
+			status.ConsecutiveFailures() != 0 || status.ConsecutiveSuccesses() != 0 {
+			t.Fatalf("untried route %v status = %v, want unchanged quarantine", node, status)
+		}
+	}
+	if down != 1 {
+		t.Fatalf("down nodes after canceled compression = %d, want 1", down)
+	}
+}
+
+func TestDynamoDBNonOKResponsesKeepConnectionReusable(t *testing.T) {
+	// Exact connection-count assertions need isolation from parallel transport stress.
 	server, connections, requests := newDynamoDBCountingHTTPServer(t)
 	defer server.Close()
 	host, port := splitTestServerHostPort(t, server)
@@ -1432,13 +2624,24 @@ func newDynamoDBCountingHTTPServer(t *testing.T) (*httptest.Server, *atomic.Int3
 
 	var connections atomic.Int32
 	var requests atomic.Int32
+	var dynamoDBConnections sync.Map
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			t.Fatalf("unexpected request path %q", r.URL.Path)
-		}
 		if r.Body != nil {
 			_, _ = io.Copy(io.Discard, r.Body)
 			_ = r.Body.Close()
+		}
+		if r.URL.Path == "/localnodes" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		if r.URL.Path != "/" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %q", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if _, loaded := dynamoDBConnections.LoadOrStore(r.RemoteAddr, struct{}{}); !loaded {
+			connections.Add(1)
 		}
 
 		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -1450,11 +2653,6 @@ func newDynamoDBCountingHTTPServer(t *testing.T) (*httptest.Server, *atomic.Int3
 			_, _ = w.Write([]byte(`{"TableNames":[]}`))
 		}
 	}))
-	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateNew {
-			connections.Add(1)
-		}
-	}
 	server.Start()
 	return server, &connections, &requests
 }
@@ -2158,6 +3356,64 @@ func batchWriteExpectedPlanHosts(t *testing.T, preferred []url.URL, _ []string) 
 		hosts = append(hosts, node.Host)
 	}
 	return hosts
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type httpDoFunc func(*http.Request) (*http.Response, error)
+
+func (f httpDoFunc) Do(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func adapterNodeHealthConfig() nodeshealth.Config {
+	config := nodeshealth.DefaultConfig()
+	config.ActiveFailureThreshold = 1
+	config.DownRecoveryThreshold = 1
+	config.QuarantinePromotionThreshold = 1
+	config.QuarantineFailureThreshold = 1
+	config.ProbePeriod = time.Hour
+	config.ProbeConcurrency = 1
+	config.ProbeTimeout = time.Second
+	return config
+}
+
+func assertHelperNodeHealth(
+	t *testing.T,
+	h *Helper,
+	active, quarantined, down []url.URL,
+) {
+	t.Helper()
+
+	discovered := append([]url.URL(nil), active...)
+	discovered = append(discovered, quarantined...)
+	discovered = append(discovered, down...)
+	wantDiscovered := sortNodes(append([]url.URL{}, discovered...))
+	if diff := cmp.Diff(wantDiscovered, sortNodes(h.GetDiscoveredNodes())); diff != "" {
+		t.Errorf("GetDiscoveredNodes() returned unexpected result (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(wantDiscovered, sortNodes(h.GetNodes())); diff != "" {
+		t.Errorf("GetNodes() alias returned unexpected result (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(sortNodes(append([]url.URL{}, active...)), sortNodes(h.GetActiveNodes())); diff != "" {
+		t.Errorf("GetActiveNodes() returned unexpected result (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(
+		sortNodes(append([]url.URL{}, quarantined...)),
+		sortNodes(h.GetQuarantinedNodes()),
+	); diff != "" {
+		t.Errorf("GetQuarantinedNodes() returned unexpected result (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(sortNodes(append([]url.URL{}, down...)), sortNodes(h.GetDownNodes())); diff != "" {
+		t.Errorf("GetDownNodes() returned unexpected result (-want +got):\n%s", diff)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
 }
 
 func sortNodes(nodes []url.URL) []url.URL {

@@ -14,7 +14,59 @@
 
 package shared
 
-import "net/http"
+import (
+	"context"
+	"errors"
+	"net/http"
+)
+
+type requestCompressionFailureHandlerKey struct{}
+
+// WithRequestCompressionFailureHandler attaches SDK attempt bookkeeping that
+// must run before a local request-compression error can be rewritten by a
+// client stack (for example, into a cancellation error).
+func WithRequestCompressionFailureHandler(ctx context.Context, handler func(error)) context.Context {
+	if handler == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestCompressionFailureHandlerKey{}, handler)
+}
+
+func reportRequestCompressionFailure(ctx context.Context, err error) {
+	if handler, ok := ctx.Value(requestCompressionFailureHandlerKey{}).(func(error)); ok {
+		handler(err)
+	}
+}
+
+type requestCompressionError struct {
+	err error
+}
+
+func (e *requestCompressionError) Error() string { return e.err.Error() }
+
+func (e *requestCompressionError) Unwrap() error { return e.err }
+
+// IsRequestCompressionError reports whether err was produced before the
+// request reached the physical HTTP transport. Besides ordinary Go error
+// wrapping, it follows AWS SDK v1's legacy OrigErr chain.
+func IsRequestCompressionError(err error) bool {
+	for err != nil {
+		var compressionErr *requestCompressionError
+		if errors.As(err, &compressionErr) {
+			return true
+		}
+		original, ok := err.(interface{ OrigErr() error })
+		if !ok {
+			return false
+		}
+		next := original.OrigErr()
+		if next == nil || next == err {
+			return false
+		}
+		err = next
+	}
+	return false
+}
 
 // CompressionTransport wraps an http.RoundTripper to compress request bodies
 type CompressionTransport struct {
@@ -38,7 +90,8 @@ func (c *CompressionTransport) RoundTrip(req *http.Request) (*http.Response, err
 
 	compressedBody, contentEncoding, length, err := c.compressionFunc(req.Body)
 	if err != nil {
-		return nil, err
+		reportRequestCompressionFailure(req.Context(), err)
+		return nil, &requestCompressionError{err: err}
 	}
 
 	req.Body = compressedBody

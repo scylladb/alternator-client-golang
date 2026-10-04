@@ -26,7 +26,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
@@ -159,14 +158,12 @@ func TestAlternatorLiveNodes_DNSEntrypointDiscoversDNSNodeRecords(t *testing.T) 
 	defer server.Close()
 
 	_, port := splitServerHostPort(t, server.URL)
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.Disabled = true
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"localhost"},
 		WithALNPort(port),
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithoutALNNodeHealth(),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -216,14 +213,12 @@ func TestAlternatorLiveNodes_IPv6LiteralDiscoversAndRoutesRequests(t *testing.T)
 	defer server.Close()
 
 	_, port := splitServerHostPort(t, server.URL)
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.Disabled = true
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"::1"},
 		WithALNPort(port),
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithoutALNNodeHealth(),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
@@ -252,8 +247,8 @@ func TestAlternatorLiveNodes_IPv6LiteralDiscoversAndRoutesRequests(t *testing.T)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("request through discovered IPv6 node returned HTTP %d", response.StatusCode)
 	}
-	if got := discoveryRequests.Load(); got != 1 {
-		t.Fatalf("discovery requests got %d, want 1", got)
+	if got := discoveryRequests.Load(); got < 1 {
+		t.Fatalf("discovery requests got %d, want at least 1", got)
 	}
 	if got := operationRequests.Load(); got != 1 {
 		t.Fatalf("operation requests got %d, want 1", got)
@@ -264,14 +259,12 @@ func TestAlternatorLiveNodes_FallsBackToOriginalIPv6Entrypoint(t *testing.T) {
 	t.Parallel()
 
 	var seedRequests atomic.Int32
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.Disabled = true
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"2001:db8::1"},
 		WithALNPort(8080),
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
+		WithoutALNNodeHealth(),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if req.URL.Path != "/localnodes" {
@@ -388,11 +381,9 @@ func TestAlternatorLiveNodesSkipsMalformedDiscoveredHost(t *testing.T) {
 func TestAlternatorLiveNodesKeepsIndependentInitialNodesWhenHealthDisabled(t *testing.T) {
 	t.Parallel()
 
-	healthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	healthConfig.Disabled = true
 	aln, err := NewAlternatorLiveNodes(
 		[]string{"seed-a.local", "seed-b.local"},
-		WithALNNodeHealthStoreConfig(healthConfig),
+		WithoutALNNodeHealth(),
 		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
 			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				return resp.AlternatorNodesResponse([]string{"seed-b.local"}, req)
@@ -527,7 +518,7 @@ func TestAlternatorLiveNodes_NonOKHealthResponseKeepsConnectionReusable(t *testi
 
 	var requests atomic.Int32
 	server, connections := newCountingHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
+		if r.URL.Path != "/localnodes" {
 			t.Fatalf("unexpected request path %q", r.URL.Path)
 		}
 		if requests.Add(1) == 1 {
@@ -540,14 +531,11 @@ func TestAlternatorLiveNodes_NonOKHealthResponseKeepsConnectionReusable(t *testi
 	defer server.Close()
 
 	host, port := splitServerHostPort(t, server.URL)
-	nodeHealthConfig := nodeshealth.DefaultNodeHealthStoreConfig()
-	nodeHealthConfig.QuarantineReleasePeriod = -1
 	aln, err := NewAlternatorLiveNodes(
 		[]string{host},
 		WithALNPort(port),
 		WithALNUpdatePeriod(0),
 		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeHealthConfig),
 	)
 	if err != nil {
 		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)

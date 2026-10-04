@@ -38,7 +38,6 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/scylladb/alternator-client-golang/shared"
-	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -87,7 +86,7 @@ func TestDNSEntrypointDiscoveryIntegration(t *testing.T) {
 		helper.WithPort(port),
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
-		helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		helper.WithoutNodeHealth(),
 	)
 	if err != nil {
 		t.Fatalf("failed to create alternator helper: %v", err)
@@ -270,12 +269,21 @@ func TestResponseCompression(t *testing.T) {
 }
 
 type KeyWriter struct {
+	mu      sync.Mutex
 	keyData []byte
 }
 
 func (w *KeyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.keyData = append(w.keyData, p...)
 	return len(p), nil
+}
+
+func (w *KeyWriter) Len() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.keyData)
 }
 
 func TestKeyLogWriter(t *testing.T) {
@@ -299,7 +307,7 @@ func TestKeyLogWriter(t *testing.T) {
 			t.Fatalf("UpdateLiveNodes() unexpectedly returned an error: %v", err)
 		}
 
-		if len(keyWriter.keyData) == 0 {
+		if keyWriter.Len() == 0 {
 			t.Fatalf("keyData should not be empty")
 		}
 	})
@@ -324,7 +332,7 @@ func TestKeyLogWriter(t *testing.T) {
 			t.Fatalf("failed to delete table: %v", err)
 		}
 
-		if len(keyWriter.keyData) == 0 {
+		if keyWriter.Len() == 0 {
 			t.Fatalf("keyData should not be empty")
 		}
 	})

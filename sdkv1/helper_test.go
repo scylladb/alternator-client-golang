@@ -263,12 +263,21 @@ func TestResponseCompression(t *testing.T) {
 }
 
 type KeyWriter struct {
+	mu      sync.Mutex
 	keyData []byte
 }
 
 func (w *KeyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.keyData = append(w.keyData, p...)
 	return len(p), nil
+}
+
+func (w *KeyWriter) Len() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.keyData)
 }
 
 func TestKeyLogWriter(t *testing.T) {
@@ -293,7 +302,7 @@ func TestKeyLogWriter(t *testing.T) {
 			t.Fatalf("UpdateLiveNodes() unexpectedly returned an error: %v", err)
 		}
 
-		if len(keyWriter.keyData) == 0 {
+		if keyWriter.Len() == 0 {
 			t.Fatalf("keyData should not be empty")
 		}
 	})
@@ -318,7 +327,7 @@ func TestKeyLogWriter(t *testing.T) {
 			t.Fatalf("unexpected operation error: %v", err)
 		}
 
-		if len(keyWriter.keyData) == 0 {
+		if keyWriter.Len() == 0 {
 			t.Fatalf("keyData should not be empty")
 		}
 	})

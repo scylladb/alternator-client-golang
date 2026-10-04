@@ -51,10 +51,12 @@ package sdkv1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"sync"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -63,6 +65,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
+	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 
 	"github.com/scylladb/alternator-client-golang/shared"
 )
@@ -119,7 +122,14 @@ var (
 	// in a form of custom implementation of `CertSource` interface
 	WithClientCertificateSource = shared.WithClientCertificateSource
 
-	// WithNodeHealthStoreConfig overrides the entire node health tracking configuration.
+	// WithNodeHealthConfig configures node-health transitions and probes.
+	WithNodeHealthConfig = shared.WithNodeHealthConfig
+
+	// WithoutNodeHealth disables node-health tracking and probing.
+	WithoutNodeHealth = shared.WithoutNodeHealth
+
+	// WithNodeHealthStoreConfig overrides the deprecated score-based health configuration.
+	// Deprecated: use WithNodeHealthConfig or WithoutNodeHealth.
 	WithNodeHealthStoreConfig = shared.WithNodeHealthStoreConfig
 
 	// WithIgnoreServerCertificateError makes both http clients ignore tls error when value is true
@@ -193,6 +203,8 @@ const (
 const (
 	sdkv1ModulePath       = "github.com/scylladb/alternator-client-golang/sdkv1"
 	sdkv1UserAgentProduct = "scylladb-alternator-client-golang"
+	healthPrepareHandler  = "alternator.NodeHealthPrepareHandler"
+	healthResultHandler   = "alternator.NodeHealthResultHandler"
 )
 
 // WithAWSConfigOptions lets callers mutate the generated aws.Config before it is used by the SDK.
@@ -213,13 +225,28 @@ type AlternatorNodesSource interface {
 	UpdateLiveNodes() error
 	CheckIfRackAndDatacenterSetCorrectly() error
 	CheckIfRackDatacenterFeatureIsSupported() (bool, error)
+	// Deprecated: physical attempt outcomes are classified automatically.
 	ReportNodeError(nodeURL url.URL, err error)
+	// Deprecated: use Helper.ProbeQuarantinedNodes.
 	TryReleaseQuarantinedNodes() []url.URL
 	Start()
 	Stop()
 }
 
-var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
+type nodeHealthNodesSource interface {
+	GetDiscoveredNodes() []url.URL
+	GetDownNodes() []url.URL
+	GetNodeHealthStatus(url.URL) *nodeshealth.Status
+	GetNodeHealthGeneration(url.URL) uint64
+	ReportNodeTrafficObservation(url.URL, uint64, nodeshealth.Observation) bool
+	ProbeQuarantinedNodes(context.Context) ([]url.URL, error)
+	Shutdown(context.Context) error
+}
+
+var (
+	_ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
+	_ nodeHealthNodesSource = &shared.AlternatorLiveNodes{}
+)
 
 // Helper manages the integration between the AWS SDK and ScyllaDB's Alternator.
 // It handles dynamic node discovery, rack/datacenter-aware routing, and creates
@@ -267,15 +294,52 @@ func (lb *Helper) NextNode() url.URL {
 	return lb.nodes.NextNode()
 }
 
-// GetNodes returns a copy of the complete list of live Alternator nodes.
-// If no live nodes are available, it returns the initial nodes list.
-func (lb *Helper) GetNodes() []url.URL {
+// GetDiscoveredNodes returns the complete current topology ring without health filtering.
+func (lb *Helper) GetDiscoveredNodes() []url.URL {
+	if nodes, ok := lb.nodes.(nodeHealthNodesSource); ok {
+		return nodes.GetDiscoveredNodes()
+	}
 	return lb.nodes.GetNodes()
+}
+
+// GetNodes returns the complete current topology ring without health filtering.
+// Deprecated: use GetDiscoveredNodes.
+func (lb *Helper) GetNodes() []url.URL {
+	return lb.GetDiscoveredNodes()
 }
 
 // GetActiveNodes returns the list of currently active Alternator node URLs.
 func (lb *Helper) GetActiveNodes() []url.URL {
-	return lb.nodes.GetNodes()
+	return lb.nodes.GetActiveNodes()
+}
+
+// GetQuarantinedNodes returns discovered endpoints awaiting validation or promotion.
+func (lb *Helper) GetQuarantinedNodes() []url.URL {
+	return lb.nodes.GetQuarantinedNodes()
+}
+
+// GetDownNodes returns discovered endpoints excluded from DynamoDB traffic.
+func (lb *Helper) GetDownNodes() []url.URL {
+	if nodes, ok := lb.nodes.(nodeHealthNodesSource); ok {
+		return nodes.GetDownNodes()
+	}
+	return []url.URL{}
+}
+
+// GetNodeHealthStatus returns a snapshot of a node's retained health history.
+func (lb *Helper) GetNodeHealthStatus(node url.URL) *nodeshealth.Status {
+	if nodes, ok := lb.nodes.(nodeHealthNodesSource); ok {
+		return nodes.GetNodeHealthStatus(node)
+	}
+	return nil
+}
+
+// ProbeQuarantinedNodes directly validates the current quarantine snapshot.
+func (lb *Helper) ProbeQuarantinedNodes(ctx context.Context) ([]url.URL, error) {
+	if nodes, ok := lb.nodes.(nodeHealthNodesSource); ok {
+		return nodes.ProbeQuarantinedNodes(ctx)
+	}
+	return nil, errors.New("node source does not support quarantine probes")
 }
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
@@ -306,6 +370,15 @@ func (lb *Helper) Stop() {
 	lb.nodes.Stop()
 }
 
+// Shutdown stops discovery and probe work and waits until completion or context cancellation.
+func (lb *Helper) Shutdown(ctx context.Context) error {
+	if nodes, ok := lb.nodes.(nodeHealthNodesSource); ok {
+		return nodes.Shutdown(ctx)
+	}
+	lb.nodes.Stop()
+	return nil
+}
+
 // GetMaxIdleHTTPConnectionsPerHost returns the configured maximum number of idle HTTP connections per host.
 func (lb *Helper) GetMaxIdleHTTPConnectionsPerHost() int {
 	return lb.cfg.MaxIdleHTTPConnectionsPerHost
@@ -329,9 +402,20 @@ func (lb *Helper) awsConfig() (aws.Config, error) {
 		cfg.Credentials = credentials.NewStaticCredentials(lb.cfg.AccessKeyID, lb.cfg.SecretAccessKey, "")
 	}
 
+	transportConfig := lb.cfg
+	previousObserver := transportConfig.HTTPAttemptObserver
+	transportConfig.HTTPAttemptObserver = func(req *http.Request, resp *http.Response, err error) {
+		lb.observeHTTPAttempt(req, resp, err)
+		if previousObserver != nil {
+			previousObserver(req, resp, err)
+		}
+	}
 	cfg.HTTPClient = &http.Client{
-		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(lb.cfg)),
+		Transport: lb.wrapHTTPTransport(shared.NewHTTPTransport(transportConfig)),
 		Timeout:   lb.cfg.HTTPClientTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	customizers, err := shared.ConvertToAWSConfigOptions[func(*aws.Config)](lb.cfg.AWSConfigOptions)
@@ -355,13 +439,15 @@ func (lb *Helper) newAWSSession() (*session.Session, error) {
 	})
 }
 
-// Update takes config of current helper, updates its config and creates a new helper with updated config
+// Update takes config of current helper, updates its data-plane config and creates a new helper.
+// Node-health options are construction-only because the returned helper reuses the existing live-node manager.
 func (lb *Helper) Update(opts ...Option) *Helper {
 	cfg := lb.cfg
 	cfg.AWSConfigOptions = shared.CloneAWSConfigOptions(cfg.AWSConfigOptions)
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	cfg.PreserveNodeHealthFrom(lb.cfg)
 	return &Helper{
 		nodes: lb.nodes,
 		cfg:   cfg,
@@ -374,6 +460,7 @@ func (lb *Helper) NewDynamoDB() (*dynamodb.DynamoDB, error) {
 	if err != nil {
 		return nil, err
 	}
+	lb.nodes.Start()
 	client := dynamodb.New(sess)
 	lb.injectQueryPlan(client)
 	return client, nil
@@ -408,35 +495,118 @@ func normalizeModuleVersion(version string) string {
 
 type roundTripper struct {
 	originalTransport http.RoundTripper
-	lb                *Helper
 }
 
 func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	node, err := getRequestNodeFromContext(req.Context())
+	attempt, err := getRequestAttemptFromContext(req.Context())
 	if err != nil {
-		return nil, err
+		return rt.originalTransport.RoundTrip(req)
 	}
-	req.URL.Scheme = node.Scheme
-	req.URL.Host = node.Host
-	req.Host = node.Host
+	req.URL.Scheme = attempt.Node.Scheme
+	req.URL.Host = attempt.Node.Host
+	req.Host = attempt.Node.Host
 
-	resp, err := rt.originalTransport.RoundTrip(req)
-	if err != nil && req.URL != nil {
-		rt.lb.nodes.ReportNodeError(node, err)
+	return rt.originalTransport.RoundTrip(req)
+}
+
+func (lb *Helper) observeHTTPAttempt(req *http.Request, resp *http.Response, err error) {
+	attempt, attemptErr := getRequestAttemptFromContext(req.Context())
+	if attemptErr != nil {
+		return
 	}
-	return resp, err
+	if shared.IsRequestCompressionError(err) {
+		return
+	}
+	if routing := getRequestRoutingStateFromContext(req.Context()); routing != nil &&
+		!routing.complete(lb, attempt) {
+		return
+	}
+	lb.reportHTTPAttempt(attempt, resp, err)
+}
+
+func (lb *Helper) reportHTTPAttempt(attempt shared.RouteAttempt, resp *http.Response, err error) {
+	reporter, ok := lb.nodes.(nodeHealthNodesSource)
+	if !ok {
+		if resp == nil && err != nil {
+			lb.nodes.ReportNodeError(attempt.Node, err)
+		}
+		return
+	}
+	if resp != nil {
+		if isHealthNeutralStatus(resp.StatusCode) {
+			return
+		}
+		reporter.ReportNodeTrafficObservation(
+			attempt.Node,
+			attempt.Generation,
+			nodeshealth.ObservationTrafficSuccess,
+		)
+		return
+	}
+	reporter.ReportNodeTrafficObservation(
+		attempt.Node,
+		attempt.Generation,
+		nodeshealth.ObservationTrafficFailure,
+	)
+}
+
+func (lb *Helper) observeRequestCompressionFailure(
+	routing *requestRoutingState,
+	attempt shared.RouteAttempt,
+	err error,
+) {
+	if !routing.complete(lb, attempt) {
+		return
+	}
+	lb.reportHTTPAttempt(attempt, nil, err)
+}
+
+func isHealthNeutralStatus(status int) bool {
+	return status == http.StatusInternalServerError || status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
 }
 
 func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTripper {
 	return &roundTripper{
 		originalTransport: original,
-		lb:                lb,
 	}
 }
 
+type healthObservedRoundTripper struct {
+	original http.RoundTripper
+	helper   *Helper
+}
+
+func (rt *healthObservedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := rt.original.RoundTrip(req)
+	rt.helper.observeHTTPAttempt(req, response, err)
+	return response, err
+}
+
+func (lb *Helper) prepareRequestHTTPClient(r *request.Request) {
+	client := r.Config.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	prepared := *client
+	transport := prepared.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	if observed, ok := transport.(*healthObservedRoundTripper); !ok || observed.helper != lb {
+		transport = &healthObservedRoundTripper{original: transport, helper: lb}
+	}
+	prepared.Transport = transport
+	prepared.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	r.Config.HTTPClient = &prepared
+}
+
 type (
-	queryPlanKeyType   struct{}
-	requestNodeKeyType struct{}
+	queryPlanKeyType      struct{}
+	requestNodeKeyType    struct{}
+	requestRoutingKeyType struct{}
 )
 
 var (
@@ -444,44 +614,180 @@ var (
 	queryPlanKey = queryPlanKeyType{}
 	// A context key to store/retrieve a node assigned to the request
 	requestNodeKey = requestNodeKeyType{}
+	// A context key to store request-scoped plan traversal and pending-attempt state.
+	requestRoutingKey = requestRoutingKeyType{}
 )
+
+type requestRoutingState struct {
+	mu      sync.Mutex
+	plan    *shared.LazyQueryPlan
+	pending *shared.RouteAttempt
+	owner   *Helper
+}
+
+func (s *requestRoutingState) nextAttempt(
+	revalidate func(shared.RouteAttempt) (shared.RouteAttempt, bool),
+) (shared.RouteAttempt, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending != nil {
+		attempt := *s.pending
+		if revalidate == nil {
+			return attempt, true
+		}
+		if refreshed, reusable := revalidate(attempt); reusable {
+			s.pending = &refreshed
+			return refreshed, true
+		}
+		// Signing and presigning can select a route before any transmission.
+		// If it is no longer the preferred eligible route, do not count that
+		// untransmitted selection as tried.
+		s.plan.AbandonAttempt(attempt)
+		s.pending = nil
+	}
+	attempt, ok := s.plan.NextAttempt()
+	if !ok {
+		return shared.RouteAttempt{}, false
+	}
+	s.pending = &attempt
+	return attempt, true
+}
+
+func (s *requestRoutingState) complete(owner *Helper, attempt shared.RouteAttempt) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner != nil && s.owner != owner {
+		return false
+	}
+	if s.pending == nil || s.pending.Generation != attempt.Generation || s.pending.Node != attempt.Node {
+		return false
+	}
+	s.pending = nil
+	return true
+}
+
+func (lb *Helper) revalidateRouteAttempt(attempt shared.RouteAttempt) (shared.RouteAttempt, bool) {
+	nodes, ok := lb.nodes.(nodeHealthNodesSource)
+	if !ok {
+		return attempt, true
+	}
+	status := nodes.GetNodeHealthStatus(attempt.Node)
+	if status == nil {
+		return attempt, true
+	}
+	// A pending route must be selected again because another untried node can
+	// become active and take precedence without changing this node's state.
+	return shared.RouteAttempt{}, false
+}
 
 func getQueryPlanFromContext(ctx context.Context) *shared.LazyQueryPlan {
 	plan, _ := ctx.Value(queryPlanKey).(*shared.LazyQueryPlan)
 	return plan
 }
 
-func getRequestNodeFromContext(ctx context.Context) (url.URL, error) {
-	val, ok := ctx.Value(requestNodeKey).(url.URL)
-	if !ok || val.Host == "" {
-		return url.URL{}, errs.ErrCtxHasNoNode
-	}
-	return val, nil
+func getRequestRoutingStateFromContext(ctx context.Context) *requestRoutingState {
+	state, _ := ctx.Value(requestRoutingKey).(*requestRoutingState)
+	return state
 }
 
-func setRequestNode(ctx context.Context, node url.URL) context.Context {
-	return context.WithValue(ctx, requestNodeKey, node)
+func (lb *Helper) ensureRequestRoutingState(r *request.Request) *requestRoutingState {
+	state := getRequestRoutingStateFromContext(r.Context())
+	if state == nil && r.HTTPRequest != nil {
+		state = getRequestRoutingStateFromContext(r.HTTPRequest.Context())
+	}
+	if state == nil {
+		plan := getQueryPlanFromContext(r.Context())
+		if plan == nil && r.HTTPRequest != nil {
+			plan = getQueryPlanFromContext(r.HTTPRequest.Context())
+		}
+		if plan == nil {
+			plan = shared.NewLazyQueryPlan(lb.nodes)
+		}
+		state = &requestRoutingState{plan: plan, owner: lb}
+	}
+
+	// Presign works on a shallow copy of request.Request. Publish the mutable
+	// routing state through the shared HTTP request before SetContext detaches the
+	// copy, so repeated Sign/Presign and a later Send all reuse one pending route.
+	if r.HTTPRequest != nil {
+		httpCtx := context.WithValue(r.HTTPRequest.Context(), queryPlanKey, state.plan)
+		httpCtx = context.WithValue(httpCtx, requestRoutingKey, state)
+		withState := r.HTTPRequest.WithContext(httpCtx)
+		*r.HTTPRequest = *withState
+	}
+	ctx := context.WithValue(r.Context(), queryPlanKey, state.plan)
+	ctx = context.WithValue(ctx, requestRoutingKey, state)
+	r.SetContext(ctx)
+	return state
+}
+
+func getRequestAttemptFromContext(ctx context.Context) (shared.RouteAttempt, error) {
+	switch val := ctx.Value(requestNodeKey).(type) {
+	case shared.RouteAttempt:
+		if val.Node.Host != "" {
+			return val, nil
+		}
+	case url.URL:
+		if val.Host != "" {
+			return shared.RouteAttempt{Node: val}, nil
+		}
+	}
+	return shared.RouteAttempt{}, errs.ErrCtxHasNoNode
+}
+
+func setRequestAttempt(ctx context.Context, attempt shared.RouteAttempt) context.Context {
+	return context.WithValue(ctx, requestNodeKey, attempt)
 }
 
 func (lb *Helper) injectQueryPlan(client *dynamodb.DynamoDB) {
 	client.Handlers.Validate.PushFront(func(r *request.Request) {
-		r.SetContext(context.WithValue(r.Context(), queryPlanKey, shared.NewLazyQueryPlan(lb.nodes)))
+		lb.ensureRequestRoutingState(r)
 	})
 
 	client.Handlers.Sign.PushFront(func(r *request.Request) {
-		plan := getQueryPlanFromContext(r.Context())
-		if plan == nil {
+		routing := getRequestRoutingStateFromContext(r.Context())
+		if routing == nil {
 			r.Error = errs.ErrCtxHasNoQueryPlan
 			return
 		}
-		node := plan.Next()
-		if node.Host == "" {
+		attempt, ok := routing.nextAttempt(lb.revalidateRouteAttempt)
+		if !ok {
 			r.Error = errs.ErrQueryPlanExhausted
 			return
 		}
-		r.SetContext(setRequestNode(r.Context(), node))
-		r.HTTPRequest.URL.Scheme = node.Scheme
-		r.HTTPRequest.URL.Host = node.Host
-		r.HTTPRequest.Host = node.Host
+		ctx := setRequestAttempt(r.Context(), attempt)
+		ctx = shared.WithRequestCompressionFailureHandler(ctx, func(err error) {
+			lb.observeRequestCompressionFailure(routing, attempt, err)
+		})
+		r.SetContext(ctx)
+		r.HTTPRequest.URL.Scheme = attempt.Node.Scheme
+		r.HTTPRequest.URL.Host = attempt.Node.Host
+		r.HTTPRequest.Host = attempt.Node.Host
+	})
+
+	// Apply after all request options and immediately before the SDK's Send
+	// handler so custom HTTP clients retain raw response visibility and cannot
+	// turn redirects into multiple physical attempts.
+	client.Handlers.Send.PushFrontNamed(request.NamedHandler{
+		Name: healthPrepareHandler,
+		Fn:   lb.prepareRequestHTTPClient,
+	})
+
+	// Run immediately after the SDK's physical Send handler and before
+	// response validation or DynamoDB unmarshalling. The transport observer
+	// normally completes the attempt first; this deduplicated fallback covers
+	// AWS-supported HTTPClient overrides, including request-local overrides.
+	client.Handlers.Send.PushBackNamed(request.NamedHandler{
+		Name: healthResultHandler,
+		Fn: func(r *request.Request) {
+			if r.HTTPRequest == nil || shared.IsRequestCompressionError(r.Error) {
+				return
+			}
+			var response *http.Response
+			if r.HTTPResponse != nil && r.HTTPResponse.StatusCode > 0 {
+				response = r.HTTPResponse
+			}
+			lb.observeHTTPAttempt(r.HTTPRequest, response, r.Error)
+		},
 	})
 }
