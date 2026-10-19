@@ -305,32 +305,47 @@ func newNodeSources(initialNodes []string, cfg *shared.Config) (AlternatorNodesS
 	return nodes, nil, err
 }
 
-// affinityScope widens concrete rack restrictions without changing custom scopes
-// or adding fallbacks. A wrapper preserves custom scope behavior and replaces only
-// its explicitly configured fallback when that fallback contains a rack.
+// affinityScope builds a lazy candidate without inspecting opaque fallbacks.
+// Until discovery selects a distinct view, the pair uses ordinary routing and health.
 func affinityScope(scope rt.Scope) (rt.Scope, bool) {
-	if scope == nil {
-		return nil, false
+	if scope == nil || rt.IsClusterScope(scope) {
+		return scope, false
 	}
-	fallback, changed := affinityScope(scope.Fallback())
+	switch dc := scope.(type) {
+	case rt.DCScope:
+		if dc.Fallback() == nil {
+			return scope, false
+		}
+	case *rt.DCScope:
+		if dc == nil || dc.Fallback() == nil {
+			return scope, false
+		}
+	}
+	return affinityScopeView(scope), true
+}
+
+func affinityScopeView(scope rt.Scope) rt.Scope {
+	if scope == nil || rt.IsClusterScope(scope) {
+		return scope
+	}
+	view := scope
 	switch rack := scope.(type) {
 	case rt.RackScope:
-		return rt.NewDCScope(rack.Datacenter(), fallback), true
+		view = rt.NewDCScope(rack.Datacenter(), nil)
 	case *rt.RackScope:
-		return rt.NewDCScope(rack.Datacenter(), fallback), true
+		view = rt.NewDCScope(rack.Datacenter(), nil)
 	}
-	if changed {
-		return scopeWithFallback{Scope: scope, fallback: fallback}, true
-	}
-	return scope, false
+	return scopeWithFallback{Scope: view, original: scope}
 }
 
 type scopeWithFallback struct {
 	rt.Scope
-	fallback rt.Scope
+	original rt.Scope
 }
 
-func (s scopeWithFallback) Fallback() rt.Scope { return s.fallback }
+func (s scopeWithFallback) Fallback() rt.Scope {
+	return affinityScopeView(s.original.Fallback())
+}
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
 	cfg := aws.Config{
@@ -416,17 +431,11 @@ func (lb *Helper) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
 // It is not required to start if automatically on first API call
 func (lb *Helper) Start() {
 	lb.nodes.Start()
-	if lb.affinityNodes != nil {
-		lb.affinityNodes.Start()
-	}
 }
 
 // Stop stops background routines used for periodic node discovery and updates.
 func (lb *Helper) Stop() {
 	lb.nodes.Stop()
-	if lb.affinityNodes != nil {
-		lb.affinityNodes.Stop()
-	}
 }
 
 // GetMaxIdleHTTPConnectionsPerHost returns the configured maximum number of idle HTTP connections per host.
@@ -511,7 +520,11 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func (lb *Helper) reportNodeError(node url.URL, err error) {
 	lb.nodes.ReportNodeError(node, err)
-	if lb.affinityNodes != nil {
+	if source, ok := lb.nodes.(*shared.AlternatorLiveNodes); ok && lb.affinityNodes != nil {
+		if affinity := source.AffinityNodes(); affinity != source {
+			affinity.ReportNodeError(node, err)
+		}
+	} else if lb.affinityNodes != nil {
 		lb.affinityNodes.ReportNodeError(node, err)
 	}
 }
@@ -575,6 +588,9 @@ func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
 
 func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
 	if lb.affinityNodes != nil {
+		if source, ok := lb.nodes.(*shared.AlternatorLiveNodes); ok {
+			return source.AffinityNodes()
+		}
 		return lb.affinityNodes
 	}
 	return lb.nodes

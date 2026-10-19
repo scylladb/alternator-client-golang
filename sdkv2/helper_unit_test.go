@@ -1404,17 +1404,12 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		t.Helper()
 
 		var routed routedNodes
-		dcDiscovery := make(chan struct{}, 1)
 		var dcDiscoveries atomic.Int32
 		mockTransport := &mocks.MockRoundTripper{
 			AlternatorRequest: func(req *http.Request) (*http.Response, error) {
 				switch req.URL.RawQuery {
 				case "dc=dc1":
 					dcDiscoveries.Add(1)
-					select {
-					case dcDiscovery <- struct{}{}:
-					default:
-					}
 					return resp.AlternatorNodesResponse(dcNodes, req)
 				case fmt.Sprintf("dc=%s&rack=%s", datacenter, rack):
 					return resp.AlternatorNodesResponse([]string{rackNode}, req)
@@ -1485,11 +1480,6 @@ func TestKeyRouteAffinityTakesPrecedenceOverRackRouting(t *testing.T) {
 		}
 		if _, err := client.UpdateItem(context.Background(), update); err != nil {
 			t.Fatalf("initial UpdateItem returned error: %v", err)
-		}
-		select {
-		case <-dcDiscovery:
-		case <-time.After(time.Second):
-			t.Fatal("affinity request did not trigger datacenter discovery")
 		}
 		if got := len(h.affinityNodes.GetActiveNodes()); got != len(dcNodes) {
 			t.Fatalf("datacenter discovery published %d nodes, want %d", got, len(dcNodes))
@@ -2717,4 +2707,154 @@ func TestEligibleAffinityRetriesUseDiscoveredMembership(t *testing.T) {
 			assertNodesStatus(t, h.affinityNodes, active, []url.URL{target})
 		})
 	}
+}
+
+// These opaque scopes deliberately reject reads of an unused fallback. The
+// value form also cannot be compared as an interface map key.
+type unusedAffinityFallback struct{ rt.Scope }
+
+func (unusedAffinityFallback) Fallback() rt.Scope { panic("unused custom fallback inspected") }
+
+type noncomparableAffinityFallback struct {
+	unusedAffinityFallback
+	values []string
+}
+
+func TestOpaqueAffinityKeepsOrdinaryHealthUntilWidened(t *testing.T) {
+	t.Parallel()
+	base := unusedAffinityFallback{rt.NewDCScope("A", nil)}
+	for _, scope := range []rt.Scope{&base, noncomparableAffinityFallback{base, []string{"opaque"}}} {
+		t.Run(fmt.Sprintf("%T", scope), func(t *testing.T) {
+			t.Parallel()
+			var transportID, discoveries int
+			var auxiliaryProbes atomic.Int32
+			health := nodeshealth.DefaultNodeHealthStoreConfig()
+			health.QuarantineReleasePeriod = -1
+			health.Scoring.QuarantineScoreCutOff = 2
+			health.Scoring.QuarantineReleaseScore = 0
+			health.Scoring.NodeEventScoreFunc = func(error) uint64 { return 1 }
+			h, err := NewHelper([]string{"seed.local"}, WithRoutingScope(scope), WithNodeHealthStoreConfig(health),
+				WithNodesListUpdatePeriod(-1), WithIdleNodesListUpdatePeriod(-1),
+				WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					transportID++
+					id := transportID
+					return &mocks.MockRoundTripper{
+						AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+							discoveries++
+							return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+						},
+						NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
+							if id == 2 {
+								auxiliaryProbes.Add(1)
+							}
+							return resp.HealthCheckResponse(req)
+						},
+					}
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+			h.Start()
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			if discoveries != 1 || auxiliaryProbes.Load() != 0 || h.affinityNodeSource() != h.nodes {
+				t.Fatalf(
+					"unused view changed discovery/health: queries%d, probes%d",
+					discoveries,
+					auxiliaryProbes.Load(),
+				)
+			}
+			known := h.GetNodes()[0]
+			h.reportNodeError(known, errors.New("one penalty"))
+			assertNodesStatus(t, h.nodes, []url.URL{known}, []url.URL{})
+			h.reportNodeError(known, errors.New("second penalty"))
+			assertNodesStatus(t, h.nodes, []url.URL{}, []url.URL{known})
+		})
+	}
+}
+
+func TestOpaqueAffinityActivatesAtRackAndReusesFailedDiscovery(t *testing.T) {
+	t.Parallel()
+	var phase, transportID int
+	requests := map[string]int{}
+	var auxiliaryProbes atomic.Int32
+	failure := errors.New("custom discovery unavailable")
+	health := nodeshealth.DefaultNodeHealthStoreConfig()
+	health.QuarantineReleasePeriod = -1
+	h, err := NewHelper([]string{"seed.local"},
+		WithRoutingScope(customAffinityScope{rt.NewRackScope("A", "r1", nil)}), WithNodeHealthStoreConfig(health),
+		WithNodesListUpdatePeriod(-1), WithIdleNodesListUpdatePeriod(-1),
+		WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			transportID++
+			id := transportID
+			return &mocks.MockRoundTripper{
+				NodeHealthRequest: func(req *http.Request) (*http.Response, error) {
+					if id == 2 {
+						auxiliaryProbes.Add(1)
+					}
+					return resp.HealthCheckResponse(req)
+				},
+				AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					requests[req.URL.RawQuery]++
+					switch req.URL.RawQuery {
+					case "custom=value":
+						if phase == 2 {
+							return nil, failure
+						}
+						if phase == 1 {
+							return resp.AlternatorNodesResponse(nil, req)
+						}
+						return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+					case "dc=A&rack=r1":
+						return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+					case "dc=A":
+						if req.URL.Hostname() == "seed.local" {
+							return nil, errors.New("old seed unavailable for DC discovery")
+						}
+						return resp.AlternatorNodesResponse([]string{"dc1.local", "dc2.local"}, req)
+					default:
+						t.Fatalf("unexpected scope%q", req.URL.RawQuery)
+						return nil, nil
+					}
+				},
+			}
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Stop()
+	h.Start()
+	if err := h.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if h.affinityNodeSource() != h.nodes || auxiliaryProbes.Load() != 0 || requests["custom=value"] != 1 {
+		t.Fatal("opaque successful scope activated auxiliary behavior")
+	}
+	phase = 1
+	requests = map[string]int{}
+	if err := h.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if h.affinityNodeSource() == h.nodes || auxiliaryProbes.Load() != 2 {
+		t.Fatal("rack widening did not activate its health view")
+	}
+	want := []url.URL{{Scheme: "http", Host: "dc1.local:8080"}, {Scheme: "http", Host: "dc2.local:8080"}}
+	assertNodesStatus(t, h.affinityNodeSource(), want, []url.URL{})
+	if requests["custom=value"] != 2 || requests["dc=A"] != 1 {
+		t.Fatalf("unexpected discovery attempts%v", requests)
+	}
+	phase = 2
+	requests = map[string]int{}
+	err = h.UpdateLiveNodes()
+	if !errors.Is(err, failure) || strings.Count(err.Error(), failure.Error()) != 1 {
+		t.Fatalf("cached failure changed error:%v", err)
+	}
+	if requests["custom=value"] != 2 || len(requests) != 1 {
+		t.Fatalf("unchanged failed scope was rediscovered:%v", requests)
+	}
+	assertNodesStatus(t, h.affinityNodeSource(), want, []url.URL{})
 }
