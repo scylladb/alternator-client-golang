@@ -203,12 +203,7 @@ func (e *NodeHealthStore) GetQuarantinedNodes() []url.URL {
 // TryReleaseQuarantinedNodes iterates over quarantined nodes and invokes the
 // configured release callback. Nodes are reactivated when the callback returns true.
 func (e *NodeHealthStore) TryReleaseQuarantinedNodes() []url.URL {
-	return e.TryReleaseQuarantinedNodesWith(e.releaseFunc)
-}
-
-// TryReleaseQuarantinedNodesWith checks quarantined nodes with the supplied callback.
-func (e *NodeHealthStore) TryReleaseQuarantinedNodesWith(releaseFunc QuarantineReleaseFunc) []url.URL {
-	if releaseFunc == nil {
+	if e.releaseFunc == nil {
 		return nil
 	}
 	candidates := e.GetQuarantinedNodes()
@@ -244,7 +239,7 @@ func (e *NodeHealthStore) TryReleaseQuarantinedNodesWith(releaseFunc QuarantineR
 		go func() {
 			defer wg.Done()
 			for rc := range workCh {
-				if releaseFunc(rc.node, rc.status) {
+				if e.releaseFunc(rc.node, rc.status) {
 					releasedLock.Lock()
 					releasedCandidates = append(releasedCandidates, rc.node)
 					releasedLock.Unlock()

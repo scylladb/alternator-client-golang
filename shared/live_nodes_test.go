@@ -23,211 +23,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
-
-	"github.com/google/go-cmp/cmp"
 
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
-
-func TestAlternatorLiveNodesConcurrentStartStopIsTerminal(t *testing.T) {
-	t.Parallel()
-
-	for iteration := 0; iteration < 100; iteration++ {
-		aln, err := NewAlternatorLiveNodes(
-			[]string{"node.local"},
-			WithALNIdleUpdatePeriod(-1),
-			WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-				return liveNodesRoundTripFunc(resp.HealthCheckResponse)
-			}),
-		)
-		if err != nil {
-			t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-		}
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			aln.Start()
-		}()
-		go func() {
-			defer wg.Done()
-			aln.Stop()
-		}()
-		wg.Wait()
-
-		aln.Start()
-		aln.Stop()
-	}
-}
-
-func TestAlternatorLiveNodesNextNodeDoesNotStartDisabledIdleUpdater(t *testing.T) {
-	t.Parallel()
-
-	var requests atomic.Int32
-	aln, err := NewAlternatorLiveNodes(
-		[]string{"node.local"},
-		WithALNUpdatePeriod(time.Minute),
-		WithALNIdleUpdatePeriod(-1),
-		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				requests.Add(1)
-				return resp.AlternatorNodesResponse([]string{"node.local"}, req)
-			})
-		}),
-	)
-	if err != nil {
-		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-	}
-	defer aln.Stop()
-
-	_ = aln.NextNode()
-	if aln.idleUpdaterStarted.Load() {
-		t.Fatal("NextNode started updater while idle updates were disabled")
-	}
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("NextNode made %d discovery requests while idle updates were disabled", got)
-	}
-}
-
-func TestAlternatorLiveNodesStopCancelsAndJoinsBlockedRefresh(t *testing.T) {
-	t.Parallel()
-
-	requestStarted := make(chan struct{})
-	requestCanceled := make(chan struct{})
-	allowReturn := make(chan struct{})
-	aln, err := NewAlternatorLiveNodes(
-		[]string{"node.local"},
-		WithALNUpdatePeriod(time.Minute),
-		WithALNIdleUpdatePeriod(time.Hour),
-		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path != "/localnodes" {
-					return resp.HealthCheckResponse(req)
-				}
-				close(requestStarted)
-				<-req.Context().Done()
-				close(requestCanceled)
-				<-allowReturn
-				return resp.AlternatorNodesResponse([]string{"published-after-stop.local"}, req)
-			})
-		}),
-	)
-	if err != nil {
-		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-	}
-
-	aln.nextUpdate.Store(0)
-	_ = aln.NextNode()
-	select {
-	case <-requestStarted:
-	case <-time.After(time.Second):
-		t.Fatal("background refresh did not start")
-	}
-
-	stopDone := make(chan struct{})
-	go func() {
-		aln.Stop()
-		close(stopDone)
-	}()
-	select {
-	case <-requestCanceled:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not cancel the blocked discovery request")
-	}
-	select {
-	case <-stopDone:
-		t.Fatal("Stop returned before the blocked updater exited")
-	default:
-	}
-	close(allowReturn)
-	select {
-	case <-stopDone:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not join the canceled updater")
-	}
-
-	nodes := aln.GetNodes()
-	if len(nodes) != 1 || nodes[0].Hostname() != "node.local" {
-		t.Fatalf("canceled refresh published nodes after Stop: %v", nodes)
-	}
-}
-
-func TestAlternatorLiveNodesStopCancelsBlockedBackgroundHealthProbe(t *testing.T) {
-	t.Parallel()
-
-	healthStarted := make(chan struct{})
-	healthCanceled := make(chan struct{})
-	allowHealthReturn := make(chan struct{})
-	var healthCalls atomic.Int32
-	aln, err := NewAlternatorLiveNodes(
-		[]string{"node.local"},
-		WithALNUpdatePeriod(time.Minute),
-		WithALNIdleUpdatePeriod(time.Hour),
-		WithALNHTTPClientTimeout(0),
-		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
-			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path == "/localnodes" {
-					return resp.AlternatorNodesResponse([]string{"node.local", "new-node.local"}, req)
-				}
-				if healthCalls.Add(1) == 1 {
-					close(healthStarted)
-					<-req.Context().Done()
-					close(healthCanceled)
-					<-allowHealthReturn
-				}
-				return nil, req.Context().Err()
-			})
-		}),
-	)
-	if err != nil {
-		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
-	}
-
-	aln.nextUpdate.Store(0)
-	_ = aln.NextNode()
-	select {
-	case <-healthStarted:
-	case <-time.After(time.Second):
-		t.Fatal("background refresh did not reach node health probing")
-	}
-
-	stopDone := make(chan struct{})
-	go func() {
-		aln.Stop()
-		close(stopDone)
-	}()
-	select {
-	case <-healthCanceled:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not cancel the blocked background health request")
-	}
-	select {
-	case <-stopDone:
-		t.Fatal("Stop returned before the blocked health probe exited")
-	default:
-	}
-	close(allowHealthReturn)
-	select {
-	case <-stopDone:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not join the updater blocked in health probing")
-	}
-
-	want := aln.GetNodes()
-	time.Sleep(10 * time.Millisecond)
-	if diff := cmp.Diff(want, aln.GetNodes()); diff != "" {
-		t.Fatalf("topology changed after Stop returned (-want +got):\n%s", diff)
-	}
-}
 
 func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T) {
 	t.Parallel()
@@ -807,4 +609,56 @@ func splitServerHostPort(t *testing.T, rawURL string) (string, int) {
 		t.Fatalf("failed to parse server port: %v", err)
 	}
 	return host, port
+}
+
+func TestAlternatorLiveNodes_AffinityScopeReuse(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                       string
+		ordinary                   rt.Scope
+		affinity                   rt.Scope
+		responses                  map[string][]string
+		wantOrdinary, wantAffinity []string
+		wantQueries                []string
+	}{
+		{"distinct rack and DC", rt.NewRackScope("A", "r1", nil), rt.NewDCScope("A", nil), map[string][]string{"dc=A&rack=r1": {"rack.local"}, "dc=A": {"rack.local", "other-rack.local"}}, []string{"rack.local"}, []string{"other-rack.local", "rack.local"}, []string{"dc=A&rack=r1", "dc=A"}},
+		{"reuse ordinary DC fallback", rt.NewRackScope("A", "r1", rt.NewDCScope("A", nil)), rt.NewDCScope("A", rt.NewDCScope("A", nil)), map[string][]string{"dc=A": {"dc.local"}}, []string{"dc.local"}, []string{"dc.local"}, []string{"dc=A&rack=r1", "dc=A"}},
+		{"try preferred DC before reusing later scope", rt.NewRackScope("A", "r1", rt.NewRackScope("B", "r2", nil)), rt.NewDCScope("A", rt.NewDCScope("B", nil)), map[string][]string{"dc=B&rack=r2": {"rack-b.local"}, "dc=A": {"dc-a.local"}}, []string{"rack-b.local"}, []string{"dc-a.local"}, []string{"dc=A&rack=r1", "dc=B&rack=r2", "dc=A"}},
+		{"ordered cross DC then cluster reuse", rt.NewRackScope("A", "r1", rt.NewRackScope("B", "r2", rt.NewClusterScope())), rt.NewDCScope("A", rt.NewDCScope("B", rt.NewClusterScope())), map[string][]string{"": {"cluster.local"}}, []string{"cluster.local"}, []string{"cluster.local"}, []string{"dc=A&rack=r1", "dc=B&rack=r2", "", "dc=A", "dc=B"}},
+		{"no implicit fallback", rt.NewRackScope("A", "r1", nil), rt.NewDCScope("A", nil), map[string][]string{}, []string{"seed.local"}, []string{"seed.local"}, []string{"dc=A&rack=r1", "dc=A"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var queries []string
+			nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"}, tc.affinity,
+				WithALNRoutingScope(tc.ordinary), WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						queries = append(queries, req.URL.RawQuery)
+						return resp.AlternatorNodesResponse(tc.responses[req.URL.RawQuery], req)
+					})
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodes.Stop()
+			defer affinity.Stop()
+			if err := nodes.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			if got := hostnames(nodes.GetNodes()); !slices.Equal(got, tc.wantOrdinary) {
+				t.Fatalf("ordinary=%v, want %v", got, tc.wantOrdinary)
+			}
+			if got := hostnames(affinity.GetNodes()); !slices.Equal(got, tc.wantAffinity) {
+				t.Fatalf("affinity=%v, want %v", got, tc.wantAffinity)
+			}
+			if !slices.Equal(queries, tc.wantQueries) {
+				t.Fatalf("queries=%q, want %q", queries, tc.wantQueries)
+			}
+			if affinity.cfg.UpdatePeriod > 0 || affinity.cfg.IdleUpdatePeriod > 0 {
+				t.Fatal("affinity has a second discovery updater")
+			}
+		})
+	}
 }

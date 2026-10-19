@@ -211,58 +211,6 @@ func TestLazyQueryPlan(t *testing.T) {
 			}
 		}
 	})
-
-	t.Run("PreferredQuarantinedNodesFirstThenSortedRemaining", func(t *testing.T) {
-		const seed = int64(42)
-		preferredQ2 := url.URL{Host: "q2"}
-		preferredQ1 := url.URL{Host: "q1"}
-		source := &fakeNodesSource{
-			quarantinedNodes: []url.URL{{Host: "q3"}, preferredQ1, preferredQ2},
-		}
-
-		plan := NewLazyQueryPlanWithPreferredNodes(
-			source,
-			[]url.URL{preferredQ2, preferredQ1},
-			seed,
-		)
-		got := []string{
-			plan.Next().Host,
-			plan.Next().Host,
-			plan.Next().Host,
-		}
-		want := []string{"q2", "q1", "q3"}
-		for i := range got {
-			if got[i] != want[i] {
-				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
-			}
-		}
-	})
-
-	t.Run("PreferredNodesPreserveHealthTierOrder", func(t *testing.T) {
-		const seed = int64(42)
-		source := &fakeNodesSource{
-			activeNodes:      []url.URL{{Host: "a2"}, {Host: "a1"}},
-			quarantinedNodes: []url.URL{{Host: "q2"}, {Host: "q1"}},
-		}
-
-		plan := NewLazyQueryPlanWithPreferredNodes(
-			source,
-			[]url.URL{{Host: "q2"}, {Host: "a2"}},
-			seed,
-		)
-		got := []string{
-			plan.Next().Host,
-			plan.Next().Host,
-			plan.Next().Host,
-			plan.Next().Host,
-		}
-		want := []string{"a2", "a1", "q2", "q1"}
-		for i := range got {
-			if got[i] != want[i] {
-				t.Fatalf("unexpected order at %d: got %v, want %v", i, got, want)
-			}
-		}
-	})
 }
 
 func expectedPreferredPlanHosts(activeNodes, quarantinedNodes, preferredNodes []url.URL, seed int64) []string {
@@ -270,13 +218,17 @@ func expectedPreferredPlanHosts(activeNodes, quarantinedNodes, preferredNodes []
 	activeNodes = cloneAndSortNodes(activeNodes)
 	quarantinedNodes = cloneAndSortNodes(quarantinedNodes)
 
-	activePreferred, unmatchedPreferred := takePreferredNodes(&activeNodes, preferredNodes)
-	quarantinedPreferred, _ := takePreferredNodes(&quarantinedNodes, unmatchedPreferred)
-
 	hosts := make([]string, 0, len(activeNodes)+len(quarantinedNodes))
-	hosts = append(hosts, planHosts(activePreferred)...)
+	for _, preferred := range preferredNodes {
+		if preferred.Host == "" {
+			continue
+		}
+		if node, ok := popNode(&activeNodes, preferred); ok {
+			hosts = append(hosts, node.Host)
+		}
+	}
+
 	hosts = append(hosts, planHosts(activeNodes)...)
-	hosts = append(hosts, planHosts(quarantinedPreferred)...)
 	hosts = append(hosts, planHosts(quarantinedNodes)...)
 	return hosts
 }

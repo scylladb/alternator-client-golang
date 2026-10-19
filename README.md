@@ -389,9 +389,11 @@ h, err := helper.NewHelper(
 ```
 Until the partition key is discovered, requests are routed without optimization. Once discovered, requests for the same partition key are pinned to the same coordinator node.
 
-When key route affinity is combined with a rack or datacenter routing scope, affinity takes precedence for operations covered by the configured affinity mode. Those operations choose their coordinator from the cluster-wide node set so clients in different racks select the same node for the same partition key. Operations not covered by key route affinity continue to use the configured rack or datacenter scope.
+When SDK v2 key route affinity is combined with a routing scope containing a rack restriction, eligible requests use an additional datacenter view. Each concrete rack scope becomes its named datacenter while every configured fallback keeps its order. For example, `rack(A,r1) → rack(B,r2) → cluster` becomes `DC(A) → DC(B) → cluster`. No fallback is added. The helper queries `/localnodes?dc=<configured-dc>` for named datacenters and reuses ordinary discovery results when they satisfy the selected affinity scope. Disabled affinity and scopes without rack restrictions need no additional discovery.
 
-The first affinity-eligible request completes cluster-wide discovery before selecting its coordinator. Discovery is bounded by the request context and an internal 30-second limit. If discovery cannot return a usable node set, the request fails without being sent to a rack-local coordinator. Changing the routing scope or enabling/disabling key route affinity on an existing helper requires `NewHelper`; `Helper.Update` rejects those topology changes.
+After successful datacenter discovery, clients in different racks of the same datacenter use the same membership for eligible same-key single-item and batch writes. Other datacenters remain excluded while the preferred datacenter is usable; explicit fallback scopes determine any wider membership. Reads, noneligible writes and requests without usable partition-key information keep ordinary routing.
+
+Startup and discovery failures retain the existing seed or previously discovered fallback behavior. Requests do not wait for synchronous affinity readiness, so cross-rack convergence is not guaranteed before successful datacenter discovery. SDK v1 remains unchanged.
 
 #### Pre-Configuring Partition Keys with WithPkInfo
 
