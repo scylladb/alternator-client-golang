@@ -15,6 +15,7 @@
 package shared
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -660,5 +661,60 @@ func TestAlternatorLiveNodes_AffinityScopeReuse(t *testing.T) {
 				t.Fatal("affinity has a second discovery updater")
 			}
 		})
+	}
+}
+
+func TestAlternatorLiveNodes_AffinityRefreshFailuresAreIndependent(t *testing.T) {
+	t.Parallel()
+	discoveryFailure := errors.New("discovery unavailable")
+	phases := []struct {
+		rack, dc         []string
+		failQuery        string
+		wantRack, wantDC []string
+	}{
+		{[]string{"rack0.local"}, []string{"dc0.local"}, "", []string{"rack0.local"}, []string{"dc0.local"}},
+		{nil, []string{"dc1.local"}, "dc=A&rack=r1", []string{"rack0.local"}, []string{"dc1.local"}},
+		{[]string{"rack2.local"}, nil, "dc=A", []string{"rack2.local"}, []string{"dc1.local"}},
+		{nil, nil, "", []string{"rack2.local"}, []string{"dc1.local"}},
+		{[]string{"rack4.local"}, []string{"dc4.local"}, "", []string{"rack4.local"}, []string{"dc4.local"}},
+	}
+	var phase int
+	nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"}, rt.NewDCScope("A", nil),
+		WithALNRoutingScope(rt.NewRackScope("A", "r1", nil)), WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				current := phases[phase]
+				if req.URL.RawQuery == current.failQuery {
+					return nil, discoveryFailure
+				}
+				switch req.URL.RawQuery {
+				case "dc=A&rack=r1":
+					return resp.AlternatorNodesResponse(current.rack, req)
+				case "dc=A":
+					return resp.AlternatorNodesResponse(current.dc, req)
+				default:
+					t.Fatalf("unexpected scope query %q", req.URL.RawQuery)
+					return nil, nil
+				}
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	defer affinity.Stop()
+	for phase = 0; phase < len(phases); phase++ {
+		current := phases[phase]
+		err := nodes.UpdateLiveNodes()
+		if errors.Is(err, discoveryFailure) != (current.failQuery != "") {
+			t.Fatalf("phase%d refresh error=%v", phase, err)
+		}
+		if got := hostnames(nodes.GetNodes()); !slices.Equal(got, current.wantRack) {
+			t.Fatalf("phase%d ordinary=%v, want%v", phase, got, current.wantRack)
+		}
+		if got := hostnames(affinity.GetNodes()); !slices.Equal(got, current.wantDC) {
+			t.Fatalf("phase%d affinity=%v, want%v", phase, got, current.wantDC)
+		}
 	}
 }

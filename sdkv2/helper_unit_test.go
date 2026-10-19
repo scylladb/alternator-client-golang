@@ -2608,3 +2608,113 @@ func TestAffinityStartupFailureAndRecoveryKeepRequestFallback(t *testing.T) {
 		t.Fatal("Update lost source aliases")
 	}
 }
+
+func TestEligibleAffinityRetriesUseDiscoveredMembership(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		batch bool
+	}{{"single", false}, {"batch", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dcNodes := batchWriteTestNodes()
+			target := dcNodes[1]
+			key := batchWriteStringKeysForNode(t, target, 1)[0]
+			var dcHosts []string
+			for _, node := range dcNodes {
+				dcHosts = append(dcHosts, node.Hostname())
+			}
+			// Distinct snapshots model discovery changing between the rack and DC responses.
+			// A retry that accidentally falls back to ordinary routing is distinguishable.
+			ordinary := url.URL{Scheme: "http", Host: "rack-only.example.com:8000"}
+			var attempts []url.URL
+			transport := &mocks.MockRoundTripper{
+				AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					switch req.URL.RawQuery {
+					case "dc=A&rack=r1":
+						return resp.AlternatorNodesResponse([]string{ordinary.Hostname()}, req)
+					case "dc=A":
+						return resp.AlternatorNodesResponse(dcHosts, req)
+					default:
+						t.Fatalf("unexpected discovery scope%q", req.URL.RawQuery)
+						return nil, nil
+					}
+				},
+				NodeHealthRequest: resp.HealthCheckResponse,
+				DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+					attempts = append(attempts, url.URL{Scheme: req.URL.Scheme, Host: req.URL.Host})
+					if len(attempts) == 1 {
+						return nil, &net.OpError{Err: syscall.ECONNREFUSED}
+					}
+					if tc.batch {
+						return resp.New().
+							OK().
+							ContentType(ct.DynamoDBJSON).
+							Body(`{"UnprocessedItems":{}}`).
+							Request(req).
+							Build()
+					}
+					return resp.DynamoDBUpdateItemResponse(req)
+				},
+			}
+			health := nodeshealth.DefaultNodeHealthStoreConfig()
+			health.Scoring.QuarantineScoreCutOff = 1
+			health.QuarantineReleasePeriod = -1
+			h, err := NewHelper(
+				[]string{"seed.local"},
+				WithPort(8000),
+				WithCredentials("key", "secret"),
+				WithRoutingScope(rt.NewRackScope("A", "r1", nil)),
+				WithNodeHealthStoreConfig(health),
+				WithNodesListUpdatePeriod(-1),
+				WithIdleNodesListUpdatePeriod(-1),
+				WithKeyRouteAffinity(
+					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).
+						WithPkInfo(map[string]string{"orders": "id"}),
+				),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return transport }),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+				options.Retryer = retry.NewStandard(
+					func(options *retry.StandardOptions) { options.MaxAttempts = 2; options.MaxBackoff = 0 },
+				)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if tc.batch {
+				_, err = client.BatchWriteItem(
+					ctx,
+					&dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{
+						"orders": {{PutRequest: &types.PutRequest{Item: keyWithID(key)}}},
+					}},
+				)
+			} else {
+				_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{TableName: aws.String("orders"), Key: keyWithID(key)})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 2 || attempts[0] != target || attempts[1] == target {
+				t.Fatalf("unexpected attempts%v, first want%s", attempts, target.Host)
+			}
+			for _, node := range attempts {
+				if !slices.Contains(dcNodes, node) {
+					t.Fatalf("eligible retry escaped DC membership:%s", node.Host)
+				}
+			}
+			assertNodesStatus(t, h.nodes, []url.URL{ordinary}, []url.URL{})
+			active := slices.DeleteFunc(slices.Clone(dcNodes), func(node url.URL) bool { return node == target })
+			assertNodesStatus(t, h.affinityNodes, active, []url.URL{target})
+		})
+	}
+}
