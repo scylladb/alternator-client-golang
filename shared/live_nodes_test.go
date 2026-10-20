@@ -941,3 +941,66 @@ func TestUnpairedDiscoveryRetainsPerProbeCustomQueries(t *testing.T) {
 		t.Fatalf("nonpaired query behavior changed: reads=%d queries=%v", reads.Load(), queries)
 	}
 }
+
+type perSeedAuxiliaryCustom struct {
+	rt.Scope
+	reads *atomic.Int32
+}
+
+func (s perSeedAuxiliaryCustom) GetLocalNodesQuery() string {
+	if s.reads.Add(1)%2 == 1 {
+		return "dc=A"
+	}
+	return "dc=B"
+}
+
+func TestAffinityCustomProbeReuseDoesNotHideLaterQuery(t *testing.T) {
+	t.Parallel()
+	for _, failA := range []bool{false, true} {
+		t.Run(strconv.FormatBool(failA), func(t *testing.T) {
+			t.Parallel()
+			failure := errors.New("A probe failed")
+			var reads atomic.Int32
+			counts := make(map[string]int)
+			nodes, view, err := NewAlternatorLiveNodesWithAffinity([]string{"one.local", "two.local"},
+				perSeedAuxiliaryCustom{Scope: rt.NewDCScope("unused", nil), reads: &reads},
+				WithALNRoutingScope(rt.NewDCScope("A", rt.NewRackScope("X", "r1", nil))),
+				WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						counts[req.URL.RawQuery]++
+						if failA && req.URL.RawQuery == "dc=A" {
+							return nil, failure
+						}
+						if req.URL.RawQuery == "dc=X&rack=r1" {
+							return resp.AlternatorNodesResponse([]string{"one.local"}, req)
+						}
+						if req.URL.RawQuery == "dc=B" {
+							return resp.AlternatorNodesResponse([]string{"b.local"}, req)
+						}
+						return resp.AlternatorNodesResponse(nil, req)
+					})
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodes.Stop()
+			for attempt := 0; attempt < 2; attempt++ {
+				reads.Store(0)
+				clear(counts)
+				if err := nodes.UpdateLiveNodes(); errors.Is(err, failure) != failA {
+					t.Fatalf("ordinary error=%v, want failure=%v", err, failA)
+				}
+				// The activated view adds b.local as its first candidate on refresh two.
+				// The original A seed responses are still retried once per refresh.
+				if reads.Load() != 2 || counts["dc=A"] != 2+attempt || counts["dc=B"] != 1 {
+					t.Fatalf("probe reuse/next-attempt retry lost: reads=%d requests=%v", reads.Load(), counts)
+				}
+				if view.GetNodes()[0].Hostname() != "b.local" {
+					t.Fatal("cached A aggregate hid custom second-seed B")
+				}
+			}
+		})
+	}
+}

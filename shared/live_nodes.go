@@ -589,6 +589,8 @@ type scopeObservation struct {
 	outcome                 scopeOutcome
 	next                    rt.Scope
 	fellBack                bool
+	refresh                 *scopeRefresh
+	reuse                   bool
 }
 
 func (o *scopeObservation) query(value string) string {
@@ -606,8 +608,14 @@ func (o *scopeObservation) query(value string) string {
 type scopeRefresh struct {
 	origins  map[int]*scopeObservation
 	outcomes map[scopeKey]*scopeObservation
+	probes   map[scopeProbeKey]scopeOutcome
 	token    *byte
 	widened  *atomic.Bool
+}
+
+type scopeProbeKey struct {
+	endpoint string
+	cluster  bool
 }
 
 func sameOperation(left, right *scopeObservation) bool {
@@ -645,10 +653,15 @@ func (aln *AlternatorLiveNodes) fetchLiveNodesWithOutcomes(
 			}
 		}
 		if observation == nil {
-			observation = &scopeObservation{key: scopeKey{cluster: rt.IsClusterScope(discoveryScope)}}
+			observation = &scopeObservation{
+				key: scopeKey{cluster: rt.IsClusterScope(discoveryScope)}, refresh: refresh, reuse: reuse,
+			}
 			cached := false
-			if refresh != nil && (reuse || refresh.widened.Load()) {
-				observation.fixed = true
+			switch discoveryScope.(type) {
+			case rt.RackScope, *rt.RackScope, rt.DCScope, *rt.DCScope, rt.ClusterScope, *rt.ClusterScope:
+				observation.fixed = refresh != nil
+			}
+			if observation.fixed {
 				observation.query(discoveryScope.GetLocalNodesQuery())
 				if reuse {
 					if previous := refresh.outcomes[observation.key]; previous != nil {
@@ -741,7 +754,7 @@ func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(
 		endpoint.Path = "/localnodes"
 		endpoint.RawQuery = query()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		newNodes, err := aln.getNodesForProbe(&endpoint, operation)
 		if err != nil {
 			lastErr = err
 			continue
@@ -769,7 +782,7 @@ func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(
 		endpoint.Path = "/localnodes"
 		endpoint.RawQuery = query()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		newNodes, err := aln.getNodesForProbe(&endpoint, operation)
 		if err != nil {
 			lastErr = err
 			continue
@@ -791,6 +804,22 @@ func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(
 	return nil, nil
 }
 
+// Custom queries are evaluated at their original per-probe call sites. Only the
+// auxiliary traversal may reuse a matching response; ordinary discovery remains
+// observational and executes its established requests and error handling.
+func (aln *AlternatorLiveNodes) getNodesForProbe(endpoint *url.URL, operation *scopeObservation) ([]url.URL, error) {
+	if operation == nil || operation.refresh == nil {
+		return aln.getNodes(endpoint)
+	}
+	key := scopeProbeKey{endpoint: endpoint.String(), cluster: operation.key.cluster}
+	if previous, ok := operation.refresh.probes[key]; ok && operation.reuse {
+		return slices.Clone(previous.nodes), previous.err
+	}
+	nodes, err := aln.getNodes(endpoint)
+	operation.refresh.probes[key] = scopeOutcome{nodes: slices.Clone(nodes), err: err}
+	return nodes, err
+}
+
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 	if aln.affinity == nil {
@@ -804,6 +833,7 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 	refresh := &scopeRefresh{
 		origins:  make(map[int]*scopeObservation),
 		outcomes: make(map[scopeKey]*scopeObservation),
+		probes:   make(map[scopeProbeKey]scopeOutcome),
 		token:    new(byte),
 		widened:  &aln.affinity.widened,
 	}

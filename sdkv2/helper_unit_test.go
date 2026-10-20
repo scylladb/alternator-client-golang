@@ -3367,7 +3367,7 @@ func TestAffinityQueryCaptureFollowsOriginalChainOccurrences(t *testing.T) {
 	}
 }
 
-func TestAffinityCapturedQueryIsUsedForEveryProbe(t *testing.T) {
+func TestAffinityCustomQueriesPreserveEachProbeAfterWidening(t *testing.T) {
 	t.Parallel()
 	var reads atomic.Int32
 	var queries []string
@@ -3398,7 +3398,7 @@ func TestAffinityCapturedQueryIsUsedForEveryProbe(t *testing.T) {
 	if err := h.UpdateLiveNodes(); err != nil {
 		t.Fatal(err)
 	}
-	if reads.Load() != 1 || !slices.Equal(queries, []string{"custom=first", "custom=first"}) ||
+	if reads.Load() != 2 || !slices.Equal(queries, []string{"custom=first", "custom=second"}) ||
 		h.affinityNodeSource() != h.nodes {
 		t.Fatalf("query key diverged from network probes: reads=%d queries=%v", reads.Load(), queries)
 	}
@@ -3731,8 +3731,10 @@ func (s *finiteRepeatedOpaqueTail) Fallback() rt.Scope {
 }
 
 func (s *finiteRepeatedOpaqueTail) GetLocalNodesQuery() string {
-	n := s.reads.Add(1)
-	if *s.phase == 1 && n > 1 {
+	s.reads.Add(1)
+	// Reach the second occurrence after the actual ordinary fallback, rather
+	// than switching query on a later seed probe of the first occurrence.
+	if *s.phase == 1 && s.calls.Load() > 2 {
 		return "custom=tail"
 	}
 	return "custom=empty"
@@ -3800,5 +3802,59 @@ func TestAffinityRetainedTailDoesNotReuseShorterOrdinaryPathByIndex(t *testing.T
 				calls.Load(),
 			)
 		}
+	}
+}
+
+type knownRackSeedCustom struct {
+	rt.Scope
+	reads *atomic.Int32
+}
+
+func (s knownRackSeedCustom) GetLocalNodesQuery() string {
+	if s.reads.Add(1)%2 == 1 {
+		return "dc=A"
+	}
+	return "dc=B"
+}
+
+func TestKnownRackCustomPreservesPerSeedDiscovery(t *testing.T) {
+	t.Parallel()
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%v", enabled), func(t *testing.T) {
+			t.Parallel()
+			var reads atomic.Int32
+			custom := knownRackSeedCustom{Scope: rt.NewDCScope("unused", nil), reads: &reads}
+			mode := KeyRouteAffinityRMW
+			if !enabled {
+				mode = 0
+			}
+			h, err := NewHelper([]string{"one.local", "two.local"},
+				WithRoutingScope(rt.NewRackScope("X", "r1", custom)),
+				WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(mode)),
+				WithNodesListUpdatePeriod(-1), WithIdleNodesListUpdatePeriod(-1),
+				WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return &mocks.MockRoundTripper{AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+						if req.URL.RawQuery == "dc=B" {
+							return resp.AlternatorNodesResponse([]string{"b.local"}, req)
+						}
+						return resp.AlternatorNodesResponse(nil, req)
+					}}
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.Stop)
+			err = h.UpdateLiveNodes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reads.Load() != 2 {
+				t.Fatalf("ordinary custom reads=%d, want2", reads.Load())
+			}
+			if h.GetNodes()[0].Hostname() != "b.local" {
+				t.Errorf("enabled=%v ordinary lost second per-seed custom query", enabled)
+			}
+		})
 	}
 }
