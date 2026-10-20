@@ -17,7 +17,6 @@ package shared
 import (
 	"math/rand"
 	"net/url"
-	"sort"
 	"time"
 )
 
@@ -37,6 +36,7 @@ type LazyQueryPlan struct {
 	rnd              *rand.Rand
 	preferredNodes   []url.URL
 	deterministic    bool
+	sortQuarantined  bool
 }
 
 // NewLazyQueryPlan constructs a plan bound to the provided nodes source.
@@ -61,8 +61,9 @@ func NewLazyQueryPlanWithSeed(nodes nodesSource, seed int64) *LazyQueryPlan {
 func NewLazyQueryPlanWithSortedSeed(nodes nodesSource, seed int64) *LazyQueryPlan {
 	return &LazyQueryPlan{
 		activeNodes:      cloneAndSortNodes(nodes.GetActiveNodes()),
-		quarantinedNodes: cloneAndSortNodes(nodes.GetQuarantinedNodes()),
+		quarantinedNodes: makeSureNotNil(append([]url.URL(nil), nodes.GetQuarantinedNodes()...)),
 		rnd:              rand.New(rand.NewSource(seed)),
+		sortQuarantined:  true,
 	}
 }
 
@@ -73,9 +74,10 @@ func NewLazyQueryPlanWithPreferredNodes(nodes nodesSource, preferredNodes []url.
 	_ = seed
 	return &LazyQueryPlan{
 		activeNodes:      cloneAndSortNodes(nodes.GetActiveNodes()),
-		quarantinedNodes: cloneAndSortNodes(nodes.GetQuarantinedNodes()),
+		quarantinedNodes: makeSureNotNil(append([]url.URL(nil), nodes.GetQuarantinedNodes()...)),
 		preferredNodes:   append([]url.URL(nil), preferredNodes...),
 		deterministic:    true,
+		sortQuarantined:  true,
 	}
 }
 
@@ -112,6 +114,10 @@ func (p *LazyQueryPlan) Next() url.URL {
 
 	if p.quarantinedNodes == nil {
 		p.quarantinedNodes = makeSureNotNil(p.nodes.GetQuarantinedNodes())
+	}
+	if p.sortQuarantined {
+		sortNodesByAddress(p.quarantinedNodes)
+		p.sortQuarantined = false
 	}
 	if len(p.quarantinedNodes) > 0 {
 		return p.pickAndRemove(&p.quarantinedNodes)
@@ -153,8 +159,5 @@ func popNode(nodes *[]url.URL, preferred url.URL) (url.URL, bool) {
 
 func cloneAndSortNodes(in []url.URL) []url.URL {
 	out := makeSureNotNil(append([]url.URL(nil), in...))
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].String() < out[j].String()
-	})
-	return out
+	return sortNodesByAddress(out)
 }
