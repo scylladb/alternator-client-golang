@@ -72,6 +72,9 @@ func NewRackScope(datacenter, rack string, fallback Scope) *RackScope {
 	}
 }
 
+// Datacenter returns the datacenter containing the rack.
+func (r RackScope) Datacenter() string { return r.datacenter }
+
 // Name implements Scope.
 func (r RackScope) Name() string {
 	return "Rack"

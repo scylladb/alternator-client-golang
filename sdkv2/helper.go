@@ -51,6 +51,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -59,6 +60,7 @@ import (
 
 	"github.com/scylladb/alternator-client-golang/shared/errs"
 	"github.com/scylladb/alternator-client-golang/shared/logx"
+	"github.com/scylladb/alternator-client-golang/shared/rt"
 
 	"github.com/scylladb/alternator-client-golang/shared"
 
@@ -257,6 +259,7 @@ var _ AlternatorNodesSource = &shared.AlternatorLiveNodes{}
 // and routing to healthy nodes.
 type Helper struct {
 	nodes         AlternatorNodesSource
+	affinityNodes AlternatorNodesSource
 	cfg           shared.Config
 	queryPlanSeed int64
 
@@ -272,7 +275,7 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 		opt(cfg)
 	}
 
-	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	nodes, affinityNodes, err := newNodeSources(initialNodes, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -286,10 +289,133 @@ func NewHelper(initialNodes []string, options ...shared.Option) (*Helper, error)
 	}
 
 	return &Helper{
-		nodes:       nodes,
-		cfg:         *cfg,
-		keyAffinity: keyAffinity{pkInfoPerTable: pkInfoPerTable},
+		nodes:         nodes,
+		affinityNodes: affinityNodes,
+		cfg:           *cfg,
+		keyAffinity:   keyAffinity{pkInfoPerTable: pkInfoPerTable},
 	}, nil
+}
+
+func newNodeSources(initialNodes []string, cfg *shared.Config) (AlternatorNodesSource, AlternatorNodesSource, error) {
+	if cfg.KeyRouteAffinity.Type != KeyRouteAffinityNone {
+		if scope, changed := affinityScope(cfg.RoutingScope); changed {
+			return shared.NewAlternatorLiveNodesWithAffinity(initialNodes, scope, cfg.ToALNOptions()...)
+		}
+	}
+	nodes, err := shared.NewAlternatorLiveNodes(initialNodes, cfg.ToALNOptions()...)
+	return nodes, nil, err
+}
+
+// affinityScope resolves built-in prefixes and leaves opaque fallback links untouched.
+// Custom queries remain live; each needed derived link is retained once.
+func affinityScope(scope rt.Scope) (rt.Scope, bool) {
+	resolver := &affinityScopeResolver{operations: make(map[affinityScopeOperation]bool)}
+	resolved, opaque := resolver.resolve(scope, 0, nil)
+	return resolved, opaque || resolver.rack.Load()
+}
+
+type affinityScopeOperation struct {
+	query   string
+	cluster bool
+}
+
+type affinityScopeResolver struct {
+	mu         sync.Mutex
+	operations map[affinityScopeOperation]bool
+	rack       atomic.Bool
+}
+
+func (r *affinityScopeResolver) resolve(scope rt.Scope, index int, token *byte) (rt.Scope, bool) {
+	var prefix []*scopeWithFallback
+	var terminal rt.Scope
+	opaque := false
+	for scope != nil {
+		view := scope
+		widened := false
+		switch rack := scope.(type) {
+		case rt.RackScope:
+			view = rt.NewDCScope(rack.Datacenter(), nil)
+			widened = true
+		case *rt.RackScope:
+			view = rt.NewDCScope(rack.Datacenter(), nil)
+			widened = true
+		}
+		if widened {
+			r.rack.Store(true)
+		}
+		switch scope.(type) {
+		case rt.RackScope, *rt.RackScope, rt.DCScope, *rt.DCScope, rt.ClusterScope, *rt.ClusterScope:
+			// Fixed built-ins alone are structurally deduplicated.
+			key := affinityScopeOperation{query: view.GetLocalNodesQuery(), cluster: rt.IsClusterScope(view)}
+			r.mu.Lock()
+			duplicate := r.operations[key]
+			r.operations[key] = true
+			r.mu.Unlock()
+			if !duplicate {
+				if rt.IsClusterScope(view) {
+					terminal = view
+					scope = nil
+					continue
+				}
+				prefix = append(prefix, &scopeWithFallback{Scope: view, originalIndex: index, token: token, widened: widened, resolver: r})
+			}
+			scope = scope.Fallback()
+			if index >= 0 {
+				index++
+			}
+		default:
+			terminal = &scopeWithFallback{Scope: scope, originalIndex: index, token: token, opaque: true, resolver: r}
+			opaque = true
+			scope = nil
+		}
+	}
+	for i := len(prefix) - 1; i >= 0; i-- {
+		prefix[i].fallback = terminal
+		terminal = prefix[i]
+	}
+	return terminal, opaque
+}
+
+type scopeWithFallback struct {
+	rt.Scope
+	fallback        rt.Scope
+	originalIndex   int
+	token           *byte
+	widened, opaque bool
+	once            sync.Once
+	resolver        *affinityScopeResolver
+}
+
+func (s *scopeWithFallback) Fallback() rt.Scope         { return s.AffinityScopeFallback(nil, false, nil) }
+func (s *scopeWithFallback) AffinityScopeHasRack() bool { return s.resolver.rack.Load() }
+
+// A nil token identifies the configured root or its fixed built-in successors.
+// Below an opaque edge, only its first observed resolution proves correspondence
+// for that attempt. Tokens never retain the attempt's queries or outcomes.
+func (s *scopeWithFallback) AffinityScopeOrigin(token *byte) (rt.Scope, int) {
+	if s.widened || (s.token != nil && s.token != token) {
+		return s.Scope, -1
+	}
+	return s.Scope, s.originalIndex
+}
+
+func (s *scopeWithFallback) AffinityScopeFallback(next rt.Scope, observed bool, token *byte) rt.Scope {
+	if !s.opaque {
+		return s.fallback
+	}
+	s.once.Do(func() {
+		index := -1
+		if observed {
+			index = s.originalIndex + 1
+		} else {
+			next = s.Scope.Fallback()
+		}
+		if token == nil {
+			token = new(byte)
+		}
+		s.fallback, _ = s.resolver.resolve(next, index, token)
+	})
+	return s.fallback
 }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
@@ -332,9 +458,10 @@ func (lb *Helper) Update(opts ...Option) *Helper {
 		opt(&cfg)
 	}
 	return &Helper{
-		nodes:       lb.nodes,
-		cfg:         cfg,
-		keyAffinity: lb.keyAffinity.Clone(),
+		nodes:         lb.nodes,
+		affinityNodes: lb.affinityNodes,
+		cfg:           cfg,
+		keyAffinity:   lb.keyAffinity.Clone(),
 	}
 }
 
@@ -454,12 +581,21 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Host = node.Host
 	resp, err := rt.originalTransport.RoundTrip(req)
 	if err != nil && req.URL != nil {
-		rt.lb.nodes.ReportNodeError(url.URL{
+		rt.lb.reportNodeError(url.URL{
 			Host:   req.URL.Host,
 			Scheme: req.URL.Scheme,
 		}, err)
 	}
 	return resp, err
+}
+
+func (lb *Helper) reportNodeError(node url.URL, err error) {
+	lb.nodes.ReportNodeError(node, err)
+	if source, ok := lb.nodes.(*shared.AlternatorLiveNodes); ok && lb.affinityNodes != nil {
+		if affinity := source.AffinityNodes(); affinity != source {
+			affinity.ReportNodeError(node, err)
+		}
+	}
 }
 
 func (lb *Helper) wrapHTTPTransport(original http.RoundTripper) http.RoundTripper {
@@ -519,6 +655,15 @@ func (lb *Helper) newDefaultQueryPlan() *shared.LazyQueryPlan {
 	return shared.NewLazyQueryPlanWithSeed(lb.nodes, lb.queryPlanSeed)
 }
 
+func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
+	if lb.affinityNodes != nil {
+		if source, ok := lb.nodes.(*shared.AlternatorLiveNodes); ok {
+			return source.AffinityNodes()
+		}
+	}
+	return lb.nodes
+}
+
 func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
 		if err := stack.Initialize.Add(
@@ -557,7 +702,6 @@ func (lb *Helper) queryPlanAPIOption() func(*middleware.Stack) error {
 				if node.Host == "" {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, errs.ErrQueryPlanExhausted
 				}
-
 				ctx = middleware.WithStackValue(ctx, requestNodeKey, node)
 
 				req, ok := in.Request.(*smithyhttp.Request)
@@ -647,7 +791,7 @@ func (lb *Helper) getAffinityQueryPlan(in middleware.InitializeInput) (*shared.L
 	if err != nil {
 		return nil, err
 	}
-	return shared.NewLazyQueryPlanWithSortedSeed(lb.nodes, pkHash), nil
+	return shared.NewLazyQueryPlanWithSortedSeed(lb.affinityNodeSource(), pkHash), nil
 }
 
 func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
@@ -702,6 +846,14 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	return 0, fmt.Errorf("could not get a proper hash")
 }
 
+// affinityPlanNodes keeps batch voting and retries on the same captured membership.
+type affinityPlanNodes struct {
+	active, quarantined []url.URL
+}
+
+func (n affinityPlanNodes) GetActiveNodes() []url.URL      { return n.active }
+func (n affinityPlanNodes) GetQuarantinedNodes() []url.URL { return n.quarantined }
+
 type batchWriteRoutingCandidate struct {
 	tableName string
 	values    map[string]types.AttributeValue
@@ -713,7 +865,12 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have a routing target")
 	}
 
-	activeNodes := lb.nodes.GetActiveNodes()
+	source := lb.affinityNodeSource()
+	affinityNodes := affinityPlanNodes{
+		active:      source.GetActiveNodes(),
+		quarantined: source.GetQuarantinedNodes(),
+	}
+	activeNodes := affinityNodes.GetActiveNodes()
 	if len(activeNodes) == 0 {
 		return nil, fmt.Errorf("batch write request does not have active nodes")
 	}
@@ -756,7 +913,7 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have usable preferred nodes")
 	}
 
-	return shared.NewLazyQueryPlanWithPreferredNodes(lb.nodes, preferredNodes, batchWriteSeed(hashes)), nil
+	return shared.NewLazyQueryPlanWithPreferredNodes(affinityNodes, preferredNodes, batchWriteSeed(hashes)), nil
 }
 
 func selectBatchWriteRoutingCandidates(requestItems map[string][]types.WriteRequest) []batchWriteRoutingCandidate {
