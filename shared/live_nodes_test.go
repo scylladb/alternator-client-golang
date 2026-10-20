@@ -816,3 +816,87 @@ func TestAlternatorLiveNodes_AffinityActivationStop(t *testing.T) {
 		})
 	}
 }
+
+type nonClusterEmptyQueryScope struct{ rt.Scope }
+
+func (nonClusterEmptyQueryScope) GetLocalNodesQuery() string { return "" }
+
+func TestAffinityDiscoveryDistinguishesQueryAggregation(t *testing.T) {
+	t.Parallel()
+	var transportID int
+	calls := make(map[int]int)
+	nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"one.local", "two.local"}, rt.NewClusterScope(),
+		WithALNRoutingScope(nonClusterEmptyQueryScope{rt.NewDCScope("A", nil)}),
+		WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			transportID++
+			id := transportID
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls[id]++
+				if req.URL.RawQuery != "" {
+					t.Fatalf("unexpected query %q", req.URL.RawQuery)
+				}
+				return resp.AlternatorNodesResponse([]string{req.URL.Hostname()}, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes.GetNodes()) != 1 || !slices.Equal(hostnames(affinity.GetNodes()), []string{"one.local", "two.local"}) {
+		t.Fatalf(
+			"custom scoped and cluster results conflated: ordinary=%v affinity=%v",
+			nodes.GetNodes(),
+			affinity.GetNodes(),
+		)
+	}
+	if calls[1] != 1 || calls[2] != 2 {
+		t.Fatalf("unexpected operation probes: %v", calls)
+	}
+}
+
+func TestAffinityDiscoveryCachesAdditionalEmptyOutcomesPerAttempt(t *testing.T) {
+	t.Parallel()
+	counts := make(map[string]int)
+	var recovered bool
+	nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"},
+		rt.NewDCScope("A", rt.NewDCScope("A", rt.NewDCScope("B", nil))),
+		WithALNRoutingScope(rt.NewRackScope("A", "r1", nil)),
+		WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				query := req.URL.RawQuery
+				counts[query]++
+				if query == "dc=A&rack=r1" {
+					return resp.AlternatorNodesResponse([]string{"seed.local"}, req)
+				}
+				if recovered && query == "dc=A" {
+					return resp.AlternatorNodesResponse([]string{"recovered.local"}, req)
+				}
+				return resp.AlternatorNodesResponse(nil, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if counts["dc=A"] != 1 || counts["dc=B"] != 1 {
+		t.Fatalf("empty affinity outcome rediscovered: %v", counts)
+	}
+	recovered = true
+	counts = make(map[string]int)
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if counts["dc=A"] != 1 || counts["dc=B"] != 0 || affinity.GetNodes()[0].Hostname() != "recovered.local" {
+		t.Fatalf("empty outcome cached across refreshes: calls=%v nodes=%v", counts, affinity.GetNodes())
+	}
+}

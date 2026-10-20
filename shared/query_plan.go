@@ -28,14 +28,14 @@ type nodesSource interface {
 
 // LazyQueryPlan lazily materializes a list of nodes to execute a request against.
 // It defers fetching active and quarantined nodes from the source until the first
-// time they are needed by Next().
+// time they are needed by Next(). Affinity constructors capture both lists when
+// the request plan is created so later discovery cannot change its retries.
 type LazyQueryPlan struct {
 	nodes            nodesSource
 	activeNodes      []url.URL
 	quarantinedNodes []url.URL
 	rnd              *rand.Rand
 	preferredNodes   []url.URL
-	sortNodes        bool
 	deterministic    bool
 }
 
@@ -57,24 +57,25 @@ func NewLazyQueryPlanWithSeed(nodes nodesSource, seed int64) *LazyQueryPlan {
 
 // NewLazyQueryPlanWithSortedSeed constructs a seeded plan that sorts node
 // addresses lexicographically before applying the seeded selection algorithm.
+// Both active and quarantined membership are captured at construction.
 func NewLazyQueryPlanWithSortedSeed(nodes nodesSource, seed int64) *LazyQueryPlan {
 	return &LazyQueryPlan{
-		nodes:     nodes,
-		rnd:       rand.New(rand.NewSource(seed)),
-		sortNodes: true,
+		activeNodes:      cloneAndSortNodes(nodes.GetActiveNodes()),
+		quarantinedNodes: cloneAndSortNodes(nodes.GetQuarantinedNodes()),
+		rnd:              rand.New(rand.NewSource(seed)),
 	}
 }
 
 // NewLazyQueryPlanWithPreferredNodes constructs a plan that tries
 // preferredNodes first when they are still active, then returns the remaining
-// lexicographically sorted nodes.
+// lexicographically sorted nodes. Both node lists are captured at construction.
 func NewLazyQueryPlanWithPreferredNodes(nodes nodesSource, preferredNodes []url.URL, seed int64) *LazyQueryPlan {
 	_ = seed
 	return &LazyQueryPlan{
-		nodes:          nodes,
-		preferredNodes: append([]url.URL(nil), preferredNodes...),
-		sortNodes:      true,
-		deterministic:  true,
+		activeNodes:      cloneAndSortNodes(nodes.GetActiveNodes()),
+		quarantinedNodes: cloneAndSortNodes(nodes.GetQuarantinedNodes()),
+		preferredNodes:   append([]url.URL(nil), preferredNodes...),
+		deterministic:    true,
 	}
 }
 
@@ -93,7 +94,7 @@ func FirstNodeWithSeed(nodes []url.URL, seed int64) url.URL {
 // so that a node is never returned twice. If no nodes remain, it returns the zero url.URL.
 func (p *LazyQueryPlan) Next() url.URL {
 	if p.activeNodes == nil {
-		p.activeNodes = p.prepareNodes(p.nodes.GetActiveNodes())
+		p.activeNodes = makeSureNotNil(p.nodes.GetActiveNodes())
 	}
 	for len(p.preferredNodes) > 0 {
 		preferredNode := p.preferredNodes[0]
@@ -110,7 +111,7 @@ func (p *LazyQueryPlan) Next() url.URL {
 	}
 
 	if p.quarantinedNodes == nil {
-		p.quarantinedNodes = p.prepareNodes(p.nodes.GetQuarantinedNodes())
+		p.quarantinedNodes = makeSureNotNil(p.nodes.GetQuarantinedNodes())
 	}
 	if len(p.quarantinedNodes) > 0 {
 		return p.pickAndRemove(&p.quarantinedNodes)
@@ -131,13 +132,6 @@ func (p *LazyQueryPlan) pickAndRemove(nodes *[]url.URL) url.URL {
 	(*nodes)[idx] = (*nodes)[len(*nodes)-1]
 	*nodes = (*nodes)[:len(*nodes)-1]
 	return node
-}
-
-func (p *LazyQueryPlan) prepareNodes(in []url.URL) []url.URL {
-	if p.sortNodes {
-		return cloneAndSortNodes(in)
-	}
-	return makeSureNotNil(in)
 }
 
 func makeSureNotNil(in []url.URL) []url.URL {

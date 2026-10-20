@@ -608,7 +608,7 @@ func (aln *AlternatorLiveNodes) fetchLiveNodesWithOutcomes(
 		}
 		if !cached {
 			outcome.nodes, outcome.err = aln.getNodesForScopeWithSource(scope, source)
-			if outcomes != nil && !reuse {
+			if outcomes != nil {
 				outcomes[key] = outcome
 			}
 		}
@@ -631,6 +631,9 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 
 func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(scope rt.Scope, source nodesSource) ([]url.URL, error) {
 	clusterScope := rt.IsClusterScope(scope)
+	// A new affinity cluster view may probe ordinary learned nodes, but must
+	// still aggregate the configured seeds rather than inherit rack membership.
+	aggregateSeeds := clusterScope && source != nil
 	if source == nil {
 		source = aln
 	}
@@ -657,7 +660,7 @@ func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(scope rt.Scope, sourc
 		}
 		discoveredNodes = append(discoveredNodes, newNodes...)
 	}
-	if len(discoveredNodes) != 0 {
+	if len(discoveredNodes) != 0 && !aggregateSeeds {
 		return cloneAndDedupeNodes(discoveredNodes), nil
 	}
 

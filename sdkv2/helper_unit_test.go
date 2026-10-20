@@ -2433,6 +2433,10 @@ func (s customAffinityScope) Fallback() rt.Scope { return s.Scope }
 func (s customAffinityScope) Name() string               { return "Custom" }
 func (s customAffinityScope) GetLocalNodesQuery() string { return "custom=value" }
 
+type emptyQueryAffinityScope struct{ rt.Scope }
+
+func (emptyQueryAffinityScope) GetLocalNodesQuery() string { return "" }
+
 func TestAffinityScopePreservesFallbacks(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -2445,6 +2449,7 @@ func TestAffinityScopePreservesFallbacks(t *testing.T) {
 		{"rack without fallback", rt.NewRackScope("A", "r1", nil), []string{"dc=A"}, true},
 		{"rack value", *rt.NewRackScope("A", "r1", nil), []string{"dc=A"}, true},
 		{"custom fallback", customAffinityScope{rt.NewRackScope("B", "r2", nil)}, []string{"custom=value", "dc=B"}, true},
+		{"custom empty query", rt.NewRackScope("A", "r1", emptyQueryAffinityScope{rt.NewDCScope("custom", rt.NewClusterScope())}), []string{"dc=A", "", ""}, true},
 		{"DC", rt.NewDCScope("A", nil), []string{"dc=A"}, false},
 		{"cluster", rt.NewClusterScope(), []string{""}, false},
 	} {
@@ -2709,11 +2714,11 @@ func TestEligibleAffinityRetriesUseDiscoveredMembership(t *testing.T) {
 	}
 }
 
-// These opaque scopes deliberately reject reads of an unused fallback. The
+// Opaque implementations preserve their own query and fallback metadata. The
 // value form also cannot be compared as an interface map key.
 type unusedAffinityFallback struct{ rt.Scope }
 
-func (unusedAffinityFallback) Fallback() rt.Scope { panic("unused custom fallback inspected") }
+func (s unusedAffinityFallback) Fallback() rt.Scope { return s.Scope.Fallback() }
 
 type noncomparableAffinityFallback struct {
 	unusedAffinityFallback
@@ -2857,4 +2862,299 @@ func TestOpaqueAffinityActivatesAtRackAndReusesFailedDiscovery(t *testing.T) {
 		t.Fatalf("unchanged failed scope was rediscovered:%v", requests)
 	}
 	assertNodesStatus(t, h.affinityNodeSource(), want, []url.URL{})
+}
+
+type countedAffinityScope struct {
+	rt.Scope
+	fallback rt.Scope
+	calls    *int
+}
+
+func (s countedAffinityScope) Fallback() rt.Scope {
+	*s.calls++
+	return s.fallback
+}
+
+func TestAffinityScopeResolvesAndDeduplicatesOnce(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	last := rt.NewRackScope("B", "r2", rt.NewClusterScope())
+	// Matching query text does not make the custom implementation a built-in rack.
+	custom := countedAffinityScope{rt.NewRackScope("C", "custom", nil), last, &calls}
+	original := rt.NewRackScope("A", "r1", rt.NewRackScope("A", "r1", rt.NewDCScope("A", custom)))
+	derived, changed := affinityScope(original)
+	if !changed || calls != 1 {
+		t.Fatalf("changed=%v, initialization fallback reads=%d", changed, calls)
+	}
+	for range 2 {
+		var queries []string
+		var cluster bool
+		for scope := derived; scope != nil; scope = scope.Fallback() {
+			queries = append(queries, scope.GetLocalNodesQuery())
+			cluster = rt.IsClusterScope(scope)
+		}
+		if !slices.Equal(queries, []string{"dc=A", "dc=C&rack=custom", "dc=B", ""}) || !cluster {
+			t.Fatalf("derived queries=%v, terminal cluster=%v", queries, cluster)
+		}
+	}
+	if calls != 1 || original.GetLocalNodesQuery() != "dc=A&rack=r1" ||
+		original.Fallback().Fallback().Fallback() != custom {
+		t.Fatal("derived traversal reread or mutated ordinary metadata")
+	}
+}
+
+type selfReturningAffinityScope struct{ rt.Scope }
+
+func (s *selfReturningAffinityScope) Fallback() rt.Scope { return s }
+
+type selfReturningAffinityValue struct{ rt.Scope }
+
+func (s selfReturningAffinityValue) Fallback() rt.Scope { return s }
+
+type selfReturningAffinitySlice []string
+
+func (selfReturningAffinitySlice) Name() string               { return "Custom" }
+func (selfReturningAffinitySlice) String() string             { return "Custom()" }
+func (selfReturningAffinitySlice) GetLocalNodesQuery() string { return "dc=A" }
+func (s selfReturningAffinitySlice) Fallback() rt.Scope       { return s }
+
+func TestAffinityScopeSupportsSelfReturningCustomValues(t *testing.T) {
+	t.Parallel()
+	for _, scope := range []rt.Scope{
+		&selfReturningAffinityScope{rt.NewDCScope("A", nil)},
+		selfReturningAffinitySlice{"opaque"},
+		selfReturningAffinityValue{selfReturningAffinitySlice{"opaque"}},
+	} {
+		t.Run(fmt.Sprintf("%T", scope), func(t *testing.T) {
+			t.Parallel()
+			var queries []string
+			h, err := NewHelper([]string{"seed.local"}, WithRoutingScope(scope),
+				WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithNodesListUpdatePeriod(-1), WithIdleNodesListUpdatePeriod(-1),
+				WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return &mocks.MockRoundTripper{AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+						queries = append(queries, req.URL.RawQuery)
+						return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+					}}
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(queries, []string{"dc=A"}) || h.GetNodes()[0].Hostname() != "known.local" {
+				t.Fatalf("custom discovery changed: queries=%v nodes=%v", queries, h.GetNodes())
+			}
+		})
+	}
+}
+
+func TestAffinityScopeRetriesEmptyDerivedOperationsOnLaterRefresh(t *testing.T) {
+	t.Parallel()
+	var phase int
+	counts := make(map[string]int)
+	h, err := NewHelper(
+		[]string{"seed.local"},
+		WithRoutingScope(
+			rt.NewRackScope("A", "r1", rt.NewRackScope("A", "r2", rt.NewDCScope("A", rt.NewRackScope("B", "r1", nil)))),
+		),
+		WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithNodesListUpdatePeriod(-1),
+		WithIdleNodesListUpdatePeriod(-1),
+		WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return &mocks.MockRoundTripper{AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+				query := req.URL.RawQuery
+				counts[query]++
+				if strings.Contains(query, "rack=") {
+					return resp.AlternatorNodesResponse([]string{"seed.local"}, req)
+				}
+				if phase == 1 && query == "dc=A" {
+					return resp.AlternatorNodesResponse([]string{"recovered.local"}, req)
+				}
+				return resp.AlternatorNodesResponse(nil, req)
+			}}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Stop()
+	if err := h.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if counts["dc=A"] != 1 || counts["dc=B"] != 1 {
+		t.Fatalf("repeated empty discovery: %v", counts)
+	}
+	phase = 1
+	counts = make(map[string]int)
+	if err := h.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if counts["dc=A"] != 1 || counts["dc=B"] != 0 ||
+		h.affinityNodeSource().GetNodes()[0].Hostname() != "recovered.local" {
+		t.Fatalf("later refresh did not retry preferred DC: %v", counts)
+	}
+}
+
+func TestEligibleAffinityCapturesMembershipAcrossDiscoveryRefresh(t *testing.T) {
+	t.Parallel()
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			t.Parallel()
+			oldNodes := []url.URL{
+				{Scheme: "http", Host: "old-one.local:8000"},
+				{Scheme: "http", Host: "old-two.local:8000"},
+				{Scheme: "http", Host: "old-quarantined.local:8000"},
+			}
+			newNodes := []url.URL{
+				{Scheme: "http", Host: "new-active.local:8000"},
+				{Scheme: "http", Host: "new-quarantined.local:8000"},
+			}
+			var h *Helper
+			var refreshed bool
+			var attempts []url.URL
+			transport := &mocks.MockRoundTripper{
+				AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					if req.URL.RawQuery != "dc=A" {
+						return resp.AlternatorNodesResponse([]string{"rack.local"}, req)
+					}
+					membership := oldNodes
+					if refreshed {
+						membership = newNodes
+					}
+					hosts := make([]string, len(membership))
+					for i, node := range membership {
+						hosts[i] = node.Hostname()
+					}
+					return resp.AlternatorNodesResponse(hosts, req)
+				},
+				NodeHealthRequest: resp.HealthCheckResponse,
+				DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+					attempts = append(attempts, url.URL{Scheme: req.URL.Scheme, Host: req.URL.Host})
+					if len(attempts) == 1 {
+						refreshed = true
+						if err := h.UpdateLiveNodes(); err != nil {
+							t.Fatal(err)
+						}
+						h.affinityNodes.ReportNodeError(newNodes[1], errors.New("quarantine new node"))
+					}
+					if len(attempts) <= 2 {
+						return nil, &net.OpError{Err: syscall.ECONNREFUSED}
+					}
+					if batch {
+						return resp.New().
+							OK().
+							ContentType(ct.DynamoDBJSON).
+							Body(`{"UnprocessedItems":{}}`).
+							Request(req).
+							Build()
+					}
+					return resp.DynamoDBUpdateItemResponse(req)
+				},
+			}
+			health := nodeshealth.DefaultNodeHealthStoreConfig()
+			health.Scoring.QuarantineScoreCutOff = 1
+			health.QuarantineReleasePeriod = -1
+			var err error
+			h, err = NewHelper(
+				[]string{"seed.local"},
+				WithPort(8000),
+				WithCredentials("key", "secret"),
+				WithRoutingScope(rt.NewRackScope("A", "r1", nil)),
+				WithNodeHealthStoreConfig(health),
+				WithNodesListUpdatePeriod(-1),
+				WithIdleNodesListUpdatePeriod(-1),
+				WithKeyRouteAffinity(
+					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).
+						WithPkInfo(map[string]string{"orders": "id"}),
+				),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return transport }),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			h.affinityNodes.ReportNodeError(oldNodes[2], errors.New("quarantine old node"))
+			client, err := h.NewDynamoDB(func(options *dynamodb.Options) {
+				options.Retryer = retry.NewStandard(
+					func(options *retry.StandardOptions) { options.MaxAttempts = 3; options.MaxBackoff = 0 },
+				)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			write := func() error {
+				if batch {
+					_, err := client.BatchWriteItem(
+						ctx,
+						&dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{
+							"orders": {{PutRequest: &types.PutRequest{Item: keyWithID("same-key")}}},
+						}},
+					)
+					return err
+				}
+				_, err := client.UpdateItem(
+					ctx,
+					&dynamodb.UpdateItemInput{TableName: aws.String("orders"), Key: keyWithID("same-key")},
+				)
+				return err
+			}
+			if err := write(); err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 3 || attempts[0] == attempts[1] || attempts[2] != oldNodes[2] {
+				t.Fatalf("captured active/quarantined plan changed: %v", attempts)
+			}
+			for _, node := range attempts {
+				if !slices.Contains(oldNodes, node) {
+					t.Fatalf("retry used refreshed membership: %v", attempts)
+				}
+			}
+			if err := write(); err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 4 || attempts[3] != newNodes[0] {
+				t.Fatalf("new request missed refreshed membership: %v", attempts)
+			}
+		})
+	}
+}
+
+func TestDisabledAffinityDoesNotResolveFallbacks(t *testing.T) {
+	t.Parallel()
+	calls, discoveries := 0, 0
+	cfg := shared.NewDefaultConfig()
+	cfg.RoutingScope = countedAffinityScope{rt.NewDCScope("custom", nil), rt.NewRackScope("A", "r1", nil), &calls}
+	shared.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true})(cfg)
+	shared.WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+		return &mocks.MockRoundTripper{AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+			discoveries++
+			return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+		}}
+	})(cfg)
+	nodes, affinity, err := newNodeSources([]string{"seed.local"}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if affinity != nil || calls != 0 || discoveries != 1 {
+		t.Fatalf(
+			"disabled affinity derived or queried extra scopes: affinity=%v calls=%d discoveries=%d",
+			affinity,
+			calls,
+			discoveries,
+		)
+	}
 }

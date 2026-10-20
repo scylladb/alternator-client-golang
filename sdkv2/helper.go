@@ -48,7 +48,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"sync"
 
@@ -305,47 +307,62 @@ func newNodeSources(initialNodes []string, cfg *shared.Config) (AlternatorNodesS
 	return nodes, nil, err
 }
 
-// affinityScope builds a lazy candidate without inspecting opaque fallbacks.
-// Until discovery selects a distinct view, the pair uses ordinary routing and health.
+// affinityScope resolves the affinity chain once without changing ordinary scopes.
+// Only concrete built-in racks are widened; custom implementations keep their queries.
 func affinityScope(scope rt.Scope) (rt.Scope, bool) {
-	if scope == nil || rt.IsClusterScope(scope) {
-		return scope, false
+	var seen []rt.Scope
+	var views []rt.Scope
+	type operation struct {
+		query   string
+		cluster bool
 	}
-	switch dc := scope.(type) {
-	case rt.DCScope:
-		if dc.Fallback() == nil {
-			return scope, false
+	operations := make(map[operation]bool)
+	changed := false
+	for current := scope; current != nil; current = current.Fallback() {
+		// Custom scopes need not be comparable and may return themselves. Inspect
+		// their immutable values rather than imposing a depth or map-key limit.
+		if slices.ContainsFunc(seen, func(previous rt.Scope) bool {
+			if reflect.ValueOf(current).Comparable() && reflect.ValueOf(previous).Comparable() {
+				return previous == current
+			}
+			return reflect.DeepEqual(previous, current)
+		}) {
+			break
 		}
-	case *rt.DCScope:
-		if dc == nil || dc.Fallback() == nil {
-			return scope, false
+		seen = append(seen, current)
+		view := current
+		switch rack := current.(type) {
+		case rt.RackScope:
+			view = rt.NewDCScope(rack.Datacenter(), nil)
+			changed = true
+		case *rt.RackScope:
+			view = rt.NewDCScope(rack.Datacenter(), nil)
+			changed = true
+		}
+		key := operation{query: view.GetLocalNodesQuery(), cluster: rt.IsClusterScope(view)}
+		if !operations[key] {
+			operations[key] = true
+			views = append(views, view)
 		}
 	}
-	return affinityScopeView(scope), true
-}
-
-func affinityScopeView(scope rt.Scope) rt.Scope {
-	if scope == nil || rt.IsClusterScope(scope) {
-		return scope
+	var resolved rt.Scope
+	for i := len(views) - 1; i >= 0; i-- {
+		if rt.IsClusterScope(views[i]) && resolved == nil {
+			// Keep the concrete type: cluster discovery aggregates seed responses.
+			resolved = views[i]
+		} else {
+			resolved = scopeWithFallback{Scope: views[i], fallback: resolved}
+		}
 	}
-	view := scope
-	switch rack := scope.(type) {
-	case rt.RackScope:
-		view = rt.NewDCScope(rack.Datacenter(), nil)
-	case *rt.RackScope:
-		view = rt.NewDCScope(rack.Datacenter(), nil)
-	}
-	return scopeWithFallback{Scope: view, original: scope}
+	return resolved, changed
 }
 
 type scopeWithFallback struct {
 	rt.Scope
-	original rt.Scope
+	fallback rt.Scope
 }
 
-func (s scopeWithFallback) Fallback() rt.Scope {
-	return affinityScopeView(s.original.Fallback())
-}
+func (s scopeWithFallback) Fallback() rt.Scope { return s.fallback }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
 	cfg := aws.Config{
@@ -778,6 +795,14 @@ func (lb *Helper) getPkHash(in middleware.InitializeInput) (int64, error) {
 	return 0, fmt.Errorf("could not get a proper hash")
 }
 
+// affinityPlanNodes keeps batch voting and retries on the same captured membership.
+type affinityPlanNodes struct {
+	active, quarantined []url.URL
+}
+
+func (n affinityPlanNodes) GetActiveNodes() []url.URL      { return n.active }
+func (n affinityPlanNodes) GetQuarantinedNodes() []url.URL { return n.quarantined }
+
 type batchWriteRoutingCandidate struct {
 	tableName string
 	values    map[string]types.AttributeValue
@@ -789,7 +814,11 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 		return nil, fmt.Errorf("batch write request does not have a routing target")
 	}
 
-	affinityNodes := lb.affinityNodeSource()
+	source := lb.affinityNodeSource()
+	affinityNodes := affinityPlanNodes{
+		active:      slices.Clone(source.GetActiveNodes()),
+		quarantined: slices.Clone(source.GetQuarantinedNodes()),
+	}
 	activeNodes := affinityNodes.GetActiveNodes()
 	if len(activeNodes) == 0 {
 		return nil, fmt.Errorf("batch write request does not have active nodes")

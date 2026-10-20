@@ -459,3 +459,35 @@ func TestLazyQueryPlanCrossLanguageVectors(t *testing.T) {
 		})
 	}
 }
+
+func TestAffinityQueryPlansCaptureBothNodeLists(t *testing.T) {
+	for _, preferred := range []bool{false, true} {
+		t.Run(fmt.Sprintf("preferred=%v", preferred), func(t *testing.T) {
+			source := &fakeNodesSource{
+				activeNodes:      []url.URL{{Host: "active"}},
+				quarantinedNodes: []url.URL{{Host: "quarantined"}},
+			}
+			var plan *LazyQueryPlan
+			if preferred {
+				plan = NewLazyQueryPlanWithPreferredNodes(source, source.activeNodes, 42)
+			} else {
+				plan = NewLazyQueryPlanWithSortedSeed(source, 42)
+			}
+			// Refresh before the first attempt, and again before quarantine is needed.
+			source.activeNodes[0].Host = "new-active"
+			if node := plan.Next(); node.Host != "active" {
+				t.Fatalf("active snapshot changed: %v", node)
+			}
+			source.quarantinedNodes[0].Host = "new-quarantined"
+			if node := plan.Next(); node.Host != "quarantined" {
+				t.Fatalf("quarantine snapshot changed: %v", node)
+			}
+			if node := plan.Next(); node.Host != "" {
+				t.Fatalf("plan gained nodes: %v", node)
+			}
+			if source.activeCalls != 1 || source.quarantinedCalls != 1 {
+				t.Fatal("captured plan reread its source")
+			}
+		})
+	}
+}
