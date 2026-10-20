@@ -48,11 +48,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"reflect"
 	"runtime/debug"
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -307,82 +307,116 @@ func newNodeSources(initialNodes []string, cfg *shared.Config) (AlternatorNodesS
 	return nodes, nil, err
 }
 
-// affinityScope resolves the affinity chain once without changing ordinary scopes.
-// Only concrete built-in racks are widened; custom implementations keep their queries.
+// affinityScope resolves built-in prefixes and leaves opaque fallback links untouched.
+// Custom queries remain live; each needed derived link is retained once.
 func affinityScope(scope rt.Scope) (rt.Scope, bool) {
-	var seen []rt.Scope
-	type affinityView struct {
-		scope         rt.Scope
-		originalIndex int
-	}
-	var views []affinityView
-	type operation struct {
-		query   string
-		cluster bool
-	}
-	operations := make(map[operation]bool)
-	changed := false
-	for current := scope; current != nil; current = current.Fallback() {
-		// Custom scopes need not be comparable and may return themselves. Inspect
-		// their immutable values rather than imposing a depth or map-key limit.
-		if slices.ContainsFunc(seen, func(previous rt.Scope) bool {
-			if reflect.ValueOf(current).Comparable() && reflect.ValueOf(previous).Comparable() {
-				return previous == current
-			}
-			return reflect.DeepEqual(previous, current)
-		}) {
-			break
-		}
-		seen = append(seen, current)
-		view := current
-		originalIndex := len(seen) - 1
-		switch rack := current.(type) {
+	resolver := &affinityScopeResolver{operations: make(map[affinityScopeOperation]bool)}
+	resolved, opaque := resolver.resolve(scope, 0, nil)
+	return resolved, opaque || resolver.rack.Load()
+}
+
+type affinityScopeOperation struct {
+	query   string
+	cluster bool
+}
+
+type affinityScopeResolver struct {
+	mu         sync.Mutex
+	operations map[affinityScopeOperation]bool
+	rack       atomic.Bool
+}
+
+func (r *affinityScopeResolver) resolve(scope rt.Scope, index int, token *byte) (rt.Scope, bool) {
+	var prefix []*scopeWithFallback
+	var terminal rt.Scope
+	opaque := false
+	for scope != nil {
+		view := scope
+		widened := false
+		switch rack := scope.(type) {
 		case rt.RackScope:
 			view = rt.NewDCScope(rack.Datacenter(), nil)
-			originalIndex = -1 // Widening is a distinct operation from the original rack.
-			changed = true
+			widened = true
 		case *rt.RackScope:
 			view = rt.NewDCScope(rack.Datacenter(), nil)
-			originalIndex = -1 // Widening is a distinct operation from the original rack.
-			changed = true
+			widened = true
 		}
-		switch current.(type) {
+		if widened {
+			r.rack.Store(true)
+		}
+		switch scope.(type) {
 		case rt.RackScope, *rt.RackScope, rt.DCScope, *rt.DCScope, rt.ClusterScope, *rt.ClusterScope:
-			key := operation{query: view.GetLocalNodesQuery(), cluster: rt.IsClusterScope(view)}
-			if operations[key] {
-				continue
+			// Fixed built-ins alone are structurally deduplicated.
+			key := affinityScopeOperation{query: view.GetLocalNodesQuery(), cluster: rt.IsClusterScope(view)}
+			r.mu.Lock()
+			duplicate := r.operations[key]
+			r.operations[key] = true
+			r.mu.Unlock()
+			if !duplicate {
+				if rt.IsClusterScope(view) {
+					terminal = view
+					scope = nil
+					continue
+				}
+				prefix = append(prefix, &scopeWithFallback{Scope: view, originalIndex: index, token: token, widened: widened, resolver: r})
 			}
-			operations[key] = true
-		}
-		// Custom queries can change independently of their fixed fallback links.
-		// Keep the delegate and let each refresh reuse currently equal operations.
-		views = append(views, affinityView{scope: view, originalIndex: originalIndex})
-	}
-	var resolved rt.Scope
-	for i := len(views) - 1; i >= 0; i-- {
-		if rt.IsClusterScope(views[i].scope) && resolved == nil {
-			// Keep the concrete type: cluster discovery aggregates seed responses.
-			resolved = views[i].scope
-		} else {
-			resolved = scopeWithFallback{Scope: views[i].scope, fallback: resolved, originalIndex: views[i].originalIndex}
+			scope = scope.Fallback()
+			if index >= 0 {
+				index++
+			}
+		default:
+			terminal = &scopeWithFallback{Scope: scope, originalIndex: index, token: token, opaque: true, resolver: r}
+			opaque = true
+			scope = nil
 		}
 	}
-	return resolved, changed
+	for i := len(prefix) - 1; i >= 0; i-- {
+		prefix[i].fallback = terminal
+		terminal = prefix[i]
+	}
+	return terminal, opaque
 }
 
 type scopeWithFallback struct {
 	rt.Scope
-	fallback      rt.Scope
-	originalIndex int
+	fallback        rt.Scope
+	originalIndex   int
+	token           *byte
+	widened, opaque bool
+	once            sync.Once
+	resolver        *affinityScopeResolver
 }
 
-func (s scopeWithFallback) Fallback() rt.Scope { return s.fallback }
+func (s *scopeWithFallback) Fallback() rt.Scope         { return s.AffinityScopeFallback(nil, false, nil) }
+func (s *scopeWithFallback) AffinityScopeHasRack() bool { return s.resolver.rack.Load() }
 
-// AffinityScopeOrigin identifies a preserved occurrence in the ordinary chain.
-// Shared discovery can capture its query once per paired refresh without comparing
-// arbitrary custom values. A widened rack has no matching ordinary occurrence.
-func (s scopeWithFallback) AffinityScopeOrigin() (rt.Scope, int) {
+// A nil token identifies the configured root or its fixed built-in successors.
+// Below an opaque edge, only its first observed resolution proves correspondence
+// for that attempt. Tokens never retain the attempt's queries or outcomes.
+func (s *scopeWithFallback) AffinityScopeOrigin(token *byte) (rt.Scope, int) {
+	if s.widened || (s.token != nil && s.token != token) {
+		return s.Scope, -1
+	}
 	return s.Scope, s.originalIndex
+}
+
+func (s *scopeWithFallback) AffinityScopeFallback(next rt.Scope, observed bool, token *byte) rt.Scope {
+	if !s.opaque {
+		return s.fallback
+	}
+	s.once.Do(func() {
+		index := -1
+		if observed {
+			index = s.originalIndex + 1
+		} else {
+			next = s.Scope.Fallback()
+		}
+		if token == nil {
+			token = new(byte)
+		}
+		s.fallback, _ = s.resolver.resolve(next, index, token)
+	})
+	return s.fallback
 }
 
 func (lb *Helper) awsConfig() (aws.Config, error) {

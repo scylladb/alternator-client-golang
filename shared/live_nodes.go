@@ -386,6 +386,11 @@ func NewAlternatorLiveNodesWithAffinity(
 		return nil, nil, err
 	}
 	nodes.affinity = &affinityView{nodes: affinity}
+	known := true
+	if derived, ok := scope.(interface{ AffinityScopeHasRack() bool }); ok {
+		known = derived.AffinityScopeHasRack()
+	}
+	nodes.affinity.widened.Store(known)
 	return nodes, affinity, nil
 }
 
@@ -403,6 +408,7 @@ type affinityView struct {
 	nodes         *AlternatorLiveNodes
 	mu            sync.Mutex
 	active        atomic.Bool
+	widened       atomic.Bool
 	started       bool
 	healthStarted bool
 	stopped       bool
@@ -575,35 +581,37 @@ type scopeOutcome struct {
 	err   error
 }
 
-// scopeRefresh owns operation identity and outcomes for one paired refresh only.
+// scopeObservation describes one actual traversal, including variable-query probes.
+// Only uniform complete operations may satisfy another occurrence by query.
+type scopeObservation struct {
+	key                     scopeKey
+	queried, uniform, fixed bool
+	outcome                 scopeOutcome
+	next                    rt.Scope
+	fellBack                bool
+}
+
+func (o *scopeObservation) query(value string) string {
+	if !o.queried {
+		o.uniform = true
+	} else if o.key.query != value {
+		o.uniform = false
+	}
+	o.queried = true
+	o.key.query = value
+	return value
+}
+
+// scopeRefresh owns observations and complete outcomes for one paired refresh.
 type scopeRefresh struct {
-	origins  map[int]scopeKey
-	outcomes map[scopeKey]scopeOutcome
+	origins  map[int]*scopeObservation
+	outcomes map[scopeKey]*scopeObservation
+	token    *byte
+	widened  *atomic.Bool
 }
 
-func (r *scopeRefresh) capture(scope rt.Scope, index int, reuse bool) scopeKey {
-	if reuse {
-		// Only derived wrappers opt into ordinary occurrence sharing. Unmarked
-		// scopes still capture their own exact operation, without identity guesses.
-		index = -1
-		if origin, ok := scope.(interface{ AffinityScopeOrigin() (rt.Scope, int) }); ok {
-			scope, index = origin.AffinityScopeOrigin()
-		}
-	}
-	if index >= 0 {
-		if key, ok := r.origins[index]; ok {
-			return key
-		}
-	}
-	key := scopeKey{query: scope.GetLocalNodesQuery(), cluster: rt.IsClusterScope(scope)}
-	if index >= 0 {
-		r.origins[index] = key
-	}
-	return key
-}
-
-func sameOperation(left, right *scopeKey) bool {
-	return left != nil && right != nil && *left == *right
+func sameOperation(left, right *scopeObservation) bool {
+	return left != nil && right != nil && (left == right || (left.uniform && right.uniform && left.key == right.key))
 }
 
 // fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
@@ -612,39 +620,86 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 	return nodes, err
 }
 
-// Primary discovery records outcomes without skipping its configured fallbacks.
-// The affinity traversal reuses those outcomes, including empty responses/errors.
 func (aln *AlternatorLiveNodes) fetchLiveNodesWithOutcomes(
 	refresh *scopeRefresh,
 	reuse bool,
 	source nodesSource,
-) ([]url.URL, *scopeKey, error) {
+) ([]url.URL, *scopeObservation, error) {
 	index := 0
-	for scope := aln.cfg.RoutingScope; scope != nil; scope = scope.Fallback() {
-		var outcome scopeOutcome
-		var operation *scopeKey
-		var cached bool
+	for scope := aln.cfg.RoutingScope; scope != nil; {
+		var observation, origin *scopeObservation
+		discoveryScope := scope
 		if refresh != nil {
-			key := refresh.capture(scope, index, reuse)
-			operation = &key
-			if reuse {
-				outcome, cached = refresh.outcomes[key]
+			if !reuse {
+				switch scope.(type) {
+				case rt.RackScope, *rt.RackScope:
+					refresh.widened.Store(true)
+				}
+			} else if derived, ok := scope.(interface{ AffinityScopeOrigin(*byte) (rt.Scope, int) }); ok {
+				var originalIndex int
+				discoveryScope, originalIndex = derived.AffinityScopeOrigin(refresh.token)
+				if originalIndex >= 0 {
+					origin = refresh.origins[originalIndex]
+					observation = origin
+				}
 			}
 		}
-		if !cached {
-			outcome.nodes, outcome.err = aln.getNodesForScopeWithSource(scope, source, operation)
+		if observation == nil {
+			observation = &scopeObservation{key: scopeKey{cluster: rt.IsClusterScope(discoveryScope)}}
+			cached := false
+			if refresh != nil && (reuse || refresh.widened.Load()) {
+				observation.fixed = true
+				observation.query(discoveryScope.GetLocalNodesQuery())
+				if reuse {
+					if previous := refresh.outcomes[observation.key]; previous != nil {
+						observation, cached = previous, true
+					}
+				}
+			}
+			if !cached {
+				var tracked *scopeObservation
+				if refresh != nil {
+					tracked = observation
+				}
+				observation.outcome.nodes, observation.outcome.err = aln.getNodesForScopeWithSource(
+					discoveryScope,
+					source,
+					tracked,
+				)
+				if refresh != nil && observation.queried && observation.uniform {
+					refresh.outcomes[observation.key] = observation
+				}
+			}
+			if refresh != nil && !reuse {
+				refresh.origins[index] = observation
+			}
+		}
+		if observation.outcome.err != nil {
+			return nil, observation, observation.outcome.err
+		}
+		if len(observation.outcome.nodes) != 0 {
 			if refresh != nil {
-				refresh.outcomes[*operation] = outcome
+				return slices.Clone(observation.outcome.nodes), observation, nil
 			}
+			return observation.outcome.nodes, observation, nil
 		}
-		if outcome.err != nil {
-			return nil, operation, outcome.err
-		}
-		if len(outcome.nodes) != 0 {
-			if refresh != nil {
-				return slices.Clone(outcome.nodes), operation, nil
+		if reuse {
+			if derived, ok := scope.(interface {
+				AffinityScopeFallback(rt.Scope, bool, *byte) rt.Scope
+			}); ok {
+				var next rt.Scope
+				observed := origin != nil && origin.fellBack
+				if observed {
+					next = origin.next
+				}
+				scope = derived.AffinityScopeFallback(next, observed, refresh.token)
+			} else {
+				scope = scope.Fallback()
 			}
-			return outcome.nodes, operation, nil
+		} else {
+			next := scope.Fallback()
+			observation.next, observation.fellBack = next, true
+			scope = next
 		}
 		index++
 	}
@@ -658,13 +713,17 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(
 	scope rt.Scope,
 	source nodesSource,
-	operation *scopeKey,
+	operation *scopeObservation,
 ) ([]url.URL, error) {
 	clusterScope := rt.IsClusterScope(scope)
 	query := scope.GetLocalNodesQuery
 	if operation != nil {
-		clusterScope = operation.cluster
-		query = func() string { return operation.query }
+		clusterScope = operation.key.cluster
+		if operation.fixed {
+			query = func() string { return operation.key.query }
+		} else {
+			query = func() string { return operation.query(scope.GetLocalNodesQuery()) }
+		}
 	}
 	// A new affinity cluster view may probe ordinary learned nodes, but must
 	// still aggregate the configured seeds rather than inherit rack membership.
@@ -742,12 +801,21 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 		aln.publishNodes(nodes)
 		return nil
 	}
-	refresh := &scopeRefresh{origins: make(map[int]scopeKey), outcomes: make(map[scopeKey]scopeOutcome)}
+	refresh := &scopeRefresh{
+		origins:  make(map[int]*scopeObservation),
+		outcomes: make(map[scopeKey]*scopeObservation),
+		token:    new(byte),
+		widened:  &aln.affinity.widened,
+	}
 	nodes, scope, err := aln.fetchLiveNodesWithOutcomes(refresh, false, nil)
 	if err == nil {
 		aln.publishNodes(nodes)
 	}
 	view := aln.affinity
+	// An opaque tail alone must not start a second discovery operation.
+	if !view.widened.Load() {
+		return err
+	}
 	// Before activation, discover through the ordinary source's learned nodes.
 	// Original entrypoints remain the existing helper's final recovery candidates.
 	var source nodesSource
