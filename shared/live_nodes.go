@@ -447,7 +447,7 @@ func (view *affinityView) publish(nodes []url.URL) {
 	view.mu.Lock()
 	stopped := view.stopped
 	view.mu.Unlock()
-	if stopped {
+	if stopped && !view.active.Load() {
 		return
 	}
 	// In-flight discovery/health work retains the target's non-joining stop behavior.
@@ -844,6 +844,12 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 	view := aln.affinity
 	// An opaque tail alone must not start a second discovery operation.
 	if !view.widened.Load() {
+		return err
+	}
+	view.mu.Lock()
+	stopped := view.stopped
+	view.mu.Unlock()
+	if stopped && !view.active.Load() {
 		return err
 	}
 	// Before activation, discover through the ordinary source's learned nodes.

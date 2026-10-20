@@ -49,7 +49,6 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
-	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -596,8 +595,6 @@ func (lb *Helper) reportNodeError(node url.URL, err error) {
 		if affinity := source.AffinityNodes(); affinity != source {
 			affinity.ReportNodeError(node, err)
 		}
-	} else if lb.affinityNodes != nil {
-		lb.affinityNodes.ReportNodeError(node, err)
 	}
 }
 
@@ -663,7 +660,6 @@ func (lb *Helper) affinityNodeSource() AlternatorNodesSource {
 		if source, ok := lb.nodes.(*shared.AlternatorLiveNodes); ok {
 			return source.AffinityNodes()
 		}
-		return lb.affinityNodes
 	}
 	return lb.nodes
 }
@@ -871,8 +867,8 @@ func (lb *Helper) batchWriteQueryPlan(requestItems map[string][]types.WriteReque
 
 	source := lb.affinityNodeSource()
 	affinityNodes := affinityPlanNodes{
-		active:      slices.Clone(source.GetActiveNodes()),
-		quarantined: slices.Clone(source.GetQuarantinedNodes()),
+		active:      source.GetActiveNodes(),
+		quarantined: source.GetQuarantinedNodes(),
 	}
 	activeNodes := affinityNodes.GetActiveNodes()
 	if len(activeNodes) == 0 {
