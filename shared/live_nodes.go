@@ -565,7 +565,6 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 	return &newURL
 }
 
-// fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
 type scopeKey struct {
 	query   string
 	cluster bool
@@ -576,14 +575,38 @@ type scopeOutcome struct {
 	err   error
 }
 
-func keyForScope(scope rt.Scope) scopeKey {
-	return scopeKey{query: scope.GetLocalNodesQuery(), cluster: rt.IsClusterScope(scope)}
+// scopeRefresh owns operation identity and outcomes for one paired refresh only.
+type scopeRefresh struct {
+	origins  map[int]scopeKey
+	outcomes map[scopeKey]scopeOutcome
 }
 
-func sameScope(left, right rt.Scope) bool {
-	return left != nil && right != nil && keyForScope(left) == keyForScope(right)
+func (r *scopeRefresh) capture(scope rt.Scope, index int, reuse bool) scopeKey {
+	if reuse {
+		// Only derived wrappers opt into ordinary occurrence sharing. Unmarked
+		// scopes still capture their own exact operation, without identity guesses.
+		index = -1
+		if origin, ok := scope.(interface{ AffinityScopeOrigin() (rt.Scope, int) }); ok {
+			scope, index = origin.AffinityScopeOrigin()
+		}
+	}
+	if index >= 0 {
+		if key, ok := r.origins[index]; ok {
+			return key
+		}
+	}
+	key := scopeKey{query: scope.GetLocalNodesQuery(), cluster: rt.IsClusterScope(scope)}
+	if index >= 0 {
+		r.origins[index] = key
+	}
+	return key
 }
 
+func sameOperation(left, right *scopeKey) bool {
+	return left != nil && right != nil && *left == *right
+}
+
+// fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
 func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 	nodes, _, err := aln.fetchLiveNodesWithOutcomes(nil, false, nil)
 	return nodes, err
@@ -592,45 +615,57 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 // Primary discovery records outcomes without skipping its configured fallbacks.
 // The affinity traversal reuses those outcomes, including empty responses/errors.
 func (aln *AlternatorLiveNodes) fetchLiveNodesWithOutcomes(
-	outcomes map[scopeKey]scopeOutcome,
+	refresh *scopeRefresh,
 	reuse bool,
 	source nodesSource,
-) ([]url.URL, rt.Scope, error) {
+) ([]url.URL, *scopeKey, error) {
+	index := 0
 	for scope := aln.cfg.RoutingScope; scope != nil; scope = scope.Fallback() {
 		var outcome scopeOutcome
-		var key scopeKey
+		var operation *scopeKey
 		var cached bool
-		if outcomes != nil {
-			key = keyForScope(scope)
+		if refresh != nil {
+			key := refresh.capture(scope, index, reuse)
+			operation = &key
 			if reuse {
-				outcome, cached = outcomes[key]
+				outcome, cached = refresh.outcomes[key]
 			}
 		}
 		if !cached {
-			outcome.nodes, outcome.err = aln.getNodesForScopeWithSource(scope, source)
-			if outcomes != nil {
-				outcomes[key] = outcome
+			outcome.nodes, outcome.err = aln.getNodesForScopeWithSource(scope, source, operation)
+			if refresh != nil {
+				refresh.outcomes[*operation] = outcome
 			}
 		}
 		if outcome.err != nil {
-			return nil, scope, outcome.err
+			return nil, operation, outcome.err
 		}
 		if len(outcome.nodes) != 0 {
-			if outcomes != nil {
-				return slices.Clone(outcome.nodes), scope, nil
+			if refresh != nil {
+				return slices.Clone(outcome.nodes), operation, nil
 			}
-			return outcome.nodes, scope, nil
+			return outcome.nodes, operation, nil
 		}
+		index++
 	}
 	return nil, nil, nil
 }
 
 func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, error) {
-	return aln.getNodesForScopeWithSource(scope, nil)
+	return aln.getNodesForScopeWithSource(scope, nil, nil)
 }
 
-func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(scope rt.Scope, source nodesSource) ([]url.URL, error) {
+func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(
+	scope rt.Scope,
+	source nodesSource,
+	operation *scopeKey,
+) ([]url.URL, error) {
 	clusterScope := rt.IsClusterScope(scope)
+	query := scope.GetLocalNodesQuery
+	if operation != nil {
+		clusterScope = operation.cluster
+		query = func() string { return operation.query }
+	}
 	// A new affinity cluster view may probe ordinary learned nodes, but must
 	// still aggregate the configured seeds rather than inherit rack membership.
 	aggregateSeeds := clusterScope && source != nil
@@ -645,7 +680,7 @@ func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(scope rt.Scope, sourc
 		attempted[node.String()] = struct{}{}
 		endpoint := node
 		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
+		endpoint.RawQuery = query()
 
 		newNodes, err := aln.getNodes(&endpoint)
 		if err != nil {
@@ -673,7 +708,7 @@ func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(scope rt.Scope, sourc
 		}
 		endpoint := node
 		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
+		endpoint.RawQuery = query()
 
 		newNodes, err := aln.getNodes(&endpoint)
 		if err != nil {
@@ -707,8 +742,8 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 		aln.publishNodes(nodes)
 		return nil
 	}
-	outcomes := make(map[scopeKey]scopeOutcome)
-	nodes, scope, err := aln.fetchLiveNodesWithOutcomes(outcomes, false, nil)
+	refresh := &scopeRefresh{origins: make(map[int]scopeKey), outcomes: make(map[scopeKey]scopeOutcome)}
+	nodes, scope, err := aln.fetchLiveNodesWithOutcomes(refresh, false, nil)
 	if err == nil {
 		aln.publishNodes(nodes)
 	}
@@ -719,11 +754,11 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 	if !view.active.Load() {
 		source = aln
 	}
-	affinityNodes, affinityScope, affinityErr := view.nodes.fetchLiveNodesWithOutcomes(outcomes, true, source)
-	if affinityErr == nil && (view.active.Load() || !sameScope(scope, affinityScope)) {
+	affinityNodes, affinityScope, affinityErr := view.nodes.fetchLiveNodesWithOutcomes(refresh, true, source)
+	if affinityErr == nil && (view.active.Load() || !sameOperation(scope, affinityScope)) {
 		view.publish(affinityNodes)
 	}
-	if err != nil && sameScope(scope, affinityScope) {
+	if err != nil && sameOperation(scope, affinityScope) {
 		return err
 	}
 	return errors.Join(err, affinityErr)

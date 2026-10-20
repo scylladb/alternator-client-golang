@@ -900,3 +900,44 @@ func TestAffinityDiscoveryCachesAdditionalEmptyOutcomesPerAttempt(t *testing.T) 
 		t.Fatalf("empty outcome cached across refreshes: calls=%v nodes=%v", counts, affinity.GetNodes())
 	}
 }
+
+type alternatingDiscoveryQuery struct {
+	rt.Scope
+	reads *atomic.Int32
+}
+
+func (s alternatingDiscoveryQuery) GetLocalNodesQuery() string {
+	if s.reads.Add(1)%2 == 1 {
+		return "custom=first"
+	}
+	return "custom=second"
+}
+
+func TestUnpairedDiscoveryRetainsPerProbeCustomQueries(t *testing.T) {
+	t.Parallel()
+	var reads atomic.Int32
+	var queries []string
+	nodes, err := NewAlternatorLiveNodes([]string{"one.local", "two.local"},
+		WithALNRoutingScope(alternatingDiscoveryQuery{rt.NewDCScope("unused", nil), &reads}),
+		WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				queries = append(queries, req.URL.RawQuery)
+				if len(queries) == 1 {
+					return nil, errors.New("first probe failed")
+				}
+				return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() != 2 || !slices.Equal(queries, []string{"custom=first", "custom=second"}) {
+		t.Fatalf("nonpaired query behavior changed: reads=%d queries=%v", reads.Load(), queries)
+	}
+}

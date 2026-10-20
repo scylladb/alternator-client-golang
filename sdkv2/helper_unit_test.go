@@ -2727,7 +2727,7 @@ type noncomparableAffinityFallback struct {
 
 func TestOpaqueAffinityKeepsOrdinaryHealthUntilWidened(t *testing.T) {
 	t.Parallel()
-	base := unusedAffinityFallback{rt.NewDCScope("A", nil)}
+	base := unusedAffinityFallback{rt.NewDCScope("A", rt.NewRackScope("B", "r2", nil))}
 	for _, scope := range []rt.Scope{&base, noncomparableAffinityFallback{base, []string{"opaque"}}} {
 		t.Run(fmt.Sprintf("%T", scope), func(t *testing.T) {
 			t.Parallel()
@@ -2761,6 +2761,9 @@ func TestOpaqueAffinityKeepsOrdinaryHealthUntilWidened(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer h.Stop()
+			if h.affinityNodes == nil {
+				t.Fatal("rack fallback did not create an auxiliary view")
+			}
 			h.Start()
 			if err := h.UpdateLiveNodes(); err != nil {
 				t.Fatal(err)
@@ -3156,5 +3159,217 @@ func TestDisabledAffinityDoesNotResolveFallbacks(t *testing.T) {
 			calls,
 			discoveries,
 		)
+	}
+}
+
+type changingQueryAffinityScope struct {
+	rt.Scope
+	query *atomic.Value
+	reads *atomic.Int32
+}
+
+func (s changingQueryAffinityScope) GetLocalNodesQuery() string {
+	s.reads.Add(1)
+	return s.query.Load().(string)
+}
+
+func TestAffinityPreservesInitiallyEquivalentCustomOperations(t *testing.T) {
+	t.Parallel()
+	for _, customFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("customFirst=%v", customFirst), func(t *testing.T) {
+			t.Parallel()
+			var query atomic.Value
+			query.Store("dc=A")
+			var reads atomic.Int32
+			custom := changingQueryAffinityScope{Scope: rt.NewDCScope("unused", nil), query: &query, reads: &reads}
+			var scope rt.Scope = rt.NewRackScope("A", "r1", custom)
+			if customFirst {
+				custom.Scope = rt.NewDCScope("unused", rt.NewRackScope("A", "r1", nil))
+				scope = custom
+			}
+			phase := 0
+			queries := make(map[string]int)
+			var routes []string
+			h, err := NewHelper(
+				[]string{"seed.local"},
+				WithRoutingScope(scope),
+				WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithNodesListUpdatePeriod(-1),
+				WithIdleNodesListUpdatePeriod(-1),
+				WithCredentials("key", "secret"),
+				WithKeyRouteAffinity(
+					shared.NewKeyRouteAffinityConfig(KeyRouteAffinityAnyWrite).
+						WithPkInfo(map[string]string{"orders": "id"}),
+				),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return &mocks.MockRoundTripper{
+						AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+							q := req.URL.RawQuery
+							queries[q]++
+							if phase == 0 {
+								return resp.AlternatorNodesResponse([]string{"a.local"}, req)
+							}
+							if customFirst && q == "dc=A&rack=r1" {
+								return resp.AlternatorNodesResponse([]string{"rack.local"}, req)
+							}
+							if customFirst && q == "dc=A" {
+								return resp.AlternatorNodesResponse([]string{"fallback.local"}, req)
+							}
+							if !customFirst && q == "dc=B" {
+								return resp.AlternatorNodesResponse([]string{"b.local"}, req)
+							}
+							return resp.AlternatorNodesResponse(nil, req)
+						},
+						DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+							routes = append(routes, req.URL.Hostname())
+							return resp.DynamoDBUpdateItemResponse(req)
+						},
+					}
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+			if reads.Load() != 0 {
+				t.Fatal("initialization evaluated a custom discovery query")
+			}
+			client, err := h.NewDynamoDB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			send := func() {
+				t.Helper()
+				_, err := client.UpdateItem(
+					context.Background(),
+					&dynamodb.UpdateItemInput{TableName: aws.String("orders"), Key: keyWithID("same-key")},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			send()
+			if queries["dc=A"] != 1 {
+				t.Fatalf("initially equivalent operation repeated: %v", queries)
+			}
+			phase = 1
+			query.Store("dc=B")
+			reads.Store(0)
+			queries = make(map[string]int)
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			send()
+			want := "b.local"
+			if customFirst {
+				want = "fallback.local"
+			}
+			if !slices.Equal(routes, []string{"a.local", want}) || reads.Load() != 1 {
+				t.Fatalf(
+					"custom/built-in divergence lost: routes=%v reads=%d queries=%v",
+					routes,
+					reads.Load(),
+					queries,
+				)
+			}
+		})
+	}
+}
+
+type alternatingQueryAffinityScope struct {
+	rt.Scope
+	reads  *atomic.Int32
+	values []string
+}
+
+func (s alternatingQueryAffinityScope) GetLocalNodesQuery() string {
+	if s.reads.Add(1)%2 == 1 {
+		return "custom=first"
+	}
+	return "custom=second"
+}
+
+func TestAffinityQueryCaptureFollowsOriginalChainOccurrences(t *testing.T) {
+	t.Parallel()
+	var reads atomic.Int32
+	custom := alternatingQueryAffinityScope{
+		Scope: rt.NewDCScope("unused", rt.NewRackScope("B", "r2", nil)),
+		reads: &reads, values: []string{"noncomparable"},
+	}
+	queries := make(map[string]int)
+	h, err := NewHelper([]string{"seed.local"},
+		WithRoutingScope(rt.NewRackScope("A", "r1", rt.NewRackScope("A", "r1", custom))),
+		WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithNodesListUpdatePeriod(-1), WithIdleNodesListUpdatePeriod(-1),
+		WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return &mocks.MockRoundTripper{AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+				q := req.URL.RawQuery
+				queries[q]++
+				if strings.HasPrefix(q, "custom=") {
+					return resp.AlternatorNodesResponse([]string{req.URL.Query().Get("custom") + ".local"}, req)
+				}
+				return resp.AlternatorNodesResponse(nil, req)
+			}}
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Stop()
+	if reads.Load() != 0 {
+		t.Fatal("initialization read a custom query")
+	}
+	for attempt, want := range []string{"first.local", "second.local"} {
+		queries = make(map[string]int)
+		if err := h.UpdateLiveNodes(); err != nil {
+			t.Fatal(err)
+		}
+		if reads.Load() != int32(attempt+1) || h.affinityNodeSource().GetNodes()[0].Hostname() != want {
+			t.Fatalf(
+				"capture lost origin after built-in dedup: reads=%d nodes=%v",
+				reads.Load(),
+				h.affinityNodeSource().GetNodes(),
+			)
+		}
+		if queries["dc=A"] == 0 || queries["dc=A&rack=r1"] == 0 || queries["custom="+strings.Split(want, ".")[0]] != 1 {
+			t.Fatalf("widened DC or custom operation conflated: %v", queries)
+		}
+	}
+}
+
+func TestAffinityCapturedQueryIsUsedForEveryProbe(t *testing.T) {
+	t.Parallel()
+	var reads atomic.Int32
+	var queries []string
+	custom := alternatingQueryAffinityScope{
+		Scope: rt.NewDCScope("unused", rt.NewRackScope("A", "r1", nil)),
+		reads: &reads,
+	}
+	h, err := NewHelper([]string{"one.local", "two.local"}, WithRoutingScope(custom),
+		WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithNodesListUpdatePeriod(-1), WithIdleNodesListUpdatePeriod(-1),
+		WithKeyRouteAffinity(shared.NewKeyRouteAffinityConfig(KeyRouteAffinityRMW)),
+		WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return &mocks.MockRoundTripper{AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+				queries = append(queries, req.URL.RawQuery)
+				if len(queries) == 1 {
+					return nil, errors.New("first probe failed")
+				}
+				return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+			}}
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Stop()
+	if err := h.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() != 1 || !slices.Equal(queries, []string{"custom=first", "custom=first"}) ||
+		h.affinityNodeSource() != h.nodes {
+		t.Fatalf("query key diverged from network probes: reads=%d queries=%v", reads.Load(), queries)
 	}
 }

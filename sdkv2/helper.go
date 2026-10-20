@@ -311,7 +311,11 @@ func newNodeSources(initialNodes []string, cfg *shared.Config) (AlternatorNodesS
 // Only concrete built-in racks are widened; custom implementations keep their queries.
 func affinityScope(scope rt.Scope) (rt.Scope, bool) {
 	var seen []rt.Scope
-	var views []rt.Scope
+	type affinityView struct {
+		scope         rt.Scope
+		originalIndex int
+	}
+	var views []affinityView
 	type operation struct {
 		query   string
 		cluster bool
@@ -331,27 +335,36 @@ func affinityScope(scope rt.Scope) (rt.Scope, bool) {
 		}
 		seen = append(seen, current)
 		view := current
+		originalIndex := len(seen) - 1
 		switch rack := current.(type) {
 		case rt.RackScope:
 			view = rt.NewDCScope(rack.Datacenter(), nil)
+			originalIndex = -1 // Widening is a distinct operation from the original rack.
 			changed = true
 		case *rt.RackScope:
 			view = rt.NewDCScope(rack.Datacenter(), nil)
+			originalIndex = -1 // Widening is a distinct operation from the original rack.
 			changed = true
 		}
-		key := operation{query: view.GetLocalNodesQuery(), cluster: rt.IsClusterScope(view)}
-		if !operations[key] {
+		switch current.(type) {
+		case rt.RackScope, *rt.RackScope, rt.DCScope, *rt.DCScope, rt.ClusterScope, *rt.ClusterScope:
+			key := operation{query: view.GetLocalNodesQuery(), cluster: rt.IsClusterScope(view)}
+			if operations[key] {
+				continue
+			}
 			operations[key] = true
-			views = append(views, view)
 		}
+		// Custom queries can change independently of their fixed fallback links.
+		// Keep the delegate and let each refresh reuse currently equal operations.
+		views = append(views, affinityView{scope: view, originalIndex: originalIndex})
 	}
 	var resolved rt.Scope
 	for i := len(views) - 1; i >= 0; i-- {
-		if rt.IsClusterScope(views[i]) && resolved == nil {
+		if rt.IsClusterScope(views[i].scope) && resolved == nil {
 			// Keep the concrete type: cluster discovery aggregates seed responses.
-			resolved = views[i]
+			resolved = views[i].scope
 		} else {
-			resolved = scopeWithFallback{Scope: views[i], fallback: resolved}
+			resolved = scopeWithFallback{Scope: views[i].scope, fallback: resolved, originalIndex: views[i].originalIndex}
 		}
 	}
 	return resolved, changed
@@ -359,10 +372,18 @@ func affinityScope(scope rt.Scope) (rt.Scope, bool) {
 
 type scopeWithFallback struct {
 	rt.Scope
-	fallback rt.Scope
+	fallback      rt.Scope
+	originalIndex int
 }
 
 func (s scopeWithFallback) Fallback() rt.Scope { return s.fallback }
+
+// AffinityScopeOrigin identifies a preserved occurrence in the ordinary chain.
+// Shared discovery can capture its query once per paired refresh without comparing
+// arbitrary custom values. A widened rack has no matching ordinary occurrence.
+func (s scopeWithFallback) AffinityScopeOrigin() (rt.Scope, int) {
+	return s.Scope, s.originalIndex
+}
 
 func (lb *Helper) awsConfig() (aws.Config, error) {
 	cfg := aws.Config{
