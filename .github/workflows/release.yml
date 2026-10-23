@@ -1,47 +1,163 @@
-name: Publish Release Notes
+name: Release
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+\.[0-9]+\.[0-9]+*'  # Triggers on version tags like v1.0.0
   workflow_dispatch:
     inputs:
-      target-tag:
+      release-version:
         required: true
         type: string
-        description: Target tag to run on
+        description: 'New version, for example v1.0.7'
+      dry-run:
+        type: boolean
+        default: true
+        description: 'Prepare and verify signatures without pushing or publishing'
+      publish-existing:
+        type: boolean
+        default: false
+        description: 'Recover GitHub release creation after an earlier successful atomic push'
+      release-base:
+        type: string
+        description: 'Recovery only: original baseline SHA from the failed run'
 
 permissions:
-  contents: write  # Required to create release
+  contents: read
+
+concurrency:
+  group: repository-release
+  cancel-in-progress: false
 
 jobs:
-  release:
+  validation:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Checkout target tag
-        if: ${{ inputs.target-tag != '' }}
+      - name: Checkout validation source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.target-tag }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Create GitHub Release for ${{ inputs.target-tag }}
-        if: ${{ inputs.target-tag != '' }}
-        run: |
-          gh release create "${{ inputs.target-tag }}" \
-            --generate-notes \
-            --title "${{ inputs.target-tag }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure validation logs
+        run: echo "RELEASE_LOG_DIR=$RUNNER_TEMP/release-logs" >> "$GITHUB_ENV"
 
-      - name: Create GitHub Release
-        if: ${{ inputs.target-tag == '' }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --title "$GITHUB_REF_NAME"
+      - name: Install validation Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: '**/go.sum'
+
+      - name: Test release tooling
+        run: python3 scripts/release/capture.py tool-tests make test-release-signing
+
+      - name: Build, lint, and test
+        if: inputs.publish-existing == false
+        run: python3 scripts/release/capture.py validation make build check test-unit test-integration
+
+      - name: Upload sanitized validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: validation-logs
+          path: ${{ runner.temp }}/release-logs/
+          if-no-files-found: ignore
+
+  release:
+    needs: validation
+    if: github.ref == 'refs/heads/main' && needs.validation.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      GOTOOLCHAIN: local
+      RELEASE_VERSION: ${{ inputs.release-version }}
+      RELEASE_PUBLISH_EXISTING: ${{ inputs.publish-existing }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure release logs
+        run: echo "RELEASE_LOG_DIR=$RUNNER_TEMP/release-logs" >> "$GITHUB_ENV"
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - name: Validate pipeline and release target
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RECOVERY_BASE: ${{ inputs.release-base }}
+        run: |
+          python3 scripts/release/capture.py target bash -euo pipefail -c '
+            if [ "$RELEASE_PUBLISH_EXISTING" = true ]; then
+              export RELEASE_BASE_COMMIT="$RELEASE_RECOVERY_BASE"
+              python3 scripts/release/pipeline.py check-recovery
+              baseline=$RELEASE_BASE_COMMIT
+            else
+              python3 scripts/release/pipeline.py check
+              baseline=$(git rev-parse HEAD)
+            fi
+            echo "RELEASE_BASE_COMMIT=$baseline" >> "$GITHUB_ENV"
+          '
+
+      - name: Prepare signed release
+        id: prepare
+        if: inputs.publish-existing == false
+        env:
+          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: python3 scripts/release/capture.py prepare make create-release-commits version="$RELEASE_VERSION"
+
+      - name: Verify prepared history with public key only
+        run: |
+          python3 scripts/release/capture.py verify bash -euo pipefail -c '
+            python3 scripts/release/signing.py verify-release "$RELEASE_VERSION"
+            status=$(git status --porcelain)
+            test -z "$status"
+          '
+
+      - name: Publish verified release
+        id: publication
+        if: inputs.dry-run == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release/capture.py publish bash -euo pipefail -c '
+            if [ "$RELEASE_PUBLISH_EXISTING" = true ]; then
+              python3 scripts/release/pipeline.py check-recovery
+            else
+              python3 scripts/release/pipeline.py check-publication
+              make push-release-commits
+            fi
+            gh release create "$RELEASE_VERSION" --verify-tag --generate-notes --title "$RELEASE_VERSION"
+          '
+
+      - name: Record release result
+        if: always() && (steps.prepare.outcome == 'success' || inputs.publish-existing == true)
+        env:
+          RELEASE_DRY_RUN: ${{ inputs.dry-run }}
+          RELEASE_PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
+        run: python3 scripts/release/capture.py summary python3 scripts/release/pipeline.py summary
+
+      - name: Upload sanitized release logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-logs
+          path: ${{ runner.temp }}/release-logs/
+          if-no-files-found: ignore

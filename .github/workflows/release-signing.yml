@@ -1,0 +1,16 @@
+name: Release signing
+on:
+  pull_request:
+    paths: ['scripts/release/**', '.github/workflows/*release*', 'Makefile']
+  push:
+    branches: [main]
+    paths: ['scripts/release/**', '.github/workflows/*release*', 'Makefile']
+permissions:
+  contents: read
+jobs:
+  release-signing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: make test-release-signing

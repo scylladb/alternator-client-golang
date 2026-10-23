@@ -445,3 +445,14 @@ Then you need to configure your traffic analyzer to read pre master key secrets 
 ## Examples
 
 Use [sdkv2/helper_test.go](sdkv2/helper_test.go) for current examples. [sdkv1/helper_test.go](sdkv1/helper_test.go) remains only as legacy coverage for the deprecated SDK v1 module.
+
+## Releases
+
+Prepare and publish releases through the [Release workflow](.github/workflows/release.yml)
+on `main`. Validation runs first on a separate runner with read-only access and no
+release credentials. Only successful validation permits the signing and publication
+job to request approval from a member of `scylladb/drivers` other than the triggering
+operator, including for dry runs and recovery. The release job uses a fresh runner
+without validation artifacts or caches. Only non-dry runs publish. Start with a
+pipeline dry run. See
+[release signing](scripts/release/SIGNING.md) for dispatch and recovery instructions.
