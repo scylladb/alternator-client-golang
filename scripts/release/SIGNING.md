@@ -140,9 +140,19 @@ gh workflow run release.yml --ref main -f release-version=v1.0.7 \
 Recovery imports no signing credentials and creates no commits or tags. It verifies
 the complete prepared history, checks that remote `main` and all four annotated
 tag objects match exactly, and creates only the missing GitHub release. A moved
-branch, missing or mismatched tag, invalid baseline, or existing GitHub release
-blocks recovery and requires maintainer investigation. Do not derive a new
+branch, missing or mismatched tag, invalid baseline, or conflicting GitHub release
+blocks recovery and requires maintainer investigation. A published release with
+the expected version title and release status is preserved on a recovery rerun,
+including its notes and assets; draft releases require investigation. Do not derive a new
 baseline from a release tag's parent.
+
+All accepted versions create ordinary GitHub releases (`prerelease: false`),
+including suffix versions such as `v1.0.7-rc.1`. Recovery preserves matching
+ordinary releases and their notes/assets. A release manually marked as a GitHub
+prerelease is conflicting metadata and requires investigation, even when its
+version has a suffix. This policy applies throughout this PR, later review cycles
+and resumed work; no follow-up status change or automatic metadata repair is
+scheduled.
 
 During rotation, pause releases, validate a new protected signing subkey, register
 and distribute its public certificate, review both pinned fingerprints and the
