@@ -1,0 +1,8 @@
+{
+  "name": "alternator-client-golang-release-automation",
+  "private": true,
+  "dependencies": {
+    "js-yaml": "5.5.0",
+    "minimatch": "10.2.5"
+  }
+}
