@@ -99,7 +99,7 @@ class PipelineTests(unittest.TestCase):
                 else:
                     pipeline.check_publication()
 
-    def test_recovery_requires_missing_release_and_fails_closed_on_api_errors(self):
+    def test_recovery_reuses_matching_release_and_fails_closed_on_conflicts_or_api_errors(self):
         head = "a" * 40
         version = "v1.0.7"
         refs = {"refs/heads/main": head}
@@ -111,7 +111,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(command[:4], ["git", "ls-remote", "--refs", "origin"])
             return "\n".join(value + "\t" + ref for ref, value in remote_refs.items())
         cases = [("matching", result) for result in
-                 ([[]], [[], [{"tag_name": version, "draft": True}]], signing.SigningError("API unavailable"))]
+                 ([[]], [[{"tag_name": version, "draft": False, "name": version, "prerelease": False}]],
+                  [[], [{"tag_name": version, "draft": True}]], signing.SigningError("API unavailable"))]
         cases.extend((failure, [[]]) for failure in ("missing-main", "changed-main", "missing-tag", "changed-tag"))
         for dry_run in ("true", "false"):
             for remote_state, result in cases:
@@ -134,13 +135,53 @@ class PipelineTests(unittest.TestCase):
                             pipeline.check_recovery()
                         api.assert_not_called()
                         continue
-                    if result == [[]]:
+                    if result == [[]] or (not isinstance(result, Exception) and result[0]):
                         pipeline.check_recovery()
                     else:
                         with self.assertRaisesRegex(signing.SigningError,
                                                     "API unavailable" if isinstance(result, Exception) else "release already exists"):
                             pipeline.check_recovery()
                     api.assert_called_once_with("releases?per_page=100", paginate=True)
+
+    def test_note_publication_verifies_remote_tags_and_preserves_existing_release(self):
+        for version in ("v1.0.7", "v1.0.7-rc.1"):
+            refs = {"refs/tags/" + prefix + version: str(index) * 40
+                    for index, prefix in enumerate(("", "shared/", "sdkv1/", "sdkv2/"), 1)}
+            published = {"tag_name": version, "draft": False, "name": version, "prerelease": False}
+            for state in ("new", "existing", "wrong-tag", "draft", "wrong-title", "prerelease", "api-error"):
+                commands = []
+                def run(command):
+                    commands.append(command)
+                    if command[:2] == ["git", "rev-parse"]:
+                        return refs[command[2]]
+                    if command[:3] == ["git", "ls-remote", "--refs"]:
+                        remote = dict(refs)
+                        if state == "wrong-tag":
+                            remote["refs/tags/" + version] = "f" * 40
+                        return "\n".join(value + "\t" + ref for ref, value in remote.items())
+                    self.assertEqual(command, ["gh", "release", "create", version, "--verify-tag",
+                                               "--generate-notes", "--title", version])
+                    return ""
+                release = dict(published)
+                if state == "draft":
+                    release["draft"] = True
+                if state == "prerelease":
+                    release["prerelease"] = True
+                if state == "wrong-title":
+                    release["name"] = "unrelated release"
+                with self.subTest(state=state), patch.dict(os.environ, {"RELEASE_VERSION": version}), \
+                        patch.object(signing, "verify_release") as verify, \
+                        patch.object(signing, "run", side_effect=run), \
+                        patch.object(pipeline, "api", return_value=[[]] if state == "new" else [[release]],
+                                     side_effect=signing.SigningError("API unavailable") if state == "api-error" else None):
+                    if state in ("wrong-tag", "draft", "wrong-title", "prerelease", "api-error"):
+                        with self.assertRaises(signing.SigningError):
+                            pipeline.publish_release()
+                    else:
+                        pipeline.publish_release()
+                    verify.assert_called_once_with(version)
+                    mutations = [command for command in commands if command[0] == "gh"]
+                    self.assertEqual(len(mutations), int(state == "new"))
 
     def test_summary_reports_publication_outcome(self):
         for dry_run, outcome, expected in [

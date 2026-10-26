@@ -275,6 +275,11 @@ push-release-commits: release-check-user
 		"refs/tags/shared/$$VERSION" "refs/tags/sdkv1/$$VERSION" \
 		"refs/tags/sdkv2/$$VERSION" "refs/tags/$$VERSION"
 
+.PHONY: test-release-notes
+test-release-notes:
+	npm ci --ignore-scripts --prefix .github
+	node --test .github/tests/*.test.cjs
+
 .PHONY: test-release-signing
-test-release-signing:
+test-release-signing: test-release-notes
 	python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v

@@ -1,0 +1,5 @@
+# Every reported filename must match this single union of support paths.
+omit-from-release-notes:
+  - changed-files:
+      - all-globs-to-all-files:
+          - '{.github/RELEASE_NOTES.md,.github/labeler.yml,.github/scripts/release-notes-guard.cjs,.github/tests/**,.github/package.json,.github/package-lock.json,.github/workflows/tests.yml,.github/workflows/attach-project-to-issue.yml,.github/workflows/call_jira_sync.yml,.github/workflows/label-release-notes.yml,docs/**,test/**,shared/tests/**,shared/**/*_test.go,sdkv1/**/*_test.go,sdkv2/**/*_test.go,README.md,scripts/release/SIGNING.md,.gitignore,.editorconfig,.golangci.yml,.golangci.yaml,renovate.json}'

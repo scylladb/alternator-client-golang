@@ -144,7 +144,7 @@ jobs:
               python3 scripts/release/pipeline.py check-publication
               make push-release-commits
             fi
-            gh release create "$RELEASE_VERSION" --verify-tag --generate-notes --title "$RELEASE_VERSION"
+            python3 scripts/release/pipeline.py publish-release
           '
 
       - name: Record release result
