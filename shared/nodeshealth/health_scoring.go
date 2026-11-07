@@ -26,9 +26,13 @@ import (
 )
 
 // NodeEventScoreFunc maps node events to their respective score deltas.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 type NodeEventScoreFunc func(err error) uint64
 
 // NodeEventScoreWeights holds the penalties applied for different error classes.
+//
+// Deprecated: configure the state machine with Config.
 type NodeEventScoreWeights struct {
 	ContextCancelled     uint64
 	ContextTimeout       uint64
@@ -43,6 +47,8 @@ type NodeEventScoreWeights struct {
 }
 
 // HealthScoring configures how node scores are calculated and interpreted.
+//
+// Deprecated: configure the state machine with Config.
 type HealthScoring struct {
 	NodeEventScoreFunc     NodeEventScoreFunc
 	QuarantineScoreCutOff  uint64
@@ -52,6 +58,8 @@ type HealthScoring struct {
 }
 
 // Validate ensures scoring parameters are correctly defined.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func (hs HealthScoring) Validate() error {
 	if hs.NodeEventScoreFunc == nil {
 		return errors.New("node health scoring: NodeEventScoreFunc must be provided")
@@ -67,6 +75,8 @@ func (hs HealthScoring) Validate() error {
 
 // ApplyEvent adjusts the node status based on the provided health event.
 // returns true if quarantine status had changed
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func (hs HealthScoring) ApplyEvent(status *NodeHealthStatus, err error) bool {
 	if status.quarantined {
 		return false
@@ -94,6 +104,8 @@ func (hs HealthScoring) applyDelta(status *NodeHealthStatus, delta uint64, now t
 }
 
 // Reset clears the node error score and releases it from quarantine.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func (hs HealthScoring) Reset(status *NodeHealthStatus, now time.Time) {
 	status.quarantined = false
 	status.updated = now
@@ -101,12 +113,16 @@ func (hs HealthScoring) Reset(status *NodeHealthStatus, now time.Time) {
 }
 
 // Quarantine marks the node as unhealthy and freezes its score.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func (hs HealthScoring) Quarantine(status *NodeHealthStatus) {
 	status.quarantined = true
 	status.updated = time.Now().UTC()
 }
 
 // Release activates the node and ensures the score is reset.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func (hs HealthScoring) Release(status *NodeHealthStatus) {
 	if !status.quarantined {
 		return
@@ -117,6 +133,8 @@ func (hs HealthScoring) Release(status *NodeHealthStatus) {
 }
 
 // NewStatus returns the default active state for a node.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func (hs HealthScoring) NewStatus() *NodeHealthStatus {
 	return &NodeHealthStatus{
 		score:       0,
@@ -126,67 +144,72 @@ func (hs HealthScoring) NewStatus() *NodeHealthStatus {
 }
 
 // DefaultNodeEventScoreWithWeights returns a scorer that maps errors to weights using the provided configuration.
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
 func DefaultNodeEventScoreWithWeights(weights NodeEventScoreWeights) NodeEventScoreFunc {
 	return func(err error) uint64 {
-		if err == nil {
-			return 0
-		}
-
-		switch {
-		case errors.Is(err, context.Canceled):
-			return weights.ContextCancelled
-		case errors.Is(err, context.DeadlineExceeded):
-			return weights.ContextTimeout
-		}
-
-		var opErr *net.OpError
-		if errors.As(err, &opErr) {
-			if errors.Is(opErr.Err, syscall.ECONNREFUSED) {
-				return weights.NotFound
-			}
-			return weights.NetDefault
-		}
-
-		var tlsErr *tls.RecordHeaderError
-		if errors.As(err, &tlsErr) {
-			return weights.NetDefault
-		}
-
-		var tlsCertErr *tls.CertificateVerificationError
-		if errors.As(err, &tlsCertErr) {
-			return weights.TLSCritical
-		}
-
-		var tlsECHRefErr *tls.ECHRejectionError
-		if errors.As(err, &tlsECHRefErr) {
-			return weights.TLSCritical
-		}
-
-		var dnsErr *net.DNSError
-		if errors.As(err, &dnsErr) {
-			if dnsErr.IsTimeout {
-				return weights.Timeout
-			}
-			if dnsErr.IsNotFound {
-				return weights.NotFound
-			}
-			return weights.DNSDefault
-		}
-
-		var netErr net.Error
-		if errors.As(err, &netErr) {
-			if netErr.Timeout() {
-				return weights.Timeout
-			}
-			return weights.NetDefault
-		}
-
-		return weights.Default
+		return nodeEventScoreWithWeights(err, weights)
 	}
 }
 
-// DefaultNodeEventScoreWeights defines penalties used by DefaultNodeEventScore.
-var DefaultNodeEventScoreWeights = NodeEventScoreWeights{
+func nodeEventScoreWithWeights(err error, weights NodeEventScoreWeights) uint64 {
+	if err == nil {
+		return 0
+	}
+
+	switch {
+	case errors.Is(err, context.Canceled):
+		return weights.ContextCancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		return weights.ContextTimeout
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+			return weights.NotFound
+		}
+		return weights.NetDefault
+	}
+
+	var tlsErr *tls.RecordHeaderError
+	if errors.As(err, &tlsErr) {
+		return weights.NetDefault
+	}
+
+	var tlsCertErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsCertErr) {
+		return weights.TLSCritical
+	}
+
+	var tlsECHRefErr *tls.ECHRejectionError
+	if errors.As(err, &tlsECHRefErr) {
+		return weights.TLSCritical
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		if dnsErr.IsTimeout {
+			return weights.Timeout
+		}
+		if dnsErr.IsNotFound {
+			return weights.NotFound
+		}
+		return weights.DNSDefault
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return weights.Timeout
+		}
+		return weights.NetDefault
+	}
+
+	return weights.Default
+}
+
+var defaultNodeEventScoreWeights = NodeEventScoreWeights{
 	Default:              1,
 	Timeout:              40,
 	NetConnectionRefused: 40,
@@ -198,11 +221,24 @@ var DefaultNodeEventScoreWeights = NodeEventScoreWeights{
 	DNSDefault:           2,
 }
 
+// DefaultNodeEventScoreWeights defines penalties used by DefaultNodeEventScore.
+//
+// Deprecated: configure the state machine with Config.
+var DefaultNodeEventScoreWeights = defaultNodeEventScoreWeights
+
 // DefaultNodeEventScore returns a score delta representing the impact of the provided event.
 // Positive values penalize nodes (errors) while zero values leave the score unchanged.
-var DefaultNodeEventScore = DefaultNodeEventScoreWithWeights(DefaultNodeEventScoreWeights)
+//
+// Deprecated: score-based health tracking is retained only for standalone compatibility.
+var DefaultNodeEventScore NodeEventScoreFunc = defaultNodeEventScore
+
+func defaultNodeEventScore(err error) uint64 {
+	return nodeEventScoreWithWeights(err, defaultNodeEventScoreWeights)
+}
 
 // DefaultHealthScoring configures the default node scoring thresholds and penalties.
+//
+// Deprecated: use DefaultConfig.
 var DefaultHealthScoring = HealthScoring{
 	NodeEventScoreFunc:     DefaultNodeEventScore,
 	QuarantineScoreCutOff:  124,

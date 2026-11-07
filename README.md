@@ -314,9 +314,31 @@ Only gzip request compression is currently supported.
 
 To create a new Gzip configuration, use `NewGzipConfig()`. You can also set compression level via `WithLevel()` option to control the trade-off between compression speed and compression ratio.
 
-### Disabling Node Health Tracking
+### Node health
 
-By default, the library tracks node health and temporarily quarantines nodes that experience connection errors. This helps route traffic away from unhealthy nodes. However, in some scenarios you may want to disable this behavior:
+By default, the library tracks each canonical endpoint as active, quarantined, or down. Configured seeds and newly
+discovered endpoints begin in quarantine. A successful direct `/localnodes` contact activates them immediately;
+successful DynamoDB traffic activates them after the configured consecutive-success threshold. Repeated failures
+exclude a node as down, and bounded background probes allow it to recover without recreating the client.
+
+The defaults can be customized with `nodeshealth.Config`:
+
+```go
+health := nodeshealth.DefaultConfig()
+health.ActiveFailureThreshold = 5
+health.ProbeConcurrency = 8
+
+h, err := helper.NewHelper(
+    []string{"x.x.x.x"},
+    helper.WithNodeHealthConfig(health),
+)
+```
+
+`GetDiscoveredNodes` returns the topology ring. `GetActiveNodes`, `GetQuarantinedNodes`, `GetDownNodes`, and
+`GetNodeHealthStatus` expose health snapshots. `ProbeQuarantinedNodes(ctx)` performs explicit direct validation, while
+`Shutdown(ctx)` provides bounded shutdown; `GetNodes` and `Stop` remain compatibility aliases.
+
+In some scenarios you may want to disable health tracking:
 
 - When using an external load balancer that already handles node health
 - In testing environments where you want predictable round-robin behavior
@@ -326,17 +348,21 @@ To disable node health tracking:
 ```go
 h, err := helper.NewHelper(
     []string{"x.x.x.x"},
-    helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{
-        Disabled: true,
-    }),
+    helper.WithoutNodeHealth(),
 )
 ```
 
 When disabled:
 - All discovered nodes remain active regardless of errors
 - No nodes are ever quarantined
+- No direct health probes are issued
 - Node discovery (add/remove) continues to work normally
 - AWS SDK retry mechanisms still handle transient failures
+
+`WithNodeHealthStoreConfig` and the score-based types in `nodeshealth` are deprecated compatibility APIs. The legacy
+disabled literal remains supported. A negative legacy `QuarantineReleasePeriod` disables automatic background probes
+while leaving explicit probes available, and legacy concurrency above 64 is capped at 64. Custom score functions and
+score thresholds must be migrated to `WithNodeHealthConfig`.
 
 ### KeyRouteAffinity
 
