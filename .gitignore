@@ -21,3 +21,6 @@ claude.log
 claude_history.json
 claude_config.json
 CLAUDE.md
+
+# Dependencies for trusted release-note automation tests and guards.
+.github/node_modules/

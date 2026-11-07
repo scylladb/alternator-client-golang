@@ -1,10 +1,10 @@
 name: Release signing
 on:
   pull_request:
-    paths: ['scripts/release/**', '.github/workflows/*release*', 'Makefile']
+    paths: ['scripts/release/**', '.github/workflows/*release*', '.github/workflows/call_jira_sync.yml', '.github/release.yml', '.github/labeler.yml', '.github/scripts/release-notes-guard.cjs', '.github/tests/**', '.github/package*.json', 'Makefile']
   push:
     branches: [main]
-    paths: ['scripts/release/**', '.github/workflows/*release*', 'Makefile']
+    paths: ['scripts/release/**', '.github/workflows/*release*', '.github/workflows/call_jira_sync.yml', '.github/release.yml', '.github/labeler.yml', '.github/scripts/release-notes-guard.cjs', '.github/tests/**', '.github/package*.json', 'Makefile']
 permissions:
   contents: read
 jobs:

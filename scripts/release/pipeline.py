@@ -61,6 +61,36 @@ def check_release_absent(release_version):
         raise signing.SigningError("A GitHub release already exists for this version.")
 
 
+def existing_release(release_version):
+    releases = [release for page in api("releases?per_page=100", paginate=True) for release in page]
+    matches = [release for release in releases if release.get("tag_name") == release_version]
+    if not matches:
+        return None
+    if (len(matches) != 1 or matches[0].get("draft") is not False
+            or matches[0].get("name") != release_version
+            or matches[0].get("prerelease") is not False):
+        raise signing.SigningError("Conflicting GitHub release already exists; inspect its metadata before recovery.")
+    return matches[0]
+
+
+def publish_release():
+    release_version = version()
+    signing.verify_release(release_version)
+    expected = {}
+    for prefix in ("", "shared/", "sdkv1/", "sdkv2/"):
+        ref = "refs/tags/" + prefix + release_version
+        expected[ref] = signing.run(["git", "rev-parse", ref]).strip()
+    rows = signing.run(["git", "ls-remote", "--refs", "origin", *expected]).splitlines()
+    actual = {ref: value for value, ref in (row.split() for row in rows)}
+    if actual != expected:
+        raise signing.SigningError("Published tag objects must match the verified signed release before creating GitHub notes.")
+    if existing_release(release_version):
+        print("GitHub release already published; preserving its notes and assets.")
+        return
+    signing.run(["gh", "release", "create", release_version, "--verify-tag",
+                 "--generate-notes", "--title", release_version])
+
+
 def check_publication():
     release_version = check_context()
     remote = signing.run(["git", "ls-remote", "--exit-code", "origin", "refs/heads/main"]).split()
@@ -87,7 +117,7 @@ def check_recovery():
     actual = {ref: value for value, ref in (row.split() for row in rows)}
     if actual != expected:
         raise signing.SigningError("Recovery requires the complete original branch and tag objects remotely; no refs will be changed.")
-    check_release_absent(release_version)
+    existing_release(release_version)
 
 
 def summary():
@@ -119,10 +149,12 @@ def main():
             check_publication()
         elif sys.argv[1:] == ["check-recovery"]:
             check_recovery()
+        elif sys.argv[1:] == ["publish-release"]:
+            publish_release()
         elif sys.argv[1:] == ["summary"]:
             summary()
         else:
-            raise signing.SigningError("Expected check, check-publication, check-recovery, or summary.")
+            raise signing.SigningError("Expected check, check-publication, check-recovery, publish-release, or summary.")
         return 0
     except signing.SigningError as error:
         print(str(error), file=sys.stderr)
