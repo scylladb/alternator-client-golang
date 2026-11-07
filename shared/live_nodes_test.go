@@ -15,6 +15,8 @@
 package shared
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -23,8 +25,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
@@ -609,4 +613,504 @@ func splitServerHostPort(t *testing.T, rawURL string) (string, int) {
 		t.Fatalf("failed to parse server port: %v", err)
 	}
 	return host, port
+}
+
+func TestAlternatorLiveNodes_AffinityScopeReuse(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                       string
+		ordinary                   rt.Scope
+		affinity                   rt.Scope
+		responses                  map[string][]string
+		wantOrdinary, wantAffinity []string
+		wantQueries                []string
+	}{
+		{"distinct rack and DC", rt.NewRackScope("A", "r1", nil), rt.NewDCScope("A", nil), map[string][]string{"dc=A&rack=r1": {"rack.local"}, "dc=A": {"rack.local", "other-rack.local"}}, []string{"rack.local"}, []string{"other-rack.local", "rack.local"}, []string{"dc=A&rack=r1", "dc=A"}},
+		{"reuse ordinary DC fallback", rt.NewRackScope("A", "r1", rt.NewDCScope("A", nil)), rt.NewDCScope("A", rt.NewDCScope("A", nil)), map[string][]string{"dc=A": {"dc.local"}}, []string{"dc.local"}, []string{"dc.local"}, []string{"dc=A&rack=r1", "dc=A"}},
+		{"try preferred DC before reusing later scope", rt.NewRackScope("A", "r1", rt.NewRackScope("B", "r2", nil)), rt.NewDCScope("A", rt.NewDCScope("B", nil)), map[string][]string{"dc=B&rack=r2": {"rack-b.local"}, "dc=A": {"dc-a.local"}}, []string{"rack-b.local"}, []string{"dc-a.local"}, []string{"dc=A&rack=r1", "dc=B&rack=r2", "dc=A"}},
+		{"ordered cross DC then cluster reuse", rt.NewRackScope("A", "r1", rt.NewRackScope("B", "r2", rt.NewClusterScope())), rt.NewDCScope("A", rt.NewDCScope("B", rt.NewClusterScope())), map[string][]string{"": {"cluster.local"}}, []string{"cluster.local"}, []string{"cluster.local"}, []string{"dc=A&rack=r1", "dc=B&rack=r2", "", "dc=A", "dc=A", "dc=B", "dc=B"}},
+		{"no implicit fallback", rt.NewRackScope("A", "r1", nil), rt.NewDCScope("A", nil), map[string][]string{}, []string{"seed.local"}, []string{"seed.local"}, []string{"dc=A&rack=r1", "dc=A"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var queries []string
+			nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"}, tc.affinity,
+				WithALNRoutingScope(tc.ordinary), WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						queries = append(queries, req.URL.RawQuery)
+						return resp.AlternatorNodesResponse(tc.responses[req.URL.RawQuery], req)
+					})
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodes.Stop()
+			if err := nodes.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			if got := hostnames(nodes.GetNodes()); !slices.Equal(got, tc.wantOrdinary) {
+				t.Fatalf("ordinary=%v, want %v", got, tc.wantOrdinary)
+			}
+			if got := hostnames(nodes.AffinityNodes().GetNodes()); !slices.Equal(got, tc.wantAffinity) {
+				t.Fatalf("affinity=%v, want %v", got, tc.wantAffinity)
+			}
+			if !slices.Equal(queries, tc.wantQueries) {
+				t.Fatalf("queries=%q, want %q", queries, tc.wantQueries)
+			}
+			if affinity.cfg.UpdatePeriod > 0 || affinity.cfg.IdleUpdatePeriod > 0 {
+				t.Fatal("affinity has a second discovery updater")
+			}
+		})
+	}
+}
+
+func TestAlternatorLiveNodes_AffinityRefreshFailuresAreIndependent(t *testing.T) {
+	t.Parallel()
+	discoveryFailure := errors.New("discovery unavailable")
+	phases := []struct {
+		rack, dc         []string
+		failQuery        string
+		wantRack, wantDC []string
+	}{
+		{[]string{"rack0.local"}, []string{"dc0.local"}, "", []string{"rack0.local"}, []string{"dc0.local"}},
+		{nil, []string{"dc1.local"}, "dc=A&rack=r1", []string{"rack0.local"}, []string{"dc1.local"}},
+		{[]string{"rack2.local"}, nil, "dc=A", []string{"rack2.local"}, []string{"dc1.local"}},
+		{nil, nil, "", []string{"rack2.local"}, []string{"dc1.local"}},
+		{[]string{"rack4.local"}, []string{"dc4.local"}, "", []string{"rack4.local"}, []string{"dc4.local"}},
+	}
+	var phase int
+	nodes, _, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"}, rt.NewDCScope("A", nil),
+		WithALNRoutingScope(rt.NewRackScope("A", "r1", nil)), WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				current := phases[phase]
+				if req.URL.RawQuery == current.failQuery {
+					return nil, discoveryFailure
+				}
+				switch req.URL.RawQuery {
+				case "dc=A&rack=r1":
+					return resp.AlternatorNodesResponse(current.rack, req)
+				case "dc=A":
+					return resp.AlternatorNodesResponse(current.dc, req)
+				default:
+					t.Fatalf("unexpected scope query %q", req.URL.RawQuery)
+					return nil, nil
+				}
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	for phase = 0; phase < len(phases); phase++ {
+		current := phases[phase]
+		err := nodes.UpdateLiveNodes()
+		if errors.Is(err, discoveryFailure) != (current.failQuery != "") {
+			t.Fatalf("phase%d refresh error=%v", phase, err)
+		}
+		if got := hostnames(nodes.GetNodes()); !slices.Equal(got, current.wantRack) {
+			t.Fatalf("phase%d ordinary=%v, want%v", phase, got, current.wantRack)
+		}
+		if got := hostnames(nodes.AffinityNodes().GetNodes()); !slices.Equal(got, current.wantDC) {
+			t.Fatalf("phase%d affinity=%v, want%v", phase, got, current.wantDC)
+		}
+	}
+}
+
+type affinityLifecycleHealth struct {
+	NodeHealthStoreInterface
+	starts atomic.Int32
+	stops  atomic.Int32
+}
+
+func (health *affinityLifecycleHealth) Start() {
+	health.starts.Add(1)
+	health.NodeHealthStoreInterface.Start()
+}
+
+func (health *affinityLifecycleHealth) Stop() {
+	health.stops.Add(1)
+	health.NodeHealthStoreInterface.Stop()
+}
+
+func TestAlternatorLiveNodes_AffinityActivationStop(t *testing.T) {
+	t.Parallel()
+	for _, stopBeforeDiscovery := range []bool{false, true} {
+		t.Run(strconv.FormatBool(stopBeforeDiscovery), func(t *testing.T) {
+			t.Parallel()
+			discovering := make(chan struct{})
+			resume := make(chan struct{})
+			nodes, view, err := NewAlternatorLiveNodesWithAffinity(
+				[]string{"seed.local"},
+				rt.NewDCScope("A", nil),
+				WithALNRoutingScope(
+					rt.NewRackScope("A", "r1", nil),
+				),
+				WithALNUpdatePeriod(-1),
+				WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						if req.URL.RawQuery == "dc=A" {
+							close(discovering)
+							<-resume
+							return resp.AlternatorNodesResponse([]string{"dc.local"}, req)
+						}
+						return resp.AlternatorNodesResponse([]string{"rack.local"}, req)
+					})
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodes.Stop()
+			health := &affinityLifecycleHealth{NodeHealthStoreInterface: view.nodeHealthStore}
+			view.nodeHealthStore = health
+			if stopBeforeDiscovery {
+				nodes.Start()
+			}
+			if health.starts.Load() != 0 {
+				t.Fatal("unused affinity health started")
+			}
+			result := make(chan error, 1)
+			go func() { result <- nodes.UpdateLiveNodes() }()
+			select {
+			case <-discovering:
+			case <-time.After(5 * time.Second):
+				close(resume)
+				t.Fatal("affinity discovery did not start")
+			}
+			if stopBeforeDiscovery {
+				nodes.Stop()
+			}
+			close(resume)
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("refresh did not complete")
+			}
+			if !stopBeforeDiscovery {
+				nodes.Start()
+				nodes.Stop()
+			}
+			nodes.Start() // A late start must not restart the stopped optional worker.
+			wantStarts := int32(1)
+			if stopBeforeDiscovery {
+				wantStarts = 0
+			}
+			if health.starts.Load() != wantStarts || health.stops.Load() != 1 {
+				t.Fatalf(
+					"health lifecycle starts%d/stops%d, want%d/1",
+					health.starts.Load(),
+					health.stops.Load(),
+					wantStarts,
+				)
+			}
+			if stopBeforeDiscovery && nodes.AffinityNodes() != nodes {
+				t.Fatal("stopped view activated after discovery returned")
+			}
+		})
+	}
+}
+
+func TestAlternatorLiveNodes_ActiveAffinityRefreshAfterStop(t *testing.T) {
+	t.Parallel()
+	discovering := make(chan struct{})
+	resume := make(chan struct{})
+	var resumeOnce sync.Once
+	t.Cleanup(func() { resumeOnce.Do(func() { close(resume) }) })
+	var phase atomic.Int32
+	nodes, view, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"}, rt.NewDCScope("A", nil),
+		WithALNRoutingScope(rt.NewRackScope("A", "r1", nil)),
+		WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				current := phase.Load()
+				if req.URL.RawQuery == "dc=A" {
+					if current == 1 {
+						close(discovering)
+						<-resume
+					}
+					return resp.AlternatorNodesResponse([]string{fmt.Sprintf("dc%d.local", current)}, req)
+				}
+				return resp.AlternatorNodesResponse([]string{fmt.Sprintf("rack%d.local", current)}, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nodes.Stop)
+	health := &affinityLifecycleHealth{NodeHealthStoreInterface: view.nodeHealthStore}
+	view.nodeHealthStore = health
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if nodes.AffinityNodes() != view || view.GetNodes()[0].Hostname() != "dc0.local" {
+		t.Fatal("initial affinity view did not activate")
+	}
+	nodes.Start()
+	phase.Store(1)
+	result := make(chan error, 1)
+	go func() { result <- nodes.UpdateLiveNodes() }()
+	select {
+	case <-discovering:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active affinity refresh did not reach discovery")
+	}
+	nodes.Stop()
+	resumeOnce.Do(func() { close(resume) })
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("active in-flight refresh did not finish after Stop")
+	}
+	if view.GetNodes()[0].Hostname() != "dc1.local" || nodes.GetNodes()[0].Hostname() != "rack1.local" {
+		t.Fatal("Stop discarded an already-active view's in-flight membership")
+	}
+	phase.Store(2)
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	nodes.Start() // Explicit refresh and Start must not restart optional background health.
+	if nodes.AffinityNodes() != view || view.GetNodes()[0].Hostname() != "dc2.local" ||
+		nodes.GetNodes()[0].Hostname() != "rack2.local" || health.starts.Load() != 1 || health.stops.Load() != 1 {
+		t.Fatalf(
+			"post-Stop refresh/health changed: affinity=%v health=%d/%d",
+			view.GetNodes(), health.starts.Load(), health.stops.Load(),
+		)
+	}
+}
+
+func TestAlternatorLiveNodes_InactiveAffinityAfterStopSkipsDiscovery(t *testing.T) {
+	t.Parallel()
+	var dcQueries int
+	nodes, view, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"}, rt.NewDCScope("A", nil),
+		WithALNRoutingScope(rt.NewRackScope("A", "r1", nil)),
+		WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.RawQuery == "dc=A" {
+					dcQueries++
+					return resp.AlternatorNodesResponse([]string{"dc.local"}, req)
+				}
+				return resp.AlternatorNodesResponse([]string{"rack.local"}, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nodes.Stop)
+	health := &affinityLifecycleHealth{NodeHealthStoreInterface: view.nodeHealthStore}
+	view.nodeHealthStore = health
+	nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	nodes.Start()
+	if nodes.AffinityNodes() != nodes || nodes.GetNodes()[0].Hostname() != "rack.local" || dcQueries != 0 ||
+		health.starts.Load() != 0 || health.stops.Load() != 1 {
+		t.Fatalf(
+			"stopped inactive view consumed discovery or activated: dc=%d health=%d/%d",
+			dcQueries, health.starts.Load(), health.stops.Load(),
+		)
+	}
+}
+
+type nonClusterEmptyQueryScope struct{ rt.Scope }
+
+func (nonClusterEmptyQueryScope) GetLocalNodesQuery() string { return "" }
+
+func TestAffinityDiscoveryDistinguishesQueryAggregation(t *testing.T) {
+	t.Parallel()
+	var transportID int
+	calls := make(map[int]int)
+	nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"one.local", "two.local"}, rt.NewClusterScope(),
+		WithALNRoutingScope(nonClusterEmptyQueryScope{rt.NewDCScope("A", nil)}),
+		WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			transportID++
+			id := transportID
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls[id]++
+				if req.URL.RawQuery != "" {
+					t.Fatalf("unexpected query %q", req.URL.RawQuery)
+				}
+				return resp.AlternatorNodesResponse([]string{req.URL.Hostname()}, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes.GetNodes()) != 1 || !slices.Equal(hostnames(affinity.GetNodes()), []string{"one.local", "two.local"}) {
+		t.Fatalf(
+			"custom scoped and cluster results conflated: ordinary=%v affinity=%v",
+			nodes.GetNodes(),
+			affinity.GetNodes(),
+		)
+	}
+	if calls[1] != 1 || calls[2] != 2 {
+		t.Fatalf("unexpected operation probes: %v", calls)
+	}
+}
+
+func TestAffinityDiscoveryCachesAdditionalEmptyOutcomesPerAttempt(t *testing.T) {
+	t.Parallel()
+	counts := make(map[string]int)
+	var recovered bool
+	nodes, affinity, err := NewAlternatorLiveNodesWithAffinity([]string{"seed.local"},
+		rt.NewDCScope("A", rt.NewDCScope("A", rt.NewDCScope("B", nil))),
+		WithALNRoutingScope(rt.NewRackScope("A", "r1", nil)),
+		WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				query := req.URL.RawQuery
+				counts[query]++
+				if query == "dc=A&rack=r1" {
+					return resp.AlternatorNodesResponse([]string{"seed.local"}, req)
+				}
+				if recovered && query == "dc=A" {
+					return resp.AlternatorNodesResponse([]string{"recovered.local"}, req)
+				}
+				return resp.AlternatorNodesResponse(nil, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if counts["dc=A"] != 1 || counts["dc=B"] != 1 {
+		t.Fatalf("empty affinity outcome rediscovered: %v", counts)
+	}
+	recovered = true
+	counts = make(map[string]int)
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if counts["dc=A"] != 1 || counts["dc=B"] != 0 || affinity.GetNodes()[0].Hostname() != "recovered.local" {
+		t.Fatalf("empty outcome cached across refreshes: calls=%v nodes=%v", counts, affinity.GetNodes())
+	}
+}
+
+type alternatingDiscoveryQuery struct {
+	rt.Scope
+	reads *atomic.Int32
+}
+
+func (s alternatingDiscoveryQuery) GetLocalNodesQuery() string {
+	if s.reads.Add(1)%2 == 1 {
+		return "custom=first"
+	}
+	return "custom=second"
+}
+
+func TestUnpairedDiscoveryRetainsPerProbeCustomQueries(t *testing.T) {
+	t.Parallel()
+	var reads atomic.Int32
+	var queries []string
+	nodes, err := NewAlternatorLiveNodes([]string{"one.local", "two.local"},
+		WithALNRoutingScope(alternatingDiscoveryQuery{rt.NewDCScope("unused", nil), &reads}),
+		WithALNIdleUpdatePeriod(-1), WithALNUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				queries = append(queries, req.URL.RawQuery)
+				if len(queries) == 1 {
+					return nil, errors.New("first probe failed")
+				}
+				return resp.AlternatorNodesResponse([]string{"known.local"}, req)
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	if err := nodes.UpdateLiveNodes(); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() != 2 || !slices.Equal(queries, []string{"custom=first", "custom=second"}) {
+		t.Fatalf("nonpaired query behavior changed: reads=%d queries=%v", reads.Load(), queries)
+	}
+}
+
+type perSeedAuxiliaryCustom struct {
+	rt.Scope
+	reads *atomic.Int32
+}
+
+func (s perSeedAuxiliaryCustom) GetLocalNodesQuery() string {
+	if s.reads.Add(1)%2 == 1 {
+		return "dc=A"
+	}
+	return "dc=B"
+}
+
+func TestAffinityCustomProbeReuseDoesNotHideLaterQuery(t *testing.T) {
+	t.Parallel()
+	for _, failA := range []bool{false, true} {
+		t.Run(strconv.FormatBool(failA), func(t *testing.T) {
+			t.Parallel()
+			failure := errors.New("A probe failed")
+			var reads atomic.Int32
+			counts := make(map[string]int)
+			nodes, view, err := NewAlternatorLiveNodesWithAffinity([]string{"one.local", "two.local"},
+				perSeedAuxiliaryCustom{Scope: rt.NewDCScope("unused", nil), reads: &reads},
+				WithALNRoutingScope(rt.NewDCScope("A", rt.NewRackScope("X", "r1", nil))),
+				WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1),
+				WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+				WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+					return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						counts[req.URL.RawQuery]++
+						if failA && req.URL.RawQuery == "dc=A" {
+							return nil, failure
+						}
+						if req.URL.RawQuery == "dc=X&rack=r1" {
+							return resp.AlternatorNodesResponse([]string{"one.local"}, req)
+						}
+						if req.URL.RawQuery == "dc=B" {
+							return resp.AlternatorNodesResponse([]string{"b.local"}, req)
+						}
+						return resp.AlternatorNodesResponse(nil, req)
+					})
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nodes.Stop()
+			for attempt := 0; attempt < 2; attempt++ {
+				reads.Store(0)
+				clear(counts)
+				if err := nodes.UpdateLiveNodes(); errors.Is(err, failure) != failA {
+					t.Fatalf("ordinary error=%v, want failure=%v", err, failA)
+				}
+				// The activated view adds b.local as its first candidate on refresh two.
+				// The original A seed responses are still retried once per refresh.
+				if reads.Load() != 2 || counts["dc=A"] != 2+attempt || counts["dc=B"] != 1 {
+					t.Fatalf("probe reuse/next-attempt retry lost: reads=%d requests=%v", reads.Load(), counts)
+				}
+				if view.GetNodes()[0].Hostname() != "b.local" {
+					t.Fatal("cached A aggregate hid custom second-seed B")
+				}
+			}
+		})
+	}
 }

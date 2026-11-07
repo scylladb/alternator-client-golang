@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,6 +60,7 @@ type NodeHealthStoreInterface interface {
 
 // AlternatorLiveNodes holds logic that allows to read and remember alternator nodes
 type AlternatorLiveNodes struct {
+	affinity           *affinityView
 	liveNodes          atomic.Pointer[[]url.URL]
 	initialNodes       []url.URL
 	nextLiveNodeIdx    atomic.Uint64
@@ -364,6 +366,111 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	return out, nil
 }
 
+// NewAlternatorLiveNodesWithAffinity creates a scoped source and an affinity view
+// refreshed by that source. The view has its own health state but no discovery
+// updater. The scoped source owns the view's health lifecycle. AffinityNodes
+// returns the ordinary source until a distinct affinity scope is discovered.
+func NewAlternatorLiveNodesWithAffinity(
+	initialNodes []string,
+	scope rt.Scope,
+	options ...ALNOption,
+) (*AlternatorLiveNodes, *AlternatorLiveNodes, error) {
+	nodes, err := NewAlternatorLiveNodes(initialNodes, options...)
+	if err != nil {
+		return nil, nil, err
+	}
+	affinityOptions := append(append([]ALNOption(nil), options...),
+		WithALNRoutingScope(scope), WithALNUpdatePeriod(-1), WithALNIdleUpdatePeriod(-1))
+	affinity, err := NewAlternatorLiveNodes(initialNodes, affinityOptions...)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodes.affinity = &affinityView{nodes: affinity}
+	known := true
+	if derived, ok := scope.(interface{ AffinityScopeHasRack() bool }); ok {
+		known = derived.AffinityScopeHasRack()
+	}
+	nodes.affinity.widened.Store(known)
+	return nodes, affinity, nil
+}
+
+// AffinityNodes returns the currently selected source for affinity requests.
+// Before successful distinct discovery it returns the ordinary source and health state.
+func (aln *AlternatorLiveNodes) AffinityNodes() *AlternatorLiveNodes {
+	if aln.affinity != nil && aln.affinity.active.Load() {
+		return aln.affinity.nodes
+	}
+	return aln
+}
+
+// affinityView coordinates only the optional view; ordinary lifecycle stays unchanged.
+type affinityView struct {
+	nodes         *AlternatorLiveNodes
+	mu            sync.Mutex
+	active        atomic.Bool
+	widened       atomic.Bool
+	started       bool
+	healthStarted bool
+	stopped       bool
+}
+
+func (view *affinityView) startHealthLocked() {
+	if view.started && view.active.Load() && !view.healthStarted {
+		view.nodes.nodeHealthStore.Start()
+		view.healthStarted = true
+	}
+}
+
+func (view *affinityView) start() {
+	view.mu.Lock()
+	if view.stopped {
+		view.mu.Unlock()
+		return
+	}
+	view.started = true
+	active := view.active.Load()
+	view.mu.Unlock()
+	if active {
+		view.nodes.nodeHealthStore.TryReleaseQuarantinedNodes()
+	}
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if !view.stopped {
+		view.startHealthLocked()
+	}
+}
+
+func (view *affinityView) publish(nodes []url.URL) {
+	if len(nodes) == 0 {
+		return
+	}
+	view.mu.Lock()
+	stopped := view.stopped
+	view.mu.Unlock()
+	if stopped && !view.active.Load() {
+		return
+	}
+	// In-flight discovery/health work retains the target's non-joining stop behavior.
+	view.nodes.publishNodes(nodes)
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if view.stopped {
+		return
+	}
+	view.active.Store(true)
+	view.startHealthLocked()
+}
+
+func (view *affinityView) stop() {
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if view.stopped {
+		return
+	}
+	view.stopped = true
+	view.nodes.Stop()
+}
+
 func (aln *AlternatorLiveNodes) triggerUpdate() {
 	if aln.cfg.UpdatePeriod <= 0 {
 		return
@@ -410,6 +517,9 @@ func (aln *AlternatorLiveNodes) Start() {
 	aln.startIdleUpdater()
 	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	aln.nodeHealthStore.Start()
+	if aln.affinity != nil {
+		aln.affinity.start()
+	}
 }
 
 // Stop stops background routines used for periodic node discovery and updates.
@@ -418,6 +528,9 @@ func (aln *AlternatorLiveNodes) Stop() {
 		aln.stopFn()
 	}
 	aln.nodeHealthStore.Stop()
+	if aln.affinity != nil {
+		aln.affinity.stop()
+	}
 }
 
 // NextNode gets next node, check if node list needs to be updated and run updating routine if needed
@@ -458,26 +571,180 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 	return &newURL
 }
 
+type scopeKey struct {
+	query   string
+	cluster bool
+}
+
+type scopeOutcome struct {
+	nodes []url.URL
+	err   error
+}
+
+// scopeObservation describes one actual traversal, including variable-query probes.
+// Only uniform complete operations may satisfy another occurrence by query.
+type scopeObservation struct {
+	key                     scopeKey
+	queried, uniform, fixed bool
+	outcome                 scopeOutcome
+	next                    rt.Scope
+	fellBack                bool
+	refresh                 *scopeRefresh
+	reuse                   bool
+}
+
+func (o *scopeObservation) query(value string) string {
+	if !o.queried {
+		o.uniform = true
+	} else if o.key.query != value {
+		o.uniform = false
+	}
+	o.queried = true
+	o.key.query = value
+	return value
+}
+
+// scopeRefresh owns observations and complete outcomes for one paired refresh.
+type scopeRefresh struct {
+	origins  map[int]*scopeObservation
+	outcomes map[scopeKey]*scopeObservation
+	probes   map[scopeProbeKey]scopeOutcome
+	token    *byte
+	widened  *atomic.Bool
+}
+
+type scopeProbeKey struct {
+	endpoint string
+	cluster  bool
+}
+
+func sameOperation(left, right *scopeObservation) bool {
+	return left != nil && right != nil && (left == right || (left.uniform && right.uniform && left.key == right.key))
+}
+
 // fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
 func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
-	scope := aln.cfg.RoutingScope
+	nodes, _, err := aln.fetchLiveNodesWithOutcomes(nil, false, nil)
+	return nodes, err
+}
 
-	for scope != nil {
-		newNodes, err := aln.getNodesForScope(scope)
-		if err != nil {
-			return nil, err
+func (aln *AlternatorLiveNodes) fetchLiveNodesWithOutcomes(
+	refresh *scopeRefresh,
+	reuse bool,
+	source nodesSource,
+) ([]url.URL, *scopeObservation, error) {
+	index := 0
+	for scope := aln.cfg.RoutingScope; scope != nil; {
+		var observation, origin *scopeObservation
+		discoveryScope := scope
+		if refresh != nil {
+			if !reuse {
+				switch scope.(type) {
+				case rt.RackScope, *rt.RackScope:
+					refresh.widened.Store(true)
+				}
+			} else if derived, ok := scope.(interface{ AffinityScopeOrigin(*byte) (rt.Scope, int) }); ok {
+				var originalIndex int
+				discoveryScope, originalIndex = derived.AffinityScopeOrigin(refresh.token)
+				if originalIndex >= 0 {
+					origin = refresh.origins[originalIndex]
+					observation = origin
+				}
+			}
 		}
-		if len(newNodes) != 0 {
-			return newNodes, nil
+		if observation == nil {
+			observation = &scopeObservation{
+				key: scopeKey{cluster: rt.IsClusterScope(discoveryScope)}, refresh: refresh, reuse: reuse,
+			}
+			cached := false
+			switch discoveryScope.(type) {
+			case rt.RackScope, *rt.RackScope, rt.DCScope, *rt.DCScope, rt.ClusterScope, *rt.ClusterScope:
+				observation.fixed = refresh != nil
+			}
+			if observation.fixed {
+				observation.query(discoveryScope.GetLocalNodesQuery())
+				if reuse {
+					if previous := refresh.outcomes[observation.key]; previous != nil {
+						observation, cached = previous, true
+					}
+				}
+			}
+			if !cached {
+				var tracked *scopeObservation
+				if refresh != nil {
+					tracked = observation
+				}
+				observation.outcome.nodes, observation.outcome.err = aln.getNodesForScopeWithSource(
+					discoveryScope,
+					source,
+					tracked,
+				)
+				if refresh != nil && observation.queried && observation.uniform {
+					refresh.outcomes[observation.key] = observation
+				}
+			}
+			if refresh != nil && !reuse {
+				refresh.origins[index] = observation
+			}
 		}
-		scope = scope.Fallback()
+		if observation.outcome.err != nil {
+			return nil, observation, observation.outcome.err
+		}
+		if len(observation.outcome.nodes) != 0 {
+			if refresh != nil {
+				return slices.Clone(observation.outcome.nodes), observation, nil
+			}
+			return observation.outcome.nodes, observation, nil
+		}
+		if reuse {
+			if derived, ok := scope.(interface {
+				AffinityScopeFallback(rt.Scope, bool, *byte) rt.Scope
+			}); ok {
+				var next rt.Scope
+				observed := origin != nil && origin.fellBack
+				if observed {
+					next = origin.next
+				}
+				scope = derived.AffinityScopeFallback(next, observed, refresh.token)
+			} else {
+				scope = scope.Fallback()
+			}
+		} else {
+			next := scope.Fallback()
+			observation.next, observation.fellBack = next, true
+			scope = next
+		}
+		index++
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, error) {
+	return aln.getNodesForScopeWithSource(scope, nil, nil)
+}
+
+func (aln *AlternatorLiveNodes) getNodesForScopeWithSource(
+	scope rt.Scope,
+	source nodesSource,
+	operation *scopeObservation,
+) ([]url.URL, error) {
 	clusterScope := rt.IsClusterScope(scope)
-	plan := NewLazyQueryPlan(aln)
+	query := scope.GetLocalNodesQuery
+	if operation != nil {
+		clusterScope = operation.key.cluster
+		if operation.fixed {
+			query = func() string { return operation.key.query }
+		} else {
+			query = func() string { return operation.query(scope.GetLocalNodesQuery()) }
+		}
+	}
+	// A new affinity cluster view may probe ordinary learned nodes, but must
+	// still aggregate the configured seeds rather than inherit rack membership.
+	aggregateSeeds := clusterScope && source != nil
+	if source == nil {
+		source = aln
+	}
+	plan := NewLazyQueryPlan(source)
 	var discoveredNodes []url.URL
 	var lastErr error
 	attempted := make(map[string]struct{})
@@ -485,9 +752,9 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 		attempted[node.String()] = struct{}{}
 		endpoint := node
 		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
+		endpoint.RawQuery = query()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		newNodes, err := aln.getNodesForProbe(&endpoint, operation)
 		if err != nil {
 			lastErr = err
 			continue
@@ -500,7 +767,7 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 		}
 		discoveredNodes = append(discoveredNodes, newNodes...)
 	}
-	if len(discoveredNodes) != 0 {
+	if len(discoveredNodes) != 0 && !aggregateSeeds {
 		return cloneAndDedupeNodes(discoveredNodes), nil
 	}
 
@@ -513,9 +780,9 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 		}
 		endpoint := node
 		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
+		endpoint.RawQuery = query()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		newNodes, err := aln.getNodesForProbe(&endpoint, operation)
 		if err != nil {
 			lastErr = err
 			continue
@@ -537,14 +804,73 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 	return nil, nil
 }
 
+// Custom queries are evaluated at their original per-probe call sites. Only the
+// auxiliary traversal may reuse a matching response; ordinary discovery remains
+// observational and executes its established requests and error handling.
+func (aln *AlternatorLiveNodes) getNodesForProbe(endpoint *url.URL, operation *scopeObservation) ([]url.URL, error) {
+	if operation == nil || operation.refresh == nil {
+		return aln.getNodes(endpoint)
+	}
+	key := scopeProbeKey{endpoint: endpoint.String(), cluster: operation.key.cluster}
+	if previous, ok := operation.refresh.probes[key]; ok && operation.reuse {
+		return slices.Clone(previous.nodes), previous.err
+	}
+	nodes, err := aln.getNodes(endpoint)
+	operation.refresh.probes[key] = scopeOutcome{nodes: slices.Clone(nodes), err: err}
+	return nodes, err
+}
+
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
-	newNodes, err := aln.fetchLiveNodes()
-	if err != nil {
+	if aln.affinity == nil {
+		nodes, err := aln.fetchLiveNodes()
+		if err != nil {
+			return err
+		}
+		aln.publishNodes(nodes)
+		return nil
+	}
+	refresh := &scopeRefresh{
+		origins:  make(map[int]*scopeObservation),
+		outcomes: make(map[scopeKey]*scopeObservation),
+		probes:   make(map[scopeProbeKey]scopeOutcome),
+		token:    new(byte),
+		widened:  &aln.affinity.widened,
+	}
+	nodes, scope, err := aln.fetchLiveNodesWithOutcomes(refresh, false, nil)
+	if err == nil {
+		aln.publishNodes(nodes)
+	}
+	view := aln.affinity
+	// An opaque tail alone must not start a second discovery operation.
+	if !view.widened.Load() {
 		return err
 	}
+	view.mu.Lock()
+	stopped := view.stopped
+	view.mu.Unlock()
+	if stopped && !view.active.Load() {
+		return err
+	}
+	// Before activation, discover through the ordinary source's learned nodes.
+	// Original entrypoints remain the existing helper's final recovery candidates.
+	var source nodesSource
+	if !view.active.Load() {
+		source = aln
+	}
+	affinityNodes, affinityScope, affinityErr := view.nodes.fetchLiveNodesWithOutcomes(refresh, true, source)
+	if affinityErr == nil && (view.active.Load() || !sameOperation(scope, affinityScope)) {
+		view.publish(affinityNodes)
+	}
+	if err != nil && sameOperation(scope, affinityScope) {
+		return err
+	}
+	return errors.Join(err, affinityErr)
+}
+
+func (aln *AlternatorLiveNodes) publishNodes(newNodes []url.URL) {
 	if len(newNodes) == 0 {
-		return nil
+		return
 	}
 	currentNodes := *aln.liveNodes.Load()
 	hasNewNodes := false
@@ -566,7 +892,6 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 	if hasNewNodes {
 		aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	}
-	return nil
 }
 
 func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
