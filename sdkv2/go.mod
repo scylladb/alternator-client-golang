@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.73.2
 	github.com/aws/smithy-go v1.28.8
 	github.com/google/go-cmp v0.7.0
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/scylladb/alternator-client-golang/shared v1.0.6
 )
 
