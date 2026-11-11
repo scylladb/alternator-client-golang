@@ -26,9 +26,13 @@ import (
 
 // QuarantineReleaseFunc is invoked for each quarantined node when trying to return
 // it back into the active pool. Returning true releases the node from quarantine.
+//
+// Deprecated: use the helper-level direct probe API.
 type QuarantineReleaseFunc func(url.URL, NodeHealthStatus) bool
 
 // NodeHealthStoreConfig configures NodeHealthStore behavior.
+//
+// Deprecated: use Config. The score-based store is retained only for standalone compatibility.
 type NodeHealthStoreConfig struct {
 	Scoring HealthScoring
 	// QuarantineReleaseConcurrency caps how many release callbacks run simultaneously.
@@ -40,6 +44,8 @@ type NodeHealthStoreConfig struct {
 }
 
 // Validate normalizes configuration values and ensures sane defaults are applied.
+//
+// Deprecated: use Config.Validate.
 func (cfg *NodeHealthStoreConfig) Validate() error {
 	if err := cfg.Scoring.Validate(); err != nil {
 		return err
@@ -66,6 +72,8 @@ const (
 )
 
 // DefaultNodeHealthStoreConfig returns the default configuration for NodeHealthStore.
+//
+// Deprecated: use DefaultConfig.
 func DefaultNodeHealthStoreConfig() NodeHealthStoreConfig {
 	return NodeHealthStoreConfig{
 		Scoring:                      DefaultHealthScoring,
@@ -75,19 +83,25 @@ func DefaultNodeHealthStoreConfig() NodeHealthStoreConfig {
 }
 
 // NodeHealthStoreInterface defines the interface for tracking node health and managing quarantined nodes.
+//
+// Deprecated: use StateStore and the helper-level probe APIs.
 type NodeHealthStoreInterface interface {
 	GetActiveNodes() []url.URL
 	GetQuarantinedNodes() []url.URL
+	// Deprecated: use the helper-level ProbeQuarantinedNodes method.
 	TryReleaseQuarantinedNodes() []url.URL
 	Start()
 	Stop()
 	AddNode(url.URL)
 	RemoveNode(url.URL)
+	// Deprecated: SDK helpers classify physical attempts automatically.
 	ReportNodeError(node url.URL, err error)
 }
 
 // NewNodeHealthStore builds a new NodeHealthStore with the provided configuration.
 // When cfg.Disabled is true, it returns a no-op implementation that does not track node health.
+//
+// Deprecated: use NewStateStore. This constructor is not used by production routing.
 func NewNodeHealthStore(
 	cfg NodeHealthStoreConfig,
 	releaseFunc QuarantineReleaseFunc,
@@ -100,6 +114,8 @@ func NewNodeHealthStore(
 }
 
 // NewNodeHealthStoreBasic builds a new NodeHealthStore with the provided configuration.
+//
+// Deprecated: use NewStateStore. This constructor is not used by production routing.
 func NewNodeHealthStoreBasic(
 	cfg NodeHealthStoreConfig,
 	releaseFunc QuarantineReleaseFunc,
@@ -132,6 +148,8 @@ func NewNodeHealthStoreBasic(
 }
 
 // NodeHealthStore keeps track of scores for Alternator nodes.
+//
+// Deprecated: use StateStore. This legacy score store remains available for compatibility.
 type NodeHealthStore struct {
 	mu           sync.RWMutex
 	cfg          NodeHealthStoreConfig
@@ -148,6 +166,8 @@ type NodeHealthStore struct {
 }
 
 // NodeHealthStatus captures the current health data for a node.
+//
+// Deprecated: use Status.
 type NodeHealthStatus struct {
 	score       uint64
 	quarantined bool
@@ -165,6 +185,8 @@ func (n NodeHealthStatus) Score() uint64 { return n.score }
 
 // ReportNodeError increments a node's error score and quarantines it when the score
 // crosses the configured cutoff.
+//
+// Deprecated: SDK helpers classify physical attempts automatically.
 func (e *NodeHealthStore) ReportNodeError(node url.URL, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -202,6 +224,8 @@ func (e *NodeHealthStore) GetQuarantinedNodes() []url.URL {
 
 // TryReleaseQuarantinedNodes iterates over quarantined nodes and invokes the
 // configured release callback. Nodes are reactivated when the callback returns true.
+//
+// Deprecated: use the helper-level ProbeQuarantinedNodes method.
 func (e *NodeHealthStore) TryReleaseQuarantinedNodes() []url.URL {
 	if e.releaseFunc == nil {
 		return nil

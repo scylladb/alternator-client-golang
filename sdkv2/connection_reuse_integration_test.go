@@ -31,7 +31,6 @@ import (
 	"github.com/scylladb/alternator-client-golang/shared/tests/helpers"
 
 	helper "github.com/scylladb/alternator-client-golang/sdkv2"
-	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 )
 
 const expectedNodeCount = 3
@@ -69,7 +68,7 @@ func testConnectionReuse(t *testing.T, scheme string, port int) {
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
 		helper.WithCredentials("whatever", "secret"),
-		helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		helper.WithoutNodeHealth(),
 		helper.WithIgnoreServerCertificateError(true),
 	}
 
@@ -177,7 +176,7 @@ func testConnectionReuseParallel(t *testing.T, scheme string, port int) {
 		helper.WithNodesListUpdatePeriod(0),
 		helper.WithIdleNodesListUpdatePeriod(0),
 		helper.WithCredentials("whatever", "secret"),
-		helper.WithNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		helper.WithoutNodeHealth(),
 		helper.WithIgnoreServerCertificateError(true),
 	}
 
