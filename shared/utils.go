@@ -15,10 +15,20 @@
 package shared
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"net"
 	"net/http"
+	"time"
 )
+
+type dnsDialTargetContextKey struct{}
+
+type dnsDialTarget struct {
+	logicalAddress  string
+	resolvedAddress string
+}
 
 // DefaultHTTPTransport creates default `http.Transport`
 func DefaultHTTPTransport() *http.Transport {
@@ -42,6 +52,22 @@ func PatchHTTPTransport(config ALNConfig, transport *http.Transport) http.RoundT
 	transport.IdleConnTimeout = config.IdleHTTPConnectionTimeout
 	transport.MaxIdleConns = config.MaxIdleHTTPConnections
 	transport.MaxIdleConnsPerHost = config.MaxIdleHTTPConnectionsPerHost
+	originalDialContext := transport.DialContext
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver:  config.DNSResolver,
+	}
+	if originalDialContext == nil || config.DNSResolver != nil {
+		originalDialContext = dialer.DialContext
+	}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if target, ok := ctx.Value(dnsDialTargetContextKey{}).(dnsDialTarget); ok &&
+			address == target.logicalAddress {
+			address = target.resolvedAddress
+		}
+		return originalDialContext(ctx, network, address)
+	}
 
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}

@@ -20,6 +20,8 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"slices"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -116,6 +118,153 @@ func TestNodeHealthStoreGetNodeStatusReturnsSnapshot(t *testing.T) {
 	if after.Updated().IsZero() {
 		t.Fatalf("expected stored update timestamp to stay unchanged")
 	}
+}
+
+func TestNodeHealthStoresReplaceNodesAtomically(t *testing.T) {
+	t.Parallel()
+
+	nodeA := url.URL{Scheme: "http", Host: "node-a:8080"}
+	nodeB := url.URL{Scheme: "http", Host: "node-b:8080"}
+	nodeC := url.URL{Scheme: "http", Host: "node-c:8080"}
+
+	t.Run("basic preserves retained status", func(t *testing.T) {
+		t.Parallel()
+		store, err := NewNodeHealthStoreBasic(DefaultNodeHealthStoreConfig(), nil, []url.URL{nodeA, nodeB})
+		if err != nil {
+			t.Fatal(err)
+		}
+		retainedStatus := store.GetNodeStatus(nodeB)
+		if retainedStatus == nil {
+			t.Fatal("missing retained-node status")
+		}
+		if !store.ReplaceNodes([]url.URL{nodeB, nodeC}) {
+			t.Fatal("replacement did not report new node")
+		}
+		if store.GetNodeStatus(nodeA) != nil {
+			t.Fatal("removed node still has status")
+		}
+		if got := store.GetNodeStatus(nodeB); got == nil || got.Updated() != retainedStatus.Updated() {
+			t.Fatalf("retained status changed from %v to %v", retainedStatus, got)
+		}
+		_, quarantined := store.GetAllNodes()
+		if !sameNodeSet(quarantined, []url.URL{nodeB, nodeC}) {
+			t.Fatalf("quarantined snapshot got %v", quarantined)
+		}
+		if store.ReplaceNodes([]url.URL{nodeB, nodeC}) {
+			t.Fatal("identical replacement reported a new node")
+		}
+	})
+
+	t.Run("disabled replaces one snapshot", func(t *testing.T) {
+		t.Parallel()
+		store := NewNodeHealthNoop([]url.URL{nodeA, nodeB})
+		if !store.ReplaceNodes([]url.URL{nodeB, nodeC}) {
+			t.Fatal("replacement did not report new node")
+		}
+		active, quarantined := store.GetAllNodes()
+		if !slices.Equal(active, []url.URL{nodeB, nodeC}) || len(quarantined) != 0 {
+			t.Fatalf("snapshot got active=%v quarantined=%v", active, quarantined)
+		}
+		if store.ReplaceNodes([]url.URL{nodeB, nodeC}) {
+			t.Fatal("identical replacement reported a new node")
+		}
+	})
+}
+
+func TestNodeHealthStoreReleaseWorkerRepeatsAndStopsIdempotently(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node-worker:8080"}
+	var probes atomic.Int32
+	cfg := DefaultNodeHealthStoreConfig()
+	cfg.QuarantineReleasePeriod = 5 * time.Millisecond
+	store, err := NewNodeHealthStoreBasic(cfg, func(url.URL, NodeHealthStatus) bool {
+		probes.Add(1)
+		return false
+	}, []url.URL{node})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Start()
+	store.Start()
+	deadline := time.Now().Add(time.Second)
+	for probes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := probes.Load(); got < 2 {
+		t.Fatalf("release worker made %d probes, want at least 2", got)
+	}
+	store.Stop()
+	store.Stop()
+	time.Sleep(20 * time.Millisecond)
+	afterStop := probes.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := probes.Load(); got != afterStop {
+		t.Fatalf("release worker continued after Stop: %d -> %d probes", afterStop, got)
+	}
+}
+
+func TestNodeHealthStoreCoalescesOverlappingReleaseSweeps(t *testing.T) {
+	t.Parallel()
+
+	node := url.URL{Scheme: "http", Host: "node-release:8080"}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var probes atomic.Int32
+	store, err := NewNodeHealthStoreBasic(
+		DefaultNodeHealthStoreConfig(),
+		func(url.URL, NodeHealthStatus) bool {
+			probes.Add(1)
+			close(started)
+			<-release
+			return false
+		},
+		[]url.URL{node},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := make(chan []url.URL, 1)
+	go func() { first <- store.TryReleaseQuarantinedNodes() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first release sweep did not start")
+	}
+
+	second := make(chan []url.URL, 1)
+	go func() { second <- store.TryReleaseQuarantinedNodes() }()
+	select {
+	case released := <-second:
+		if len(released) != 0 {
+			t.Fatalf("coalesced sweep released %v", released)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overlapping release sweep did not coalesce")
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("overlapping sweeps ran %d callbacks, want 1", got)
+	}
+
+	close(release)
+	select {
+	case <-first:
+	case <-time.After(time.Second):
+		t.Fatal("first release sweep did not finish")
+	}
+}
+
+func sameNodeSet(got, want []url.URL) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, node := range want {
+		if !slices.Contains(got, node) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestNodeHealthStoreResetsScoreAfterInterval(t *testing.T) {

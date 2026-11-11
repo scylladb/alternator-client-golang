@@ -26,6 +26,10 @@ type nodesSource interface {
 	GetQuarantinedNodes() []url.URL
 }
 
+type nodesSnapshotSource interface {
+	GetAllNodes() (active, quarantined []url.URL)
+}
+
 // LazyQueryPlan lazily materializes a list of nodes to execute a request against.
 // It defers fetching active and quarantined nodes from the source until the first
 // time they are needed by Next().
@@ -37,6 +41,7 @@ type LazyQueryPlan struct {
 	preferredNodes   []url.URL
 	sortNodes        bool
 	deterministic    bool
+	snapshotLoaded   bool
 }
 
 // NewLazyQueryPlan constructs a plan bound to the provided nodes source.
@@ -92,9 +97,7 @@ func FirstNodeWithSeed(nodes []url.URL, seed int64) url.URL {
 // quarantined nodes, picking a random node from the remaining pool and removing it
 // so that a node is never returned twice. If no nodes remain, it returns the zero url.URL.
 func (p *LazyQueryPlan) Next() url.URL {
-	if p.activeNodes == nil {
-		p.activeNodes = p.prepareNodes(p.nodes.GetActiveNodes())
-	}
+	p.loadSnapshot()
 	for len(p.preferredNodes) > 0 {
 		preferredNode := p.preferredNodes[0]
 		p.preferredNodes = p.preferredNodes[1:]
@@ -109,14 +112,26 @@ func (p *LazyQueryPlan) Next() url.URL {
 		return p.pickAndRemove(&p.activeNodes)
 	}
 
-	if p.quarantinedNodes == nil {
-		p.quarantinedNodes = p.prepareNodes(p.nodes.GetQuarantinedNodes())
-	}
 	if len(p.quarantinedNodes) > 0 {
 		return p.pickAndRemove(&p.quarantinedNodes)
 	}
 
 	return url.URL{}
+}
+
+func (p *LazyQueryPlan) loadSnapshot() {
+	if p.snapshotLoaded {
+		return
+	}
+	p.snapshotLoaded = true
+	if source, ok := p.nodes.(nodesSnapshotSource); ok {
+		active, quarantined := source.GetAllNodes()
+		p.activeNodes = p.prepareNodes(active)
+		p.quarantinedNodes = p.prepareNodes(quarantined)
+		return
+	}
+	p.activeNodes = p.prepareNodes(p.nodes.GetActiveNodes())
+	p.quarantinedNodes = p.prepareNodes(p.nodes.GetQuarantinedNodes())
 }
 
 func (p *LazyQueryPlan) pickAndRemove(nodes *[]url.URL) url.URL {

@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +44,11 @@ import (
 const (
 	defaultUpdatePeriod          = time.Second * 10
 	defaultIdleConnectionTimeout = 6 * time.Hour
+	defaultDiscoveryTimeout      = 30 * time.Second
+	maxDiscoveryResponseBody     = 1 << 20
+	maxDiscoverySnapshotSize     = 1 << 20
+	maxLoggedInvalidNodes        = 8
+	maxRoutingScopeDepth         = 64
 )
 
 // NodeHealthStoreInterface defines the interface for tracking node health and managing quarantined nodes.
@@ -57,6 +63,32 @@ type NodeHealthStoreInterface interface {
 	ReportNodeError(node url.URL, err error)
 }
 
+type nodeHealthSnapshotStore interface {
+	ReplaceNodes([]url.URL) bool
+	GetAllNodes() (active, quarantined []url.URL)
+}
+
+type nodeHealthReleaser interface {
+	ReleaseNode(url.URL)
+}
+
+type nodeHealthBulkReleaser interface {
+	ReleaseNodes([]url.URL)
+}
+
+type liveNodesUpdate struct {
+	done    chan struct{}
+	err     error
+	ctx     context.Context
+	cancel  context.CancelFunc
+	waiters int
+}
+
+type liveNodesHTTPState struct {
+	client   *http.Client
+	resolver *net.Resolver
+}
+
 // AlternatorLiveNodes holds logic that allows to read and remember alternator nodes
 type AlternatorLiveNodes struct {
 	liveNodes          atomic.Pointer[[]url.URL]
@@ -67,9 +99,19 @@ type AlternatorLiveNodes struct {
 	idleUpdaterStarted atomic.Bool
 	ctx                context.Context
 	stopFn             context.CancelFunc
-	httpClient         *http.Client
+	httpState          atomic.Pointer[liveNodesHTTPState]
 	updateSignal       chan struct{}
 	nodeHealthStore    NodeHealthStoreInterface
+	updateMu           sync.Mutex
+	updateInFlight     *liveNodesUpdate
+	failureMu          sync.Mutex
+	failureSnapshot    *[]url.URL
+	failedNodes        map[url.URL]struct{}
+	recoveryStarted    bool
+	lifecycleMu        sync.Mutex
+	healthCheckGate    chan struct{}
+	started            bool
+	stopped            bool
 }
 
 // GetActiveNodes returns nodes that are currently considered healthy.
@@ -80,6 +122,14 @@ func (aln *AlternatorLiveNodes) GetActiveNodes() []url.URL {
 // GetQuarantinedNodes returns nodes currently marked as unhealthy.
 func (aln *AlternatorLiveNodes) GetQuarantinedNodes() []url.URL {
 	return aln.nodeHealthStore.GetQuarantinedNodes()
+}
+
+// GetAllNodes returns one consistent health-store snapshot.
+func (aln *AlternatorLiveNodes) GetAllNodes() (active, quarantined []url.URL) {
+	if store, ok := aln.nodeHealthStore.(nodeHealthSnapshotStore); ok {
+		return store.GetAllNodes()
+	}
+	return aln.nodeHealthStore.GetActiveNodes(), aln.nodeHealthStore.GetQuarantinedNodes()
 }
 
 // ALNConfig a config for `AlternatorLiveNodes`
@@ -110,6 +160,8 @@ type ALNConfig struct {
 	HTTPTransportWrapper func(http.RoundTripper) http.RoundTripper
 	// Timeout for HTTP requests
 	HTTPClientTimeout time.Duration
+	// DNSResolver resolves DNS entrypoints. When nil, the system resolver is used.
+	DNSResolver *net.Resolver
 	// NodeHealthStoreConfig holds the entire health store configuration shared with AlternatorLiveNodes.
 	NodeHealthStoreConfig nodeshealth.NodeHealthStoreConfig
 }
@@ -292,6 +344,17 @@ func WithALNHTTPClientTimeout(value time.Duration) ALNOption {
 	}
 }
 
+// WithALNDNSResolver sets the resolver used for DNS entrypoints.
+// It is primarily useful for deterministic tests and applications with a custom resolver.
+func WithALNDNSResolver(resolver *net.Resolver) ALNOption {
+	if resolver == nil {
+		panic("resolver can't be nil")
+	}
+	return func(config *ALNConfig) {
+		config.DNSResolver = resolver
+	}
+}
+
 // WithALNNodeHealthStoreConfig overrides the default node health store configuration.
 func WithALNNodeHealthStoreConfig(storeCfg nodeshealth.NodeHealthStoreConfig) ALNOption {
 	return func(config *ALNConfig) {
@@ -328,40 +391,66 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 	sortNodesByAddress(nodes)
 	initialNodeURLs := slices.Clone(nodes)
 
-	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
-		cfg.NodeHealthStoreConfig,
-		func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
-			resp, err := httpClient.Get(u.String())
-			if err != nil {
-				cfg.Logger.Error("failed to check node health status", logx.A("node", u.String()), logx.A("error", err))
-				return false
-			}
-			defer drainAndCloseResponseBody(resp.Body)
-			if resp.StatusCode != http.StatusOK {
-				cfg.Logger.Error("failed to check node health status, node reported an error",
-					logx.A("node", u.String()),
-					logx.A("statusCode", resp.StatusCode),
-				)
-				return false
-			}
-			return true
-		},
-		slices.Clone(nodes))
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithCancel(context.Background())
+	healthCheckConcurrency := cfg.NodeHealthStoreConfig.QuarantineReleaseConcurrency
+	if healthCheckConcurrency < 1 {
+		healthCheckConcurrency = 1
+	}
+	healthCheckGate := make(chan struct{}, healthCheckConcurrency)
 	out := &AlternatorLiveNodes{
 		initialNodes:    initialNodeURLs,
 		cfg:             cfg,
 		ctx:             ctx,
 		stopFn:          cancel,
-		httpClient:      httpClient,
-		nodeHealthStore: nodeHealthStore,
 		updateSignal:    make(chan struct{}, 1),
+		healthCheckGate: healthCheckGate,
 	}
+	out.httpState.Store(&liveNodesHTTPState{client: httpClient, resolver: cfg.DNSResolver})
+	nodeHealthStore, err := nodeshealth.NewNodeHealthStore(
+		cfg.NodeHealthStoreConfig,
+		func(u url.URL, _ nodeshealth.NodeHealthStatus) bool {
+			return checkNodeHealth(ctx, u, cfg, out.httpState.Load().client, healthCheckGate)
+		},
+		slices.Clone(nodes))
+	if err != nil {
+		cancel()
+		httpClient.CloseIdleConnections()
+		return nil, err
+	}
+	out.nodeHealthStore = nodeHealthStore
 	out.liveNodes.Store(&nodes)
 	return out, nil
+}
+
+// UpdateDNSResolver replaces the resolver used by subsequent discovery and health requests.
+// Requests already in flight continue using the transport on which they started.
+func (aln *AlternatorLiveNodes) UpdateDNSResolver(resolver *net.Resolver) {
+	if resolver == nil {
+		panic("resolver can't be nil")
+	}
+	current := aln.httpState.Load()
+	if current.resolver == resolver {
+		return
+	}
+	cfg := aln.cfg
+	cfg.DNSResolver = resolver
+	replacement := &liveNodesHTTPState{
+		client: &http.Client{
+			Transport: NewALNHTTPTransport(cfg),
+			Timeout:   cfg.HTTPClientTimeout,
+		},
+		resolver: resolver,
+	}
+
+	aln.lifecycleMu.Lock()
+	if aln.stopped {
+		aln.lifecycleMu.Unlock()
+		replacement.client.CloseIdleConnections()
+		return
+	}
+	previous := aln.httpState.Swap(replacement)
+	aln.lifecycleMu.Unlock()
+	previous.client.CloseIdleConnections()
 }
 
 func (aln *AlternatorLiveNodes) triggerUpdate() {
@@ -369,9 +458,9 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 		return
 	}
 	nextUpdate := aln.nextUpdate.Load()
-	current := time.Now().UTC().Unix()
+	current := time.Now().UTC().UnixNano()
 	if nextUpdate < current {
-		if aln.nextUpdate.CompareAndSwap(nextUpdate, current+int64(aln.cfg.UpdatePeriod.Seconds())) {
+		if aln.nextUpdate.CompareAndSwap(nextUpdate, current+int64(aln.cfg.UpdatePeriod)) {
 			select {
 			case aln.updateSignal <- struct{}{}:
 			default:
@@ -381,22 +470,27 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 }
 
 func (aln *AlternatorLiveNodes) startIdleUpdater() {
-	if aln.cfg.IdleUpdatePeriod <= 0 {
+	if aln.cfg.IdleUpdatePeriod <= 0 && aln.cfg.UpdatePeriod <= 0 || aln.ctx.Err() != nil {
 		return
 	}
 	if aln.idleUpdaterStarted.CompareAndSwap(false, true) {
 		go func() {
-			t := time.NewTicker(aln.cfg.IdleUpdatePeriod)
-			defer t.Stop()
+			var idleUpdates <-chan time.Time
+			var idleTicker *time.Ticker
+			if aln.cfg.IdleUpdatePeriod > 0 {
+				idleTicker = time.NewTicker(aln.cfg.IdleUpdatePeriod)
+				idleUpdates = idleTicker.C
+				defer idleTicker.Stop()
+			}
 			for {
 				select {
 				case <-aln.ctx.Done():
 					return
-				case <-t.C:
-					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
+				case <-idleUpdates:
+					aln.nextUpdate.Store(time.Now().UTC().UnixNano() + int64(aln.cfg.UpdatePeriod))
 					_ = aln.UpdateLiveNodes()
 				case <-aln.updateSignal:
-					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
+					aln.nextUpdate.Store(time.Now().UTC().UnixNano() + int64(aln.cfg.UpdatePeriod))
 					_ = aln.UpdateLiveNodes()
 				}
 			}
@@ -407,16 +501,32 @@ func (aln *AlternatorLiveNodes) startIdleUpdater() {
 // Start begins background routines used for periodic node discovery and updates.
 // It is not required to start if automatically on first API call
 func (aln *AlternatorLiveNodes) Start() {
+	aln.lifecycleMu.Lock()
+	if aln.started || aln.stopped {
+		aln.lifecycleMu.Unlock()
+		return
+	}
+	aln.started = true
 	aln.startIdleUpdater()
-	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
 	aln.nodeHealthStore.Start()
+	aln.lifecycleMu.Unlock()
+	if aln.ctx.Err() == nil {
+		aln.nodeHealthStore.TryReleaseQuarantinedNodes()
+	}
 }
 
 // Stop stops background routines used for periodic node discovery and updates.
 func (aln *AlternatorLiveNodes) Stop() {
+	aln.lifecycleMu.Lock()
+	defer aln.lifecycleMu.Unlock()
+	if aln.stopped {
+		return
+	}
+	aln.stopped = true
 	if aln.stopFn != nil {
 		aln.stopFn()
 	}
+	aln.httpState.Load().client.CloseIdleConnections()
 	aln.nodeHealthStore.Stop()
 }
 
@@ -459,77 +569,134 @@ func (aln *AlternatorLiveNodes) nextAsURLWithPath(path, query string) *url.URL {
 }
 
 // fetchLiveNodes discovers live Alternator nodes using the configured routing scope and fallbacks.
-func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
-	scope := aln.cfg.RoutingScope
-
-	for scope != nil {
-		newNodes, err := aln.getNodesForScope(scope)
+func (aln *AlternatorLiveNodes) fetchLiveNodes(ctx context.Context) ([]url.URL, error) {
+	scopes, err := routingScopes(aln.cfg.RoutingScope)
+	if err != nil {
+		return nil, err
+	}
+	for i, scope := range scopes {
+		scopeCtx, cancelScope := fairAttemptContext(ctx, len(scopes)-i)
+		newNodes, err := aln.getNodesForScope(scopeCtx, scope)
+		cancelScope()
 		if err != nil {
 			return nil, err
 		}
 		if len(newNodes) != 0 {
 			return newNodes, nil
 		}
-		scope = scope.Fallback()
 	}
 	return nil, nil
 }
 
-func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, error) {
-	clusterScope := rt.IsClusterScope(scope)
+func routingScopes(scope rt.Scope) ([]rt.Scope, error) {
+	scopes := make([]rt.Scope, 0, 3)
+	for scope != nil {
+		if len(scopes) == maxRoutingScopeDepth {
+			return nil, fmt.Errorf("routing scope fallback chain exceeds %d entries", maxRoutingScopeDepth)
+		}
+		scopes = append(scopes, scope)
+		scope = scope.Fallback()
+	}
+	return scopes, nil
+}
+
+func fairAttemptContext(ctx context.Context, attemptsRemaining int) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.WithCancel(ctx)
+	}
+	if attemptsRemaining < 1 {
+		attemptsRemaining = 1
+	}
+	reserve := remaining / 20
+	if reserve > 10*time.Millisecond {
+		reserve = 10 * time.Millisecond
+	}
+	attemptTimeout := (remaining - reserve) / time.Duration(attemptsRemaining)
+	if attemptTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, attemptTimeout)
+}
+
+func (aln *AlternatorLiveNodes) discoveryCandidates() []url.URL {
 	plan := NewLazyQueryPlan(aln)
-	var discoveredNodes []url.URL
-	var lastErr error
-	attempted := make(map[string]struct{})
+	candidates := make([]url.URL, 0, len(aln.GetNodes())+len(aln.initialNodes))
+	seen := make(map[string]struct{}, cap(candidates))
 	for node := plan.Next(); node.Host != ""; node = plan.Next() {
-		attempted[node.String()] = struct{}{}
-		endpoint := node
-		endpoint.Path = "/localnodes"
-		endpoint.RawQuery = scope.GetLocalNodesQuery()
-
-		newNodes, err := aln.getNodes(&endpoint)
-		if err != nil {
-			lastErr = err
+		key := node.String()
+		if _, exists := seen[key]; exists {
 			continue
 		}
-		if len(newNodes) == 0 {
-			continue
-		}
-		if !clusterScope {
-			return newNodes, nil
-		}
-		discoveredNodes = append(discoveredNodes, newNodes...)
+		seen[key] = struct{}{}
+		candidates = append(candidates, node)
 	}
-	if len(discoveredNodes) != 0 {
-		return cloneAndDedupeNodes(discoveredNodes), nil
-	}
-
-	// Successful discovery replaces the initial entrypoints in the active node set. If every
-	// learned node later fails, retry the original entrypoints so a long-lived client can relearn
-	// the cluster without being recreated.
 	for _, node := range aln.initialNodes {
-		if _, ok := attempted[node.String()]; ok {
+		key := node.String()
+		if _, exists := seen[key]; exists {
 			continue
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, node)
+	}
+	return candidates
+}
+
+func (aln *AlternatorLiveNodes) getNodesForScope(ctx context.Context, scope rt.Scope) ([]url.URL, error) {
+	clusterScope := rt.IsClusterScope(scope)
+	var discoveredNodes []url.URL
+	discoveredKeys := make(map[string]struct{})
+	discoveredSize := 0
+	var lastErr error
+	sawEmptyResponse := false
+	candidates := aln.discoveryCandidates()
+	for i, node := range candidates {
+		if err := ctx.Err(); err != nil {
+			lastErr = err
+			break
 		}
 		endpoint := node
 		endpoint.Path = "/localnodes"
 		endpoint.RawQuery = scope.GetLocalNodesQuery()
 
-		newNodes, err := aln.getNodes(&endpoint)
+		candidateCtx, cancelCandidate := fairAttemptContext(ctx, len(candidates)-i)
+		newNodes, err := aln.getNodes(candidateCtx, &endpoint)
+		cancelCandidate()
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if len(newNodes) == 0 {
+			sawEmptyResponse = true
 			continue
 		}
 		if !clusterScope {
 			return newNodes, nil
 		}
-		discoveredNodes = append(discoveredNodes, newNodes...)
+		for _, discoveredNode := range newNodes {
+			key := discoveredNode.String()
+			if _, duplicate := discoveredKeys[key]; duplicate {
+				continue
+			}
+			discoveredSize += len(key) + 3
+			if discoveredSize > maxDiscoverySnapshotSize {
+				return nil, fmt.Errorf("discovered node snapshot exceeds %d bytes", maxDiscoverySnapshotSize)
+			}
+			discoveredKeys[key] = struct{}{}
+			discoveredNodes = append(discoveredNodes, discoveredNode)
+		}
 	}
 	if len(discoveredNodes) != 0 {
-		return cloneAndDedupeNodes(discoveredNodes), nil
+		return sortNodesByAddress(discoveredNodes), nil
+	}
+	if scope.GetLocalNodesQuery() != "" && sawEmptyResponse {
+		// A valid empty scoped result is enough to advance to the configured
+		// fallback scope even when another discovery endpoint failed.
+		return nil, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -539,65 +706,437 @@ func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, err
 
 // UpdateLiveNodes forces an immediate refresh of the live Alternator nodes list.
 func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
-	newNodes, err := aln.fetchLiveNodes()
+	return aln.UpdateLiveNodesContext(context.Background())
+}
+
+func (aln *AlternatorLiveNodes) beginLiveNodesUpdate() (update *liveNodesUpdate, owner, retry bool) {
+	aln.updateMu.Lock()
+	defer aln.updateMu.Unlock()
+	if update = aln.updateInFlight; update != nil {
+		update.waiters++
+		// When the last previous waiter canceled, its shared generation is
+		// already irreversibly canceled. Wait for it to unwind, then let this
+		// still-live caller start a fresh generation instead of inheriting the
+		// abandoned generation's context error.
+		return update, false, update.ctx.Err() != nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	update = &liveNodesUpdate{done: make(chan struct{}), ctx: ctx, cancel: cancel, waiters: 1}
+	if err := aln.ctx.Err(); err != nil {
+		update.err = err
+		cancel()
+		close(update.done)
+		return update, false, false
+	}
+	aln.updateInFlight = update
+	return update, true, false
+}
+
+func (aln *AlternatorLiveNodes) finishLiveNodesUpdate(update *liveNodesUpdate, err error) {
+	aln.updateMu.Lock()
+	update.err = err
+	update.cancel()
+	if aln.updateInFlight == update {
+		aln.updateInFlight = nil
+	}
+	close(update.done)
+	aln.updateMu.Unlock()
+}
+
+func (aln *AlternatorLiveNodes) releaseLiveNodesUpdateWaiter(update *liveNodesUpdate) {
+	aln.updateMu.Lock()
+	if update.waiters > 0 {
+		update.waiters--
+	}
+	if update.waiters == 0 && aln.updateInFlight == update {
+		update.cancel()
+	}
+	aln.updateMu.Unlock()
+}
+
+func (aln *AlternatorLiveNodes) waitForLiveNodesUpdate(ctx context.Context, update *liveNodesUpdate) error {
+	defer aln.releaseLiveNodesUpdateWaiter(update)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-aln.ctx.Done():
+		return aln.ctx.Err()
+	case <-update.done:
+		return update.err
+	}
+}
+
+// UpdateLiveNodesContext forces a refresh bounded by ctx, shutdown, and the configured discovery timeout.
+func (aln *AlternatorLiveNodes) UpdateLiveNodesContext(callerCtx context.Context) error {
+	if callerCtx == nil {
+		callerCtx = context.Background()
+	}
+	if err := callerCtx.Err(); err != nil {
+		return err
+	}
+	if err := aln.ctx.Err(); err != nil {
+		return err
+	}
+	for {
+		update, owner, retry := aln.beginLiveNodesUpdate()
+		if owner {
+			go func() {
+				aln.finishLiveNodesUpdate(update, aln.updateLiveNodes(update.ctx))
+			}()
+		}
+		err := aln.waitForLiveNodesUpdate(callerCtx, update)
+		if !retry || callerCtx.Err() != nil || aln.ctx.Err() != nil {
+			return err
+		}
+	}
+}
+
+func (aln *AlternatorLiveNodes) updateLiveNodes(callerCtx context.Context) error {
+	requestCtx, cancelRequest := context.WithCancel(callerCtx)
+	stopOnShutdown := context.AfterFunc(aln.ctx, cancelRequest)
+	defer func() {
+		stopOnShutdown()
+		cancelRequest()
+	}()
+	ctx, cancelTimeout := context.WithTimeout(requestCtx, aln.discoveryTimeout())
+	defer cancelTimeout()
+
+	newNodes, err := aln.fetchLiveNodes(ctx)
 	if err != nil {
 		return err
 	}
 	if len(newNodes) == 0 {
 		return nil
 	}
-	currentNodes := *aln.liveNodes.Load()
-	hasNewNodes := false
-
-	for _, node := range newNodes {
-		if !slices.Contains(currentNodes, node) {
-			aln.nodeHealthStore.AddNode(node)
-			hasNewNodes = true
-		}
-	}
-
-	for _, node := range currentNodes {
-		if !slices.Contains(newNodes, node) {
-			aln.nodeHealthStore.RemoveNode(node)
-		}
-	}
 	sortNodesByAddress(newNodes)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	aln.lifecycleMu.Lock()
+	if aln.stopped {
+		aln.lifecycleMu.Unlock()
+		return context.Canceled
+	}
+	hasNewNodes := false
+	if store, ok := aln.nodeHealthStore.(nodeHealthSnapshotStore); ok {
+		hasNewNodes = store.ReplaceNodes(newNodes)
+	} else {
+		currentNodes := *aln.liveNodes.Load()
+		for _, node := range newNodes {
+			if !slices.Contains(currentNodes, node) {
+				aln.nodeHealthStore.AddNode(node)
+				hasNewNodes = true
+			}
+		}
+		for _, node := range currentNodes {
+			if !slices.Contains(newNodes, node) {
+				aln.nodeHealthStore.RemoveNode(node)
+			}
+		}
+	}
 	aln.liveNodes.Store(&newNodes)
+	aln.lifecycleMu.Unlock()
 	if hasNewNodes {
-		aln.nodeHealthStore.TryReleaseQuarantinedNodes()
+		aln.releaseHealthyNodes(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
-	resp, err := aln.httpClient.Get(endpoint.String())
+func (aln *AlternatorLiveNodes) releaseHealthyNodes(ctx context.Context) {
+	bulkReleaser, canReleaseBulk := aln.nodeHealthStore.(nodeHealthBulkReleaser)
+	releaser, canReleaseOne := aln.nodeHealthStore.(nodeHealthReleaser)
+	if !canReleaseBulk && !canReleaseOne {
+		return
+	}
+	candidates := aln.nodeHealthStore.GetQuarantinedNodes()
+	healthyNodes := make([]url.URL, 0, len(candidates))
+	for i, node := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		candidateCtx, cancelCandidate := fairAttemptContext(ctx, len(candidates)-i)
+		healthy := checkNodeHealth(candidateCtx, node, aln.cfg, aln.httpState.Load().client, aln.healthCheckGate)
+		cancelCandidate()
+		if healthy {
+			healthyNodes = append(healthyNodes, node)
+		}
+	}
+	if canReleaseBulk {
+		bulkReleaser.ReleaseNodes(healthyNodes)
+		return
+	}
+	for _, node := range healthyNodes {
+		releaser.ReleaseNode(node)
+	}
+}
+
+func checkNodeHealth(
+	ctx context.Context,
+	node url.URL,
+	cfg ALNConfig,
+	httpClient *http.Client,
+	gate chan struct{},
+) bool {
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		return false
+	}
+	requestCtx, cancelRequest := context.WithTimeout(ctx, discoveryTimeoutForConfig(cfg))
+	defer cancelRequest()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, node.String(), nil)
+	if err != nil {
+		return false
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		if ctx.Err() == nil {
+			cfg.Logger.Error("failed to check node health status", logx.A("node", node.String()), logx.A("error", err))
+		}
+		return false
+	}
+	defer drainAndCloseResponseBody(response.Body)
+	if response.StatusCode != http.StatusOK {
+		cfg.Logger.Error(
+			"failed to check node health status, node reported an error",
+			logx.A("node", node.String()),
+			logx.A("statusCode", response.StatusCode),
+		)
+		return false
+	}
+	return true
+}
+
+func (aln *AlternatorLiveNodes) getNodes(ctx context.Context, endpoint *url.URL) ([]url.URL, error) {
+	httpState := aln.httpState.Load()
+	resolveCtx, cancelResolve := fairAttemptContext(ctx, 2)
+	addresses, err := aln.resolveEndpointAddresses(resolveCtx, endpoint, httpState)
+	cancelResolve()
 	if err != nil {
 		return nil, err
 	}
-	defer drainAndCloseResponseBody(resp.Body)
+	if len(addresses) == 0 {
+		nodes, err := aln.getNodesOnce(ctx, endpoint, "", false, httpState.client)
+		if err == nil && len(nodes) == 0 && endpoint.RawQuery == "" {
+			return nil, errors.New("cluster /localnodes response contains no usable live nodes")
+		}
+		return nodes, err
+	}
+
+	var errs []error
+	sawEmptyResponse := false
+	for i, address := range addresses {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		requestCtx, cancelRequest := fairAttemptContext(ctx, len(addresses)-i)
+		nodes, err := aln.getNodesOnce(requestCtx, endpoint, address, len(addresses) > 1, httpState.client)
+		cancelRequest()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("DNS address %s: %w", address, err))
+			continue
+		}
+		if len(nodes) == 0 {
+			sawEmptyResponse = true
+			continue
+		}
+		return nodes, nil
+	}
+	if sawEmptyResponse && endpoint.RawQuery != "" {
+		// An empty scoped response means this address has no nodes in the requested scope.
+		// Let the caller try its configured fallback scope after every address was checked.
+		return nil, nil
+	}
+	if len(errs) != 0 {
+		return nil, errors.Join(errs...)
+	}
+	return nil, errors.New("all resolved DNS addresses returned no usable live nodes")
+}
+
+func (aln *AlternatorLiveNodes) discoveryTimeout() time.Duration {
+	return discoveryTimeoutForConfig(aln.cfg)
+}
+
+func discoveryTimeoutForConfig(cfg ALNConfig) time.Duration {
+	if cfg.HTTPClientTimeout > 0 {
+		return cfg.HTTPClientTimeout
+	}
+	return defaultDiscoveryTimeout
+}
+
+// resolveEndpointAddresses returns resolved socket addresses for a DNS endpoint.
+// A nil result means the configured test transport handles the logical hostname itself.
+func (aln *AlternatorLiveNodes) resolveEndpointAddresses(
+	ctx context.Context,
+	endpoint *url.URL,
+	httpState *liveNodesHTTPState,
+) ([]string, error) {
+	hostname := endpoint.Hostname()
+	if hostname == "" {
+		return nil, errors.New("discovery endpoint has no hostname")
+	}
+	if _, err := netip.ParseAddr(hostname); err == nil {
+		return nil, nil
+	}
+	if transport, ok := httpState.client.Transport.(*http.Transport); ok && transport.Proxy != nil {
+		proxyRequest := &http.Request{URL: endpoint}
+		proxyURL, err := transport.Proxy(proxyRequest)
+		if err != nil {
+			return nil, fmt.Errorf("select proxy for discovery endpoint %q: %w", endpoint.String(), err)
+		}
+		if proxyURL != nil {
+			// The proxy owns resolution of the logical endpoint. Resolving and
+			// pinning it locally would bypass or duplicate proxy semantics.
+			return nil, nil
+		}
+	}
+
+	resolver := httpState.resolver
+	if resolver == nil {
+		// Test-only RoundTripper hooks often use synthetic hostnames and intentionally bypass DNS.
+		// Production's standard transport uses the system resolver and gets address-level fallback.
+		if _, ok := httpState.client.Transport.(*http.Transport); !ok {
+			return nil, nil
+		}
+		resolver = net.DefaultResolver
+	}
+	resolved, err := resolver.LookupNetIP(ctx, "ip", hostname)
+	if err != nil {
+		return nil, fmt.Errorf("resolve DNS entrypoint %q: %w", hostname, err)
+	}
+
+	addresses := make([]string, 0, len(resolved))
+	for _, address := range resolved {
+		address = address.Unmap()
+		addresses = append(addresses, net.JoinHostPort(address.String(), endpoint.Port()))
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("resolve DNS entrypoint %q: empty answer", hostname)
+	}
+	return addresses, nil
+}
+
+func (aln *AlternatorLiveNodes) getNodesOnce(
+	ctx context.Context,
+	endpoint *url.URL,
+	resolvedAddress string,
+	closeConnection bool,
+	httpClient *http.Client,
+) ([]url.URL, error) {
+	if resolvedAddress != "" {
+		ctx = context.WithValue(ctx, dnsDialTargetContextKey{}, dnsDialTarget{
+			logicalAddress:  endpoint.Host,
+			resolvedAddress: resolvedAddress,
+		})
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	// Separate resolved addresses must use separate connections. Otherwise an idle connection
+	// to a reachable-but-invalid address could be reused for every fallback attempt.
+	request.Close = closeConnection
+	resp, attemptTransport, err := aln.doDiscoveryRequest(request, resolvedAddress, httpClient)
+	if err != nil {
+		return nil, err
+	}
+	if attemptTransport != nil {
+		defer attemptTransport.CloseIdleConnections()
+	}
+	drainResponse := true
+	defer func() {
+		if drainResponse {
+			drainAndCloseResponseBody(resp.Body)
+			return
+		}
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("non-200 response")
+		return nil, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	if resp.Body == nil {
+		return nil, errors.New("response has no body")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryResponseBody+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxDiscoveryResponseBody {
+		drainResponse = false
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxDiscoveryResponseBody)
 	}
 
 	var nodes []string
 	if err := json.Unmarshal(body, &nodes); err != nil {
 		return nil, err
 	}
+	if nodes == nil {
+		return nil, errors.New("response must be a JSON array")
+	}
 
 	var uris []url.URL
-	for _, node := range nodes {
+	invalidNodes := 0
+	for i, node := range nodes {
+		if i%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		uri, err := nodeURL(aln.cfg.Scheme, node, aln.cfg.Port)
 		if err != nil {
-			aln.cfg.Logger.Error("invalid node URI", logx.A("node", node), logx.A("error", err))
+			invalidNodes++
+			if invalidNodes <= maxLoggedInvalidNodes {
+				aln.cfg.Logger.Error("invalid node URI", logx.A("node", node), logx.A("error", err))
+			}
 			continue
 		}
 		uris = append(uris, uri)
 	}
+	if invalidNodes > maxLoggedInvalidNodes {
+		aln.cfg.Logger.Error(
+			"additional invalid node URIs omitted",
+			logx.A("count", invalidNodes-maxLoggedInvalidNodes),
+		)
+	}
+	if len(nodes) != 0 && len(uris) == 0 {
+		return nil, errors.New("response contains no usable live nodes")
+	}
 	return sortNodesByAddress(uris), nil
+}
+
+func (aln *AlternatorLiveNodes) doDiscoveryRequest(
+	request *http.Request,
+	resolvedAddress string,
+	httpClient *http.Client,
+) (*http.Response, *http.Transport, error) {
+	attemptClient := *httpClient
+	attemptClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	if resolvedAddress == "" {
+		response, err := attemptClient.Do(request)
+		return response, nil, err
+	}
+
+	transport, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		httpClient.CloseIdleConnections()
+		response, err := attemptClient.Do(request)
+		return response, nil, err
+	}
+	attemptTransport := transport.Clone()
+	attemptClient.Transport = attemptTransport
+	response, err := attemptClient.Do(request)
+	if err != nil {
+		attemptTransport.CloseIdleConnections()
+		return nil, nil, err
+	}
+	return response, attemptTransport, nil
 }
 
 func nodeURL(scheme, host string, port int) (url.URL, error) {
@@ -637,23 +1176,11 @@ func sortNodesByAddress(nodes []url.URL) []url.URL {
 	return nodes
 }
 
-func cloneAndDedupeNodes(nodes []url.URL) []url.URL {
-	out := make([]url.URL, 0, len(nodes))
-	seen := make(map[string]struct{}, len(nodes))
-	for _, node := range nodes {
-		key := node.String()
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, node)
-	}
-	return sortNodesByAddress(out)
-}
-
 // CheckIfRackAndDatacenterSetCorrectly verifies that the rack and datacenter
 // settings are correctly configured and recognized by the Alternator cluster.
 func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err error) {
+	ctx, cancel := context.WithTimeout(aln.ctx, aln.discoveryTimeout())
+	defer cancel()
 	var errs []error
 	defer func() {
 		if err == nil && len(errs) > 0 {
@@ -662,13 +1189,18 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 			}
 		}
 	}()
-	scope := aln.cfg.RoutingScope
-	for scope != nil {
+	scopes, err := routingScopes(aln.cfg.RoutingScope)
+	if err != nil {
+		return err
+	}
+	for i, scope := range scopes {
 		if rt.IsClusterScope(scope) {
 			// Cluster scope does not require validation
 			return nil
 		}
-		newNodes, err := aln.getNodesForScope(scope)
+		scopeCtx, cancelScope := fairAttemptContext(ctx, len(scopes)-i)
+		newNodes, err := aln.getNodesForScope(scopeCtx, scope)
+		cancelScope()
 		if err != nil {
 			return fmt.Errorf("failed to read list of nodes: %w", err)
 		}
@@ -677,7 +1209,6 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 				errs,
 				fmt.Errorf("scope %s have no nodes, datacenter or rack might be incorrect", scope.String()),
 			)
-			scope = scope.Fallback()
 			continue
 		}
 		return nil
@@ -691,14 +1222,18 @@ func (aln *AlternatorLiveNodes) CheckIfRackAndDatacenterSetCorrectly() (err erro
 // CheckIfRackDatacenterFeatureIsSupported checks whether the connected Alternator
 // cluster supports rack/datacenter-aware features.
 func (aln *AlternatorLiveNodes) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
+	ctx, cancel := context.WithTimeout(aln.ctx, aln.discoveryTimeout())
+	defer cancel()
 	baseURI := aln.nextAsURLWithPath("/localnodes", "")
 	fakeRackURI := aln.nextAsURLWithPath("/localnodes", "rack=fakeRack")
 
-	hostsWithFakeRack, err := aln.getNodes(fakeRackURI)
+	fakeCtx, cancelFake := fairAttemptContext(ctx, 2)
+	hostsWithFakeRack, err := aln.getNodes(fakeCtx, fakeRackURI)
+	cancelFake()
 	if err != nil {
 		return false, err
 	}
-	hostsWithoutRack, err := aln.getNodes(baseURI)
+	hostsWithoutRack, err := aln.getNodes(ctx, baseURI)
 	if err != nil {
 		return false, err
 	}
@@ -713,6 +1248,75 @@ func (aln *AlternatorLiveNodes) CheckIfRackDatacenterFeatureIsSupported() (bool,
 // It increases the node error score by the mapped error weight.
 func (aln *AlternatorLiveNodes) ReportNodeError(node url.URL, err error) {
 	aln.nodeHealthStore.ReportNodeError(node, err)
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+
+	snapshot := aln.liveNodes.Load()
+	if snapshot == nil || len(*snapshot) == 0 {
+		return
+	}
+
+	aln.failureMu.Lock()
+	if aln.failureSnapshot != snapshot {
+		aln.failureSnapshot = snapshot
+		aln.failedNodes = make(map[url.URL]struct{}, len(*snapshot))
+		aln.recoveryStarted = false
+	}
+	if aln.failedNodes == nil {
+		aln.failedNodes = make(map[url.URL]struct{}, len(*snapshot))
+	}
+	if !slices.Contains(*snapshot, node) {
+		aln.failureMu.Unlock()
+		return
+	}
+	aln.failedNodes[node] = struct{}{}
+	allFailed := true
+	for _, knownNode := range *snapshot {
+		if _, failed := aln.failedNodes[knownNode]; !failed {
+			allFailed = false
+			break
+		}
+	}
+	if !allFailed || aln.recoveryStarted {
+		aln.failureMu.Unlock()
+		return
+	}
+	aln.recoveryStarted = true
+	aln.failureMu.Unlock()
+
+	go aln.refreshAfterKnownNodesFailure(snapshot)
+}
+
+// ReportNodeSuccess clears a previously observed transport failure for a node
+// in the current live-node snapshot.
+func (aln *AlternatorLiveNodes) ReportNodeSuccess(node url.URL) {
+	snapshot := aln.liveNodes.Load()
+	if snapshot == nil {
+		return
+	}
+	aln.failureMu.Lock()
+	defer aln.failureMu.Unlock()
+	if aln.failureSnapshot != snapshot {
+		aln.failureSnapshot = snapshot
+		aln.failedNodes = nil
+		aln.recoveryStarted = false
+		return
+	}
+	delete(aln.failedNodes, node)
+}
+
+func (aln *AlternatorLiveNodes) refreshAfterKnownNodesFailure(snapshot *[]url.URL) {
+	_ = aln.UpdateLiveNodes()
+
+	aln.failureMu.Lock()
+	defer aln.failureMu.Unlock()
+	if aln.failureSnapshot != snapshot {
+		return
+	}
+	aln.failureSnapshot = aln.liveNodes.Load()
+	aln.failedNodes = nil
+	aln.recoveryStarted = false
 }
 
 // TryReleaseQuarantinedNodes executes the configured callback for every quarantined node.
