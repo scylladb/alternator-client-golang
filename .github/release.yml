@@ -1,9 +1,7 @@
 changelog:
   exclude:
     labels:
-      - "cicd"
-    authors:
-      - dependabot
+      - "omit-from-release-notes"
   categories:
     - title: "⚠️ Breaking changes"
       labels:

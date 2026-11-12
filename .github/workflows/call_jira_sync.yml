@@ -11,6 +11,10 @@ permissions:
 
 jobs:
   jira-sync:
+    # The release-note marker is not Jira metadata. Preserve all other events.
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name != 'omit-from-release-notes'
     uses: scylladb/github-automation/.github/workflows/main_pr_events_jira_sync.yml@main
     with:
       caller_action: ${{ github.event.action }}

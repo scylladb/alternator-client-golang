@@ -456,3 +456,6 @@ operator, including for dry runs and recovery. The release job uses a fresh runn
 without validation artifacts or caches. Only non-dry runs publish. Start with a
 pipeline dry run. See
 [release signing](scripts/release/SIGNING.md) for dispatch and recovery instructions.
+
+Generated notes filter support-only PRs through `omit-from-release-notes`. See
+[release notes](.github/RELEASE_NOTES.md) for classification and merged-PR backfill.
