@@ -73,7 +73,10 @@ type AlternatorLiveNodes struct {
 }
 
 // GetActiveNodes returns nodes that are currently considered healthy.
+// It starts background discovery and schedules a refresh when due.
 func (aln *AlternatorLiveNodes) GetActiveNodes() []url.URL {
+	aln.startIdleUpdater()
+	aln.triggerUpdate()
 	return aln.nodeHealthStore.GetActiveNodes()
 }
 
@@ -365,7 +368,7 @@ func NewAlternatorLiveNodes(initialNodes []string, options ...ALNOption) (*Alter
 }
 
 func (aln *AlternatorLiveNodes) triggerUpdate() {
-	if aln.cfg.UpdatePeriod <= 0 {
+	if aln.ctx.Err() != nil || aln.cfg.UpdatePeriod <= 0 {
 		return
 	}
 	nextUpdate := aln.nextUpdate.Load()
@@ -381,31 +384,36 @@ func (aln *AlternatorLiveNodes) triggerUpdate() {
 }
 
 func (aln *AlternatorLiveNodes) startIdleUpdater() {
-	if aln.cfg.IdleUpdatePeriod <= 0 {
+	if aln.ctx.Err() != nil || (aln.cfg.IdleUpdatePeriod <= 0 && aln.cfg.UpdatePeriod <= 0) {
 		return
 	}
 	if aln.idleUpdaterStarted.CompareAndSwap(false, true) {
 		go func() {
-			t := time.NewTicker(aln.cfg.IdleUpdatePeriod)
-			defer t.Stop()
+			var tick <-chan time.Time
+			if aln.cfg.IdleUpdatePeriod > 0 {
+				t := time.NewTicker(aln.cfg.IdleUpdatePeriod)
+				defer t.Stop()
+				tick = t.C
+			}
 			for {
 				select {
 				case <-aln.ctx.Done():
 					return
-				case <-t.C:
-					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
-					_ = aln.UpdateLiveNodes()
+				case <-tick:
 				case <-aln.updateSignal:
-					aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
-					_ = aln.UpdateLiveNodes()
 				}
+				if aln.ctx.Err() != nil {
+					return
+				}
+				aln.nextUpdate.Store(time.Now().UTC().Unix() + int64(aln.cfg.UpdatePeriod.Seconds()))
+				_ = aln.UpdateLiveNodes()
 			}
 		}()
 	}
 }
 
-// Start begins background routines used for periodic node discovery and updates.
-// It is not required to start if automatically on first API call
+// Start starts background node discovery and quarantine recovery workers.
+// Node selection starts discovery automatically.
 func (aln *AlternatorLiveNodes) Start() {
 	aln.startIdleUpdater()
 	aln.nodeHealthStore.TryReleaseQuarantinedNodes()
@@ -477,7 +485,8 @@ func (aln *AlternatorLiveNodes) fetchLiveNodes() ([]url.URL, error) {
 
 func (aln *AlternatorLiveNodes) getNodesForScope(scope rt.Scope) ([]url.URL, error) {
 	clusterScope := rt.IsClusterScope(scope)
-	plan := NewLazyQueryPlan(aln)
+	// Discovery reads the health store directly to avoid scheduling another refresh.
+	plan := NewLazyQueryPlan(aln.nodeHealthStore)
 	var discoveredNodes []url.URL
 	var lastErr error
 	attempted := make(map[string]struct{})
@@ -570,7 +579,11 @@ func (aln *AlternatorLiveNodes) UpdateLiveNodes() error {
 }
 
 func (aln *AlternatorLiveNodes) getNodes(endpoint *url.URL) ([]url.URL, error) {
-	resp, err := aln.httpClient.Get(endpoint.String())
+	req, err := http.NewRequestWithContext(aln.ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := aln.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

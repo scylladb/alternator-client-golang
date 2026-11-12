@@ -15,6 +15,8 @@
 package shared
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -25,11 +27,125 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scylladb/alternator-client-golang/shared/nodeshealth"
 	"github.com/scylladb/alternator-client-golang/shared/rt"
 	"github.com/scylladb/alternator-client-golang/shared/tests/resp"
 )
+
+func TestAlternatorLiveNodes_ReadAfterStopDoesNotStartDiscovery(t *testing.T) {
+	t.Parallel()
+
+	aln, err := NewAlternatorLiveNodes([]string{"seed.local"})
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	aln.Stop()
+
+	_ = aln.GetActiveNodes()
+	_ = aln.NextNode()
+	if aln.idleUpdaterStarted.Load() {
+		t.Fatal("node selection started discovery after Stop")
+	}
+	if len(aln.updateSignal) != 0 {
+		t.Fatal("node selection scheduled discovery after Stop")
+	}
+}
+
+func TestAlternatorLiveNodes_StopCancelsDiscovery(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{}, 1)
+	finished := make(chan error, 1)
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed.local"},
+		WithALNIdleUpdatePeriod(-1),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				started <- struct{}{}
+				select {
+				case <-req.Context().Done():
+					finished <- req.Context().Err()
+					return nil, req.Context().Err()
+				case <-time.After(5 * time.Second):
+					finished <- errors.New("discovery request was not canceled")
+					return nil, errors.New("discovery request was not canceled")
+				}
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+	aln.GetActiveNodes()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("discovery did not start")
+	}
+	// Leave another refresh queued when cancellation occurs.
+	aln.nextUpdate.Store(0)
+	aln.GetActiveNodes()
+	aln.Stop()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("discovery returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not cancel discovery")
+	}
+}
+
+func TestAlternatorLiveNodes_QueryPlanRefreshesWhenDue(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	aln, err := NewAlternatorLiveNodes(
+		[]string{"seed.local"},
+		WithALNIdleUpdatePeriod(time.Hour),
+		WithALNNodeHealthStoreConfig(nodeshealth.NodeHealthStoreConfig{Disabled: true}),
+		WithALNHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper {
+			return liveNodesRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if requests.Add(1) == 1 {
+					return resp.AlternatorNodesResponse([]string{"node1.local"}, req)
+				}
+				return resp.AlternatorNodesResponse([]string{"node2.local"}, req)
+			})
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewAlternatorLiveNodes returned error: %v", err)
+	}
+	defer aln.Stop()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
+	for i, want := range []string{"node1.local", "node2.local"} {
+		// Make the next discovery due without waiting for the configured update period.
+		aln.nextUpdate.Store(0)
+		plan := NewLazyQueryPlan(aln)
+		if node := plan.Next(); node.Host == "" {
+			t.Fatal("query plan returned no node")
+		}
+		for nodes := aln.GetNodes(); len(nodes) != 1 || nodes[0].Hostname() != want; nodes = aln.GetNodes() {
+			select {
+			case <-timeout.C:
+				t.Fatalf("query plan did not refresh nodes: got %v, want %s", nodes, want)
+			case <-ticker.C:
+			}
+		}
+		if got := requests.Load(); got != int32(i+1) {
+			t.Fatalf("discovery requests got %d, want %d", got, i+1)
+		}
+	}
+}
 
 func TestAlternatorLiveNodes_RoutingScopeFallbackRetriesKnownNodes(t *testing.T) {
 	t.Parallel()
