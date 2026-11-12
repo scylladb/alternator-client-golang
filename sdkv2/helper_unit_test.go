@@ -519,7 +519,8 @@ func TestOptions(t *testing.T) {
 				WithScheme("http"),
 				WithPort(8080),
 				WithNodeHealthStoreConfig(healthConfig),
-				WithIdleNodesListUpdatePeriod(0),
+				WithNodesListUpdatePeriod(0),
+				WithIdleNodesListUpdatePeriod(-1),
 				WithAWSConfigOptions(
 					func(cfg *aws.Config) {
 						cfg.RetryMaxAttempts = 3
@@ -634,7 +635,8 @@ func TestOptions(t *testing.T) {
 				WithScheme("http"),
 				WithPort(8080),
 				WithNodeHealthStoreConfig(healthConfig),
-				WithIdleNodesListUpdatePeriod(0), // Disable automatic node list updates
+				WithNodesListUpdatePeriod(0),
+				WithIdleNodesListUpdatePeriod(-1),
 				WithAWSConfigOptions(
 					func(cfg *aws.Config) {
 						cfg.RetryMaxAttempts = 3 // Allow some retries to make sure that query does not fail

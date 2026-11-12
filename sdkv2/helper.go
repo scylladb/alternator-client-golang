@@ -371,8 +371,8 @@ func (lb *Helper) CheckIfRackDatacenterFeatureIsSupported() (bool, error) {
 	return lb.nodes.CheckIfRackDatacenterFeatureIsSupported()
 }
 
-// Start begins background routines used for periodic node discovery and updates.
-// It is not required to start if automatically on first API call
+// Start starts background node discovery and quarantine recovery workers.
+// SDK requests start node discovery automatically.
 func (lb *Helper) Start() {
 	lb.nodes.Start()
 }
