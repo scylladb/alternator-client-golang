@@ -16,6 +16,7 @@ package sdkv2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2185,5 +2186,293 @@ func assertNodesStatus(t *testing.T, nodes AlternatorNodesSource, liveNodes, qua
 	}
 	if t.Failed() {
 		t.FailNow()
+	}
+}
+
+func TestNewDynamoDBRetrySettings(t *testing.T) {
+	t.Parallel()
+
+	uncomparable := struct {
+		aws.Retryer
+		state []byte
+	}{
+		Retryer: retry.NewStandard(func(o *retry.StandardOptions) { o.MaxAttempts = 7 }),
+		state:   []byte{1},
+	}
+
+	for _, tc := range []struct {
+		name       string
+		config     func(*aws.Config)
+		options    func(*dynamodb.Options)
+		want       int
+		wantRegion string
+		adaptive   bool
+	}{
+		{name: "default", want: 3},
+		{name: "nil config retryer", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+		}, want: 3},
+		{name: "nil config retryer with adaptive mode", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+			c.RetryMode = aws.RetryModeAdaptive
+		}, want: 3, adaptive: true},
+		{name: "nil config retryer with config maximum", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+			c.RetryMaxAttempts = 5
+		}, want: 5},
+		{name: "nil config retryer with service maximum", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				options.(*dynamodb.Options).RetryMaxAttempts = 6
+			}}
+		}, want: 6},
+		{name: "nil config retryer with service retryer", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				options.(*dynamodb.Options).Retryer = uncomparable
+			}}
+		}, want: 7},
+		{name: "nil config retryer with client retryer", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+		}, options: func(o *dynamodb.Options) {
+			o.Retryer = uncomparable
+		}, want: 7},
+		{name: "nil config retryer with client maximum", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return nil }
+		}, options: func(o *dynamodb.Options) {
+			o.RetryMaxAttempts = 8
+		}, want: 8},
+		{name: "config maximum", config: func(c *aws.Config) { c.RetryMaxAttempts = 5 }, want: 5},
+		{name: "client maximum", options: func(o *dynamodb.Options) { o.RetryMaxAttempts = 6 }, want: 6},
+		{name: "config retryer", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer {
+				return retry.NewStandard(func(o *retry.StandardOptions) { o.MaxAttempts = 7 })
+			}
+		}, want: 7},
+		{name: "client retryer", options: func(o *dynamodb.Options) {
+			o.Retryer = retry.NewStandard(func(o *retry.StandardOptions) { o.MaxAttempts = 8 })
+		}, want: 8},
+		{name: "service maximum", config: func(c *aws.Config) {
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				options.(*dynamodb.Options).RetryMaxAttempts = 9
+			}}
+		}, want: 9},
+		{name: "service retryer", config: func(c *aws.Config) {
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				options.(*dynamodb.Options).Retryer = retry.NewStandard(func(o *retry.StandardOptions) {
+					o.MaxAttempts = 7
+				})
+			}}
+		}, want: 7},
+		{name: "service mutates existing retryer", config: func(c *aws.Config) {
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				*options.(*dynamodb.Options).Retryer.(*retry.Standard) = *retry.NewStandard(func(o *retry.StandardOptions) {
+					o.MaxAttempts = 4
+				})
+			}}
+		}, want: 4},
+		{name: "config adaptive mode", config: func(c *aws.Config) {
+			c.RetryMode = aws.RetryModeAdaptive
+		}, want: 3, adaptive: true},
+		{name: "service uncomparable retryer", config: func(c *aws.Config) {
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				options.(*dynamodb.Options).Retryer = uncomparable
+			}}
+		}, want: 7},
+		{name: "config uncomparable retryer", config: func(c *aws.Config) {
+			c.Retryer = func() aws.Retryer { return uncomparable }
+		}, want: 7},
+		{name: "client uncomparable retryer", options: func(o *dynamodb.Options) {
+			o.Retryer = uncomparable
+		}, want: 7},
+		{name: "unrelated service option", config: func(c *aws.Config) {
+			c.ServiceOptions = []func(string, any){func(_ string, options any) {
+				options.(*dynamodb.Options).Region = "service-region"
+			}}
+		}, want: 3, wantRegion: "service-region"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var helperOptions []Option
+			var providerCalls int
+			var providerConfigured bool
+			if tc.config != nil {
+				helperOptions = append(helperOptions, WithAWSConfigOptions(func(c *aws.Config) {
+					tc.config(c)
+					if provider := c.Retryer; provider != nil {
+						providerConfigured = true
+						c.Retryer = func() aws.Retryer {
+							providerCalls++
+							return provider()
+						}
+					}
+				}))
+			}
+			h, err := NewHelper([]string{"node1.local"}, helperOptions...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+
+			var clientOptions []func(*dynamodb.Options)
+			if tc.options != nil {
+				clientOptions = append(clientOptions, tc.options)
+			}
+			client, err := h.NewDynamoDB(clientOptions...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.Options().Retryer.MaxAttempts(); got != tc.want {
+				t.Fatalf("retry maximum = %d, want %d", got, tc.want)
+			}
+			if tc.wantRegion != "" && client.Options().Region != tc.wantRegion {
+				t.Fatalf("region = %s, want %s", client.Options().Region, tc.wantRegion)
+			}
+			if tc.adaptive {
+				if _, ok := client.Options().Retryer.(*retry.AdaptiveMode); !ok {
+					t.Fatalf("retryer type = %T, want adaptive mode", client.Options().Retryer)
+				}
+			}
+			if providerConfigured && providerCalls != 1 {
+				t.Fatalf("retryer provider called %d times, want once", providerCalls)
+			}
+		})
+	}
+}
+
+func TestDefaultRetriesPreserveThrottlingError(t *testing.T) {
+	t.Parallel()
+	for _, nilFactory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nil factory %v", nilFactory), func(t *testing.T) {
+			t.Parallel()
+			nodes := []string{"node1.local", "node2.local", "node3.local"}
+			var requests atomic.Int32
+			transport := &mocks.MockRoundTripper{
+				AlternatorRequest: func(req *http.Request) (*http.Response, error) {
+					return resp.AlternatorNodesResponse(nodes, req)
+				},
+				NodeHealthRequest: resp.HealthCheckResponse,
+				DynamoDBRequest: func(req *http.Request) (*http.Response, error) {
+					requests.Add(1)
+					return resp.New().BadRequest().ContentType(ct.JSON).
+						Body(`{"__type":"com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException","message":"throttled"}`).
+						Request(req).Build()
+				},
+			}
+			var providerCalls int
+			h, err := NewHelper(nodes,
+				WithCredentials("test-key", "test-secret"),
+				WithAWSConfigOptions(func(c *aws.Config) {
+					if nilFactory {
+						c.Retryer = func() aws.Retryer {
+							providerCalls++
+							return nil
+						}
+					}
+				}),
+				WithHTTPTransportWrapper(func(http.RoundTripper) http.RoundTripper { return transport }),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Stop()
+			if err := h.UpdateLiveNodes(); err != nil {
+				t.Fatal(err)
+			}
+			client, err := h.NewDynamoDB()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = client.ListTables(context.Background(), &dynamodb.ListTablesInput{})
+			var throttling *types.ProvisionedThroughputExceededException
+			if !errors.As(err, &throttling) {
+				t.Fatalf("expected throttling error after retries, got %v", err)
+			}
+			if got := requests.Load(); got != 3 {
+				t.Fatalf("requests = %d, want 3", got)
+			}
+			if nilFactory && providerCalls != 1 {
+				t.Fatalf("retryer provider called %d times, want once", providerCalls)
+			}
+		})
+	}
+}
+
+func TestNewDynamoDBServiceOptionOrdering(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+	serviceOptions := make([]func(string, any), 3)
+	serviceOptions[0] = func(serviceID string, options any) {
+		calls = append(calls, "first service")
+		if serviceID != dynamodb.ServiceID {
+			t.Fatalf("service ID = %s, want %s", serviceID, dynamodb.ServiceID)
+		}
+		o := options.(*dynamodb.Options)
+		if o.RetryMaxAttempts != 0 || o.Retryer.MaxAttempts() != 3 {
+			t.Fatalf("service callback saw maximum %d and retryer maximum %d, want 0 and 3",
+				o.RetryMaxAttempts, o.Retryer.MaxAttempts())
+		}
+		o.Region = "first-region"
+	}
+	serviceOptions[1] = func(_ string, options any) {
+		calls = append(calls, "second service")
+		o := options.(*dynamodb.Options)
+		if o.Region != "first-region" {
+			t.Fatalf("second callback saw region %s", o.Region)
+		}
+		o.Region = "second-region"
+	}
+	var serviceSpareCalled bool
+	serviceOptions[2] = func(string, any) { serviceSpareCalled = true }
+	config := aws.Config{
+		Region: "original-region", ServiceOptions: serviceOptions[:2],
+		Retryer: func() aws.Retryer { calls = append(calls, "retryer"); return nil },
+	}
+
+	clientOptions := make([]func(*dynamodb.Options), 4)
+	clientOptions[0] = func(o *dynamodb.Options) {
+		calls = append(calls, "client")
+		if o.Region != "second-region" {
+			t.Fatalf("client callback saw region %s", o.Region)
+		}
+		o.Region = "client-region"
+	}
+	var clientSpareCalled bool
+	clientOptions[1] = func(*dynamodb.Options) { clientSpareCalled = true }
+
+	h, err := NewHelper([]string{"node1.local"}, WithAWSConfigOptions(func(c *aws.Config) { *c = config }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Stop()
+	for range 2 {
+		client, err := h.NewDynamoDB(clientOptions[:1]...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Options().Region != "client-region" || client.Options().Retryer.MaxAttempts() != 3 {
+			t.Fatalf("client options lost final callback or default retry maximum")
+		}
+	}
+	wantCalls := []string{
+		"retryer", "first service", "second service", "client",
+		"retryer", "first service", "second service", "client",
+	}
+	if diff := cmp.Diff(wantCalls, calls); diff != "" {
+		t.Fatalf("callback order/single execution mismatch (-want +got):\n%s", diff)
+	}
+	if config.Region != "original-region" || config.RetryMaxAttempts != 0 || len(config.ServiceOptions) != 2 {
+		t.Fatalf("caller configuration was modified")
+	}
+	if serviceSpareCalled || clientSpareCalled {
+		t.Fatal("called an option outside the provided slice length")
+	}
+	serviceOptions[2](dynamodb.ServiceID, &dynamodb.Options{})
+	clientOptions[1](&dynamodb.Options{})
+	if !serviceSpareCalled || !clientSpareCalled {
+		t.Fatal("caller option backing slices were modified")
 	}
 }

@@ -430,9 +430,20 @@ func (lb *Helper) NewDynamoDB(opts ...func(options *dynamodb.Options)) (*dynamod
 		return nil, err
 	}
 
+	if cfg.RetryMaxAttempts == 0 {
+		// Configure the previous default before the SDK constructs its retryer.
+		// Clear the maximum before user callbacks so they can supply a retryer
+		// without inheriting an explicit cap.
+		cfg.RetryMaxAttempts = 3
+		cfg.ServiceOptions = append([]func(string, any){func(_ string, options any) {
+			options.(*dynamodb.Options).RetryMaxAttempts = 0
+		}}, cfg.ServiceOptions...)
+	}
+	clientOptions := append([]func(*dynamodb.Options){}, opts...)
+
 	return dynamodb.NewFromConfig(
 		cfg,
-		append(opts,
+		append(clientOptions,
 			dynamodb.WithEndpointResolverV2(lb.endpointResolverV2()),
 			dynamodb.WithAPIOptions(lb.queryPlanAPIOption()),
 		)...,
