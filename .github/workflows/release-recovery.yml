@@ -20,7 +20,6 @@ jobs:
   release:
     uses: ./.github/workflows/release-pipeline.yml
     with:
-      dry-run: false
       publish-existing: true
       release-version: ${{ inputs.release-version }}
       release-base: ${{ inputs.release-base }}

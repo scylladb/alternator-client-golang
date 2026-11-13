@@ -10,5 +10,3 @@ permissions:
 jobs:
   release:
     uses: ./.github/workflows/release-pipeline.yml
-    with:
-      dry-run: false

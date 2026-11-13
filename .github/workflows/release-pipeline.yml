@@ -7,10 +7,6 @@ on:
         type: string
         default: ''
         description: 'Recovery only: version from the original run'
-      dry-run:
-        type: boolean
-        required: true
-        description: 'Prepare and verify signatures without pushing or publishing'
       publish-existing:
         type: boolean
         default: false
@@ -93,7 +89,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: release
-    # Inherit the caller's permissions: dry runs have read-only contents access.
+    permissions:
+      contents: write
+      actions: read
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       GOTOOLCHAIN: local
@@ -158,7 +156,6 @@ jobs:
 
       - name: Publish verified release
         id: publication
-        if: inputs.dry-run == false
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -177,7 +174,6 @@ jobs:
       - name: Record release result
         if: always() && (steps.prepare.outcome == 'success' || inputs.publish-existing == true)
         env:
-          RELEASE_DRY_RUN: ${{ inputs.dry-run }}
           RELEASE_PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
         run: python3 scripts/release/capture.py summary python3 scripts/release/pipeline.py summary
 

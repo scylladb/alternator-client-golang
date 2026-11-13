@@ -182,7 +182,6 @@ release-check-user:
 	fi; \
 	case "$${GITHUB_WORKFLOW_REF:-}" in \
 	  "$${GITHUB_REPOSITORY:-}/.github/workflows/release.yml@refs/heads/main"|\
-	  "$${GITHUB_REPOSITORY:-}/.github/workflows/release-dry-run.yml@refs/heads/main"|\
 	  "$${GITHUB_REPOSITORY:-}/.github/workflows/release-recovery.yml@refs/heads/main") ;; \
 	  *) echo "Release preparation and publication require the Release pipeline dispatched from main." >&2; exit 1;; \
 	esac

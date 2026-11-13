@@ -76,23 +76,29 @@ class PipelineTests(unittest.TestCase):
                     pipeline.select_version()
                 self.assertFalse(env_file.exists())
 
-    def test_dispatch_workflows_fix_modes_and_dry_run_permissions(self):
-        for name, dry_run in (("release.yml", False), ("release-dry-run.yml", True)):
-            with self.subTest(workflow=name):
-                workflow = (ROOT / ".github/workflows" / name).read_text()
-                self.assertIn("  workflow_dispatch:\n", workflow)
-                self.assertNotIn("    inputs:", workflow)
-                self.assertIn("uses: ./.github/workflows/release-pipeline.yml", workflow)
-                self.assertIn("      dry-run: " + str(dry_run).lower(), workflow)
-                self.assertIn("  contents: " + ("read" if dry_run else "write"), workflow)
-                self.assertNotIn("secrets:", workflow)
+    def test_dry_run_is_independent_of_credentialed_release_workflows(self):
+        live = (ROOT / ".github/workflows/release.yml").read_text()
+        dry = (ROOT / ".github/workflows/release-dry-run.yml").read_text()
+        for workflow in (live, dry):
+            self.assertIn("  workflow_dispatch:\n", workflow)
+            self.assertNotIn("    inputs:", workflow)
+        self.assertIn("uses: ./.github/workflows/release-pipeline.yml", live)
+        self.assertIn("  contents: write", live)
+        self.assertIn("  contents: read", dry)
+        for forbidden in ("secrets.", "environment:", "GH_TOKEN", "GITHUB_TOKEN", "contents: write",
+                          "release-pipeline.yml", "publish-release", "create-release-commits"):
+            self.assertNotIn(forbidden, dry)
+        self.assertIn("pipeline.py check-preview", dry)
+        self.assertIn("pipeline.py preview", dry)
+        self.assertIn("make build check test-unit test-integration", dry)
         recovery = (ROOT / ".github/workflows/release-recovery.yml").read_text()
         self.assertIn("      publish-existing: true", recovery)
-        self.assertIn("      dry-run: false", recovery)
         shared = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         self.assertIn("  workflow_call:\n", shared)
         self.assertNotIn("  workflow_dispatch:", shared)
-        self.assertIn("  group: repository-release\n  cancel-in-progress: false", shared)
+        self.assertNotIn("dry-run", shared)
+        for workflow in (shared, dry):
+            self.assertIn("  group: repository-release\n  cancel-in-progress: false", workflow)
 
     def test_version_validation_precedes_make_evaluation_and_api_access(self):
         for value in ["$(shell touch injected)", "v1.0.7\nv1.0.8", "v01.0.7", "v1.0.7-01",
@@ -103,6 +109,13 @@ class PipelineTests(unittest.TestCase):
                     pipeline.check_publication()
                 finally:
                     run.assert_not_called()
+
+    def test_preview_rejects_signing_credentials_before_running_commands(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "v1.0.7", "RELEASE_GPG_PASSPHRASE": "secret"}), \
+                patch.object(signing, "run") as run, \
+                self.assertRaisesRegex(signing.SigningError, "without signing credentials"):
+            pipeline.preview()
+        run.assert_not_called()
 
     def test_environment_requires_exact_team_and_ref_protections(self):
         pipeline.check_environment(protected_environment(), branch_policies())
@@ -287,16 +300,14 @@ class PipelineTests(unittest.TestCase):
                     self.assertEqual(len(mutations), int(state == "new"))
 
     def test_summary_reports_publication_outcome(self):
-        for dry_run, outcome, expected in [
-                ("true", "skipped", "Rehearsal verified; no refs or release published"),
-                ("true", None, "Rehearsal verified; no refs or release published"),
-                ("false", "success", "Release published"),
-                ("false", "skipped", "publication skipped"),
-                *(("false", outcome, "publication incomplete or outcome unavailable")
+        for outcome, expected in [
+                ("success", "Release published"),
+                ("skipped", "publication skipped"),
+                *((outcome, "publication incomplete or outcome unavailable")
                   for outcome in ("failure", "cancelled", "", None))]:
-            with self.subTest(dry_run=dry_run, outcome=outcome), tempfile.TemporaryDirectory() as temp:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp:
                 summary = Path(temp) / "summary"
-                env = {"RELEASE_VERSION": "v1.0.7", "RELEASE_DRY_RUN": dry_run,
+                env = {"RELEASE_VERSION": "v1.0.7",
                        "GITHUB_STEP_SUMMARY": str(summary)}
                 if outcome is not None:
                     env["RELEASE_PUBLICATION_OUTCOME"] = outcome
@@ -328,7 +339,7 @@ class PipelineTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, expected, result.stderr)
 
-    def test_workflow_scopes_signing_secrets_and_limits_publication_to_non_dry_runs(self):
+    def test_release_workflow_scopes_signing_secrets_and_requires_validation(self):
         text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         self.assertNotIn("  push:", text)
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
@@ -344,7 +355,7 @@ class PipelineTests(unittest.TestCase):
         for name, block in validation_steps.items():
             self.assertEqual("GH_TOKEN:" in block, name == "Validate pipeline and release target", name)
         self.assertIn("    environment: release\n", release_header)
-        self.assertNotIn("    permissions:", release_header)
+        self.assertIn("    permissions:\n      contents: write\n      actions: read\n", release_header)
         self.assertIn("      GOTOOLCHAIN: local\n", release_header)
         for block in (validation, release):
             self.assertIn("    runs-on: ubuntu-latest\n", block)
@@ -367,7 +378,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual("GH_TOKEN:" in block,
                              name in ("Validate pipeline and release target", "Publish verified release"), name)
         self.assertIn("persist-credentials: false", steps["Checkout release source"])
-        self.assertIn("if: inputs.dry-run == false", steps["Publish verified release"])
+        self.assertNotIn("        if:", steps["Publish verified release"])
         self.assertIn("if: always()", steps["Upload sanitized release logs"])
         self.assertIn("if: always()", validation.split("- name: Upload sanitized validation logs", 1)[1])
         for name, label in [("Validate pipeline and release target", "target"),
@@ -394,18 +405,17 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("        if:", steps["Test release tooling"])
         self.assertIn("capture.py validation make build check test-unit test-integration", steps["Build, lint, and test"])
         conditions = {name: next(line[12:] for line in steps[name].splitlines() if line.startswith("        if: "))
-                      for name in ("Build, lint, and test", "Prepare signed release", "Publish verified release")}
+                      for name in ("Build, lint, and test", "Prepare signed release")}
         # Evaluate the actual simple boolean predicates, not a job scheduler.
         def evaluate(expression, values):
             for name, value in values.items():
                 expression = expression.replace(name, repr(value))
             return eval(expression.replace("&&", " and ").replace("false", "False"), {"__builtins__": {}})
-        for dry_run, recovery in ((False, False), (True, False), (False, True), (True, True)):
-            values = {"inputs.dry-run": dry_run, "inputs.publish-existing": recovery}
-            with self.subTest(dry_run=dry_run, recovery=recovery):
+        for recovery in (False, True):
+            values = {"inputs.publish-existing": recovery}
+            with self.subTest(recovery=recovery):
                 self.assertEqual(evaluate(conditions["Build, lint, and test"], values), not recovery)
                 self.assertEqual(evaluate(conditions["Prepare signed release"], values), not recovery)
-                self.assertEqual(evaluate(conditions["Publish verified release"], values), not dry_run)
                 for result in ("success", "failure", "cancelled", "skipped"):
                     for ref in ("refs/heads/main", "refs/heads/other"):
                         self.assertEqual(evaluate(predicate, {**values, "github.ref": ref,
