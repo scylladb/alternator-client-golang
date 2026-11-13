@@ -1,0 +1,17 @@
+# case	initial-state	active-failure-threshold	down-recovery-threshold	quarantine-promotion-threshold	quarantine-failure-threshold	observations	expected-state	expected-failures	expected-successes	expected-generation
+active-failure-below	ACTIVE	3	2	3	3	TRAFFIC_FAILURE,TRAFFIC_FAILURE	ACTIVE	2	0	0
+active-failure-at	ACTIVE	3	2	3	3	TRAFFIC_FAILURE,TRAFFIC_FAILURE,TRAFFIC_FAILURE	DOWN	3	0	1
+active-success-reset	ACTIVE	3	2	3	3	TRAFFIC_FAILURE,TRAFFIC_SUCCESS	ACTIVE	0	3	0
+active-probes-neutral	ACTIVE	3	2	3	3	PROBE_FAILURE,PROBE_SUCCESS	ACTIVE	0	3	0
+quarantine-success-below	QUARANTINED	3	2	3	3	TRAFFIC_SUCCESS,TRAFFIC_SUCCESS	QUARANTINED	0	2	0
+quarantine-success-at	QUARANTINED	3	2	3	3	TRAFFIC_SUCCESS,TRAFFIC_SUCCESS,TRAFFIC_SUCCESS	ACTIVE	0	3	0
+quarantine-failure-below	QUARANTINED	3	2	3	3	TRAFFIC_FAILURE,TRAFFIC_FAILURE	QUARANTINED	2	0	0
+quarantine-failure-at	QUARANTINED	3	2	3	3	TRAFFIC_FAILURE,TRAFFIC_FAILURE,TRAFFIC_FAILURE	DOWN	3	0	1
+quarantine-failure-resets-promotion	QUARANTINED	3	2	3	3	TRAFFIC_SUCCESS,TRAFFIC_FAILURE	QUARANTINED	1	0	0
+quarantine-probe-success	QUARANTINED	3	2	3	3	PROBE_SUCCESS	ACTIVE	0	3	0
+quarantine-probe-failure	QUARANTINED	3	2	3	3	PROBE_FAILURE	QUARANTINED	0	0	0
+down-recovery-below	ACTIVE	1	2	3	3	TRAFFIC_FAILURE,PROBE_SUCCESS	DOWN	1	1	1
+down-recovery-at	ACTIVE	1	2	3	3	TRAFFIC_FAILURE,PROBE_SUCCESS,PROBE_SUCCESS	QUARANTINED	0	0	1
+down-probe-failure-reset	ACTIVE	1	2	3	3	TRAFFIC_FAILURE,PROBE_SUCCESS,PROBE_FAILURE	DOWN	1	0	1
+down-traffic-success-ignored	ACTIVE	1	2	3	3	TRAFFIC_FAILURE,TRAFFIC_SUCCESS	DOWN	1	0	1
+down-traffic-failure-ignored	ACTIVE	1	2	3	3	TRAFFIC_FAILURE,TRAFFIC_FAILURE	DOWN	1	0	1
