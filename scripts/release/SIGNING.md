@@ -1,7 +1,7 @@
 # Release pipeline
 
 The **Release** workflow on `main` handles signing, verification, Git publication,
-GitHub release creation, and recovery after a failed GitHub release creation.
+and GitHub release creation.
 The **Release dry run** workflow is independent and prepares an unsigned manifest
 preview without release credentials or deployment approval. Release Make entrypoints
 reject local use and reject the dry-run workflow. Verification commands and
@@ -47,7 +47,7 @@ the tests, tidy dependencies, and edit the release manifests. The summary report
 an unsigned preview; no commits, tags, pushes, or GitHub release are created.
 Signing-key access and signature verification belong to the actual release.
 
-Release and recovery dispatches first run validation on a separate runner with
+Release dispatches first run validation on a separate runner with
 read-only repository access, no release environment, and no signing or publication
 credentials. Validation checks the live approval configuration and release target
 before running tests. Only successful validation makes the protected release job
@@ -97,9 +97,9 @@ and passphrase. Upload credentials through stdin, never shell arguments or logs.
 
 ## Preparation and publication
 
-The validation job runs release-tool tests for every dispatch. Normal releases and
-dry runs also build, lint, and run unit and integration tests; recovery runs only
-the release-tool tests. These dependency executables never run on the protected
+The validation job runs release-tool tests for every dispatch. Releases and
+dry runs also build, lint, and run unit and integration tests.
+These dependency executables never run on the protected
 release runner.
 
 Both jobs independently check out the exact dispatched commit. The protected
@@ -112,8 +112,7 @@ release helpers, and installed tools remain trusted. Filtered `go mod tidy` and
 
 Before approval, validation checks environment protections, version syntax, the
 dispatched source commit, the current remote `main` tip, and absence of all four
-remote version tags and an existing GitHub release. Recovery instead verifies the supplied baseline,
-prepared signatures, matching remote branch and tag objects, and release metadata.
+remote version tags and an existing GitHub release.
 The protected release job repeats these checks before importing signing credentials
 because configuration and remote state can change while approval is pending.
 Signing-key and passphrase validation and signed history preparation require the
@@ -167,7 +166,7 @@ armored key lines, base64, URL encoding, JSON escapes, and shell quoting. Raw ou
 is never spooled to disk. Overflow or cancellation discards incomplete output.
 Git tracing is rejected. Validation uploads separate version-selection, target-check,
 tool-test and project-test logs; release uploads version selection, target checks,
-preparation, verification, publication/recovery, and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
+preparation, verification, publication, and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
 failure preserves an existing nonzero command status.
 
 ## Recovery and rotation
@@ -181,28 +180,22 @@ any version tag already exists. The `v1.0.0`–`v1.0.6` tags are lightweight and
 unsigned, so they fail the new signature verification gate. These existing tags
 remain unchanged; historical retagging is unsupported.
 
-When the atomic push succeeded but GitHub release creation failed, use the
-**Release** workflow with `publish-existing` enabled. Supply the original full
-baseline as `release-base` and selected version as `release-version` from the failed
-run's summary and keep `main` at the prepared development commit. Recovery preserves
-that version instead of calculating a new patch:
+If the refs were pushed but GitHub release creation failed, check out the prepared
+development commit recorded in the failed run's summary. Use the original full
+baseline SHA and selected version from that summary with the publication helper:
 
 ```sh
-gh workflow run release.yml --ref main -f publish-existing=true -f release-version=v1.0.7 \
-  -f release-base=ORIGINAL_FULL_BASELINE_SHA
+RELEASE_BASE_COMMIT=ORIGINAL_FULL_BASELINE_SHA RELEASE_VERSION=v1.0.7 \
+  python3 scripts/release/pipeline.py publish-release
 ```
 
-Recovery imports no signing credentials and creates no commits or tags. It verifies
-the complete prepared history, checks that remote `main` and all four annotated
-tag objects match exactly, and creates only the missing GitHub release. A moved
-branch, missing or mismatched tag, invalid baseline, or conflicting GitHub release
-blocks recovery and requires maintainer investigation. A published release with
-the expected version title and release status is preserved on a recovery rerun,
-including its notes and assets; draft releases require investigation. Do not derive a new
-baseline from a release tag's parent.
+This requires GitHub write access through `gh`. It verifies the signed prepared
+history and all four remote tag objects before creating the missing GitHub release.
+It creates no commits or tags and does not push refs. A matching existing release
+keeps its notes and assets. Do not derive the baseline from a release tag's parent.
 
 All accepted versions create ordinary GitHub releases (`prerelease: false`),
-including suffix versions such as `v1.0.7-rc.1`. Recovery preserves matching
+including suffix versions such as `v1.0.7-rc.1`. Publication preserves matching
 ordinary releases and their notes/assets. A release manually marked as a GitHub
 prerelease is conflicting metadata and requires investigation, even when its
 version has a suffix. This policy applies throughout this PR, later review cycles

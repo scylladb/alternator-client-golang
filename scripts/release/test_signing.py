@@ -848,7 +848,7 @@ class SigningTests(unittest.TestCase):
             return "\n".join(commands)
         with self.make_repository() as directory:
             baseline = os.environ["RELEASE_BASE_COMMIT"]
-            inputs = {"${{ inputs.release-version }}": "", "${{ inputs.publish-existing }}": "false"}
+            inputs = {"${{ inputs.release-version }}": ""}
             os.environ.update({name: inputs.get(value, value.strip("'")) for name, value in job_env.items()})
             self.assertEqual(os.environ["GOTOOLCHAIN"], "local")
             os.environ.update(GITHUB_SHA=baseline, RELEASE_PUBLICATION_OUTCOME="skipped",
@@ -958,45 +958,38 @@ class SigningTests(unittest.TestCase):
                              {name + "-" + stream + ".log" for name in
                               ("version", "target", "prepare", "verify", "summary", "publish")
                               for stream in ("stdout", "stderr")})
-            # Recover release-note creation in a fresh main dispatch, without
-            # preparing again, receiving keys, or changing any published refs.
+            # Dispatching the same version again must fail before preparing or
+            # publishing anything, even when main is the new development commit.
             before = signing.run(["git", "ls-remote", "origin"])
-            shutil.rmtree(logs)  # Recovery starts on a fresh runner.
+            repeat_env = {key: value for key, value in os.environ.items()
+                          if key != "RELEASE_BASE_COMMIT" and not key.startswith("RELEASE_GPG_")}
+            repeat_env["GITHUB_SHA"] = signing.run(["git", "rev-parse", "HEAD"]).strip()
+            with patch.dict(os.environ, repeat_env, clear=True):
+                for index, job in enumerate((validation_job, release_job)):
+                    os.environ["RELEASE_LOG_DIR"] = str(directory / f"repeat-dispatch-{index}")
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c",
+                                             shell_step("Validate pipeline and release target", job)],
+                                            capture_output=True, text=True, timeout=60)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("A release tag already exists remotely", result.stderr)
+            self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
+
+            # The existing publication helper can complete GitHub release
+            # creation after a successful push, without another workflow mode.
             published.unlink()
-            os.environ.update(RELEASE_PUBLISH_EXISTING="true", RELEASE_RECOVERY_BASE=baseline,
-                              GITHUB_SHA=signing.run(["git", "rev-parse", "HEAD"]).strip(),
-                              GITHUB_WORKFLOW_REF=("scylladb/alternator-client-golang/.github/workflows/"
-                                                   "release.yml@refs/heads/main"))
-            # Recovery retains the original version even though its tag now exists.
-            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
-            self.assertEqual(Path(os.environ["GITHUB_ENV"]).read_text().splitlines()[-1], "RELEASE_VERSION=v1.0.7")
             ref = "refs/tags/shared/v1.0.7"
             original_object = signing.run(["git", "rev-parse", ref]).strip()
             different_object = signing.run(["git", "rev-parse", "refs/tags/sdkv1/v1.0.7"]).strip()
-            self.assertNotEqual(original_object, different_object)
-            self.assertEqual(signing.run(["git", "rev-parse", ref + "^{commit}"]),
-                             signing.run(["git", "rev-parse", "refs/tags/sdkv1/v1.0.7^{commit}"]))
             try:
-                # Change only the remote tag object, preserving its commit target.
                 signing.run(["git", "--git-dir", str(remote), "update-ref", ref, different_object])
-                mismatched = signing.run(["git", "ls-remote", "origin"])
-                for job, name in ((validation_job, "Validate pipeline and release target"),
-                                  (release_job, "Publish verified release")):
-                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell_step(name, job)],
-                                            capture_output=True, text=True, timeout=60)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("Recovery requires the complete original branch and tag objects remotely", result.stderr)
+                result = subprocess.run([sys.executable, "scripts/release/pipeline.py", "publish-release"],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Published tag objects must match", result.stderr)
                 self.assertFalse(published.exists())
-                self.assertEqual(signing.run(["git", "ls-remote", "origin"]), mismatched)
             finally:
                 signing.run(["git", "--git-dir", str(remote), "update-ref", ref, original_object])
-            self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
-            shutil.rmtree(logs)  # Retry uses another fresh runner.
-            with patch.dict(os.environ, {"RELEASE_LOG_DIR": str(directory / "recovery-validation-logs")}):
-                signing.run(["bash", "-euo", "pipefail", "-c",
-                             shell_step("Validate pipeline and release target", validation_job)])
-            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Validate pipeline and release target")])
-            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Publish verified release")])
+            signing.run([sys.executable, "scripts/release/pipeline.py", "publish-release"])
             self.assertTrue(published.exists())
             self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
 
@@ -1018,7 +1011,7 @@ class SigningTests(unittest.TestCase):
                 executable.chmod(0o700)
             env = {name: value for name, value in os.environ.items()
                    if not name.startswith("RELEASE_GPG_") and name not in ("GH_TOKEN", "GITHUB_TOKEN", "GNUPGHOME")}
-            env.update(GITHUB_SHA=baseline, RELEASE_PUBLISH_EXISTING="false", RELEASE_VERSION="v1.2.0",
+            env.update(GITHUB_SHA=baseline, RELEASE_VERSION="v1.2.0",
                        RELEASE_LOG_DIR=str(directory / "preview-logs"),
                        GITHUB_STEP_SUMMARY=str(directory / "preview-summary"),
                        GITHUB_WORKFLOW_REF=("scylladb/alternator-client-golang/.github/workflows/"

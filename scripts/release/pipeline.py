@@ -36,7 +36,7 @@ def next_version():
 
 
 def select_version():
-    if not os.environ.get("RELEASE_VERSION") and os.environ.get("RELEASE_PUBLISH_EXISTING") != "true":
+    if not os.environ.get("RELEASE_VERSION"):
         os.environ["RELEASE_VERSION"] = next_version()
     release_version = version()
     with Path(os.environ["GITHUB_ENV"]).open("a") as output:
@@ -187,23 +187,6 @@ def preview():
         output.write("```text\n" + changes + "```\n")
 
 
-def check_recovery():
-    release_version = check_context()
-    signing.verify_release(release_version)
-    head = signing.run(["git", "rev-parse", "HEAD"]).strip()
-    if head != os.environ.get("GITHUB_SHA"):
-        raise signing.SigningError("Recovery checkout must match the dispatched main commit.")
-    expected = {"refs/heads/main": head}
-    for prefix in ("", "shared/", "sdkv1/", "sdkv2/"):
-        ref = "refs/tags/" + prefix + release_version
-        expected[ref] = signing.run(["git", "rev-parse", ref]).strip()
-    rows = signing.run(["git", "ls-remote", "--refs", "origin", *expected]).splitlines()
-    actual = {ref: value for value, ref in (row.split() for row in rows)}
-    if actual != expected:
-        raise signing.SigningError("Recovery requires the complete original branch and tag objects remotely; no refs will be changed.")
-    existing_release(release_version)
-
-
 def summary():
     release_version = version()
     signing.verify_release(release_version)
@@ -238,14 +221,12 @@ def main():
                 raise signing.SigningError("Checkout must match the dispatched main commit.")
         elif sys.argv[1:] == ["check-publication"]:
             check_publication()
-        elif sys.argv[1:] == ["check-recovery"]:
-            check_recovery()
         elif sys.argv[1:] == ["publish-release"]:
             publish_release()
         elif sys.argv[1:] == ["summary"]:
             summary()
         else:
-            raise signing.SigningError("Expected select-version, check-preview, preview, check-environment, check, check-publication, check-recovery, publish-release, or summary.")
+            raise signing.SigningError("Expected select-version, check-preview, preview, check-environment, check, check-publication, publish-release, or summary.")
         return 0
     except signing.SigningError as error:
         print(str(error), file=sys.stderr)
