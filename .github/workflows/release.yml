@@ -4,20 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       release-version:
+        description: 'Version to release, e.g. v1.1.0; leave empty for the next patch'
         required: false
         type: string
         default: ''
-        description: 'Version override, or empty for the next patch; recovery requires the original version'
-      publish-existing:
-        required: false
-        type: boolean
-        default: false
-        description: 'Recover GitHub release creation after an earlier successful atomic push'
-      release-base:
-        required: false
-        type: string
-        default: ''
-        description: 'Recovery only: original baseline SHA from the failed run'
 
 permissions:
   contents: read
@@ -38,7 +28,6 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       GOTOOLCHAIN: local
       RELEASE_VERSION: ${{ inputs.release-version }}
-      RELEASE_PUBLISH_EXISTING: ${{ inputs.publish-existing }}
     steps:
       - name: Checkout validation source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,24 +51,12 @@ jobs:
       - name: Validate pipeline and release target
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_RECOVERY_BASE: ${{ inputs.release-base }}
-        run: |
-          # Variables in the script are expanded by the child Bash process.
-          # shellcheck disable=SC2016
-          python3 scripts/release/capture.py target bash -euo pipefail -c '
-            if [ "$RELEASE_PUBLISH_EXISTING" = true ]; then
-              export RELEASE_BASE_COMMIT="$RELEASE_RECOVERY_BASE"
-              python3 scripts/release/pipeline.py check-recovery
-            else
-              python3 scripts/release/pipeline.py check
-            fi
-          '
+        run: python3 scripts/release/capture.py target python3 scripts/release/pipeline.py check
 
       - name: Test release tooling
         run: python3 scripts/release/capture.py tool-tests make test-release-signing
 
       - name: Build, lint, and test
-        if: inputs.publish-existing == false
         run: python3 scripts/release/capture.py validation make build check test-unit test-integration
 
       - name: Upload sanitized validation logs
@@ -103,7 +80,6 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       GOTOOLCHAIN: local
       RELEASE_VERSION: ${{ inputs.release-version }}
-      RELEASE_PUBLISH_EXISTING: ${{ inputs.publish-existing }}
     steps:
       - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -127,25 +103,17 @@ jobs:
       - name: Validate pipeline and release target
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_RECOVERY_BASE: ${{ inputs.release-base }}
         run: |
           # Variables in the script are expanded by the child Bash process.
           # shellcheck disable=SC2016
           python3 scripts/release/capture.py target bash -euo pipefail -c '
-            if [ "$RELEASE_PUBLISH_EXISTING" = true ]; then
-              export RELEASE_BASE_COMMIT="$RELEASE_RECOVERY_BASE"
-              python3 scripts/release/pipeline.py check-recovery
-              baseline=$RELEASE_BASE_COMMIT
-            else
-              python3 scripts/release/pipeline.py check
-              baseline=$(git rev-parse HEAD)
-            fi
+            python3 scripts/release/pipeline.py check
+            baseline=$(git rev-parse HEAD)
             echo "RELEASE_BASE_COMMIT=$baseline" >> "$GITHUB_ENV"
           '
 
       - name: Prepare signed release
         id: prepare
-        if: inputs.publish-existing == false
         env:
           RELEASE_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           RELEASE_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
@@ -169,17 +137,13 @@ jobs:
           # Variables in the script are expanded by the child Bash process.
           # shellcheck disable=SC2016
           python3 scripts/release/capture.py publish bash -euo pipefail -c '
-            if [ "$RELEASE_PUBLISH_EXISTING" = true ]; then
-              python3 scripts/release/pipeline.py check-recovery
-            else
-              python3 scripts/release/pipeline.py check-publication
-              make push-release-commits
-            fi
+            python3 scripts/release/pipeline.py check-publication
+            make push-release-commits
             python3 scripts/release/pipeline.py publish-release
           '
 
       - name: Record release result
-        if: always() && (steps.prepare.outcome == 'success' || inputs.publish-existing == true)
+        if: always() && steps.prepare.outcome == 'success'
         env:
           RELEASE_PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
         run: python3 scripts/release/capture.py summary python3 scripts/release/pipeline.py summary

@@ -48,11 +48,10 @@ class PipelineTests(unittest.TestCase):
                 pipeline.next_version()
 
     def test_selected_version_is_exported_and_reported_before_approval(self):
-        for recovery, requested in ((False, ""), (False, "v1.2.0"), (False, "v1.2.0-rc.1"), (True, "v1.0.7")):
-            with self.subTest(recovery=recovery, requested=requested), tempfile.TemporaryDirectory() as temp:
+        for requested in ("", "v1.2.0", "v1.2.0-rc.1"):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temp:
                 env_file, summary = Path(temp) / "env", Path(temp) / "summary"
-                env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
-                       "RELEASE_VERSION": requested,
+                env = {"RELEASE_VERSION": requested,
                        "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(summary)}
                 with patch.dict(os.environ, env, clear=True), \
                         patch.object(signing, "run", return_value="v1.0.99\n") as run, \
@@ -63,25 +62,17 @@ class PipelineTests(unittest.TestCase):
                 self.assertIn(f"Selected release version: `{expected}`", summary.read_text())
                 self.assertEqual(run.call_count, 0 if requested else 1)
 
-    def test_recovery_requires_an_explicit_version_without_calculating_a_patch(self):
-        with patch.dict(os.environ, {"RELEASE_VERSION": "", "RELEASE_PUBLISH_EXISTING": "true"}), \
-                patch.object(signing, "run") as run, self.assertRaises(signing.SigningError):
-            pipeline.select_version()
-        run.assert_not_called()
-
     def test_invalid_selected_versions_are_not_exported(self):
-        for recovery in (False, True):
-            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temp:
-                env_file = Path(temp) / "env"
-                env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
-                       "RELEASE_VERSION": "v1.0.7\nINJECTED=true",
-                       "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(Path(temp) / "summary")}
-                with patch.dict(os.environ, env, clear=True), \
-                        patch.object(signing, "run") as run, \
-                        self.assertRaises(signing.SigningError):
-                    pipeline.select_version()
-                self.assertFalse(env_file.exists())
-                run.assert_not_called()
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / "env"
+            env = {"RELEASE_VERSION": "v1.0.7\nINJECTED=true",
+                   "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(Path(temp) / "summary")}
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(signing, "run") as run, \
+                    self.assertRaises(signing.SigningError):
+                pipeline.select_version()
+            self.assertFalse(env_file.exists())
+            run.assert_not_called()
 
     def test_dry_run_is_independent_of_credentialed_release_workflows(self):
         live = (ROOT / ".github/workflows/release.yml").read_text()
@@ -91,6 +82,11 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("      release-version:\n", workflow)
             self.assertIn("        required: false\n", workflow)
             self.assertIn("        default: ''\n", workflow)
+            inputs = workflow.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+            self.assertEqual([line.strip() for line in inputs.splitlines()
+                              if line.startswith("      ") and not line.startswith("        ")],
+                             ["release-version:"])
+            self.assertIn("e.g. v1.1.0; leave empty for the next patch", inputs)
         self.assertNotIn("    uses: ./.github/workflows/", live)
         self.assertIn("      RELEASE_VERSION: ${{ inputs.release-version }}", live)
         self.assertIn("      RELEASE_VERSION: ${{ inputs.release-version }}", dry)
@@ -102,8 +98,6 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("pipeline.py check-preview", dry)
         self.assertIn("pipeline.py preview", dry)
         self.assertIn("make build check test-unit test-integration", dry)
-        self.assertIn("      publish-existing:\n        required: false\n        type: boolean\n        default: false", live)
-        self.assertIn("      release-base:\n        required: false\n        type: string\n        default: ''", live)
         self.assertNotIn("  workflow_call:", live)
         self.assertEqual({path.name for path in (ROOT / ".github/workflows").glob("release*.yml")},
                          {"release.yml", "release-dry-run.yml"})
@@ -224,50 +218,6 @@ class PipelineTests(unittest.TestCase):
                         pipeline.check_publication()
                 else:
                     pipeline.check_publication()
-
-    def test_recovery_reuses_matching_release_and_fails_closed_on_conflicts_or_api_errors(self):
-        head = "a" * 40
-        version = "v1.0.7"
-        refs = {"refs/heads/main": head}
-        refs.update({"refs/tags/" + prefix + version: str(index) * 40
-                     for index, prefix in enumerate(("", "shared/", "sdkv1/", "sdkv2/"), 1)})
-        def run(command):
-            if command[:2] == ["git", "rev-parse"]:
-                return head if command[2] == "HEAD" else refs[command[2]]
-            self.assertEqual(command[:4], ["git", "ls-remote", "--refs", "origin"])
-            return "\n".join(value + "\t" + ref for ref, value in remote_refs.items())
-        cases = [("matching", result) for result in
-                 ([[]], [[{"tag_name": version, "draft": False, "name": version, "prerelease": False}]],
-                  [[], [{"tag_name": version, "draft": True}]], signing.SigningError("API unavailable"))]
-        cases.extend((failure, [[]]) for failure in ("missing-main", "changed-main", "missing-tag", "changed-tag"))
-        for dry_run in ("true", "false"):
-            for remote_state, result in cases:
-                remote_refs = dict(refs)
-                if remote_state != "matching":
-                    ref = "refs/heads/main" if remote_state.endswith("main") else "refs/tags/shared/" + version
-                    if remote_state.startswith("missing"):
-                        del remote_refs[ref]
-                    else:
-                        remote_refs[ref] = "b" * 40
-                with self.subTest(dry_run=dry_run, remote_state=remote_state, result=result), \
-                        patch.dict(os.environ, {"GITHUB_SHA": head, "RELEASE_DRY_RUN": dry_run}), \
-                        patch.object(pipeline, "check_context", return_value=version), \
-                        patch.object(signing, "verify_release"), patch.object(signing, "run", side_effect=run), \
-                        patch.object(pipeline, "api", side_effect=result if isinstance(result, Exception) else None,
-                                     return_value=result) as api:
-                    if remote_state != "matching":
-                        with self.assertRaisesRegex(signing.SigningError,
-                                                    "Recovery requires the complete original branch and tag objects remotely"):
-                            pipeline.check_recovery()
-                        api.assert_not_called()
-                        continue
-                    if result == [[]] or (not isinstance(result, Exception) and result[0]):
-                        pipeline.check_recovery()
-                    else:
-                        with self.assertRaisesRegex(signing.SigningError,
-                                                    "API unavailable" if isinstance(result, Exception) else "release already exists"):
-                            pipeline.check_recovery()
-                    api.assert_called_once_with("releases?per_page=100", paginate=True)
 
     def test_note_publication_verifies_remote_tags_and_preserves_existing_release(self):
         for version in ("v1.0.7", "v1.0.7-rc.1"):
@@ -400,7 +350,7 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(list(steps).index("Verify prepared history with public key only"),
                         list(steps).index("Publish verified release"))
 
-    def test_workflow_validation_success_precedes_approval_in_all_modes(self):
+    def test_workflow_validation_success_precedes_approval(self):
         text = (ROOT / ".github/workflows/release.yml").read_text()
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
@@ -414,29 +364,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("capture.py tool-tests make test-release-signing", steps["Test release tooling"])
         self.assertNotIn("        if:", steps["Test release tooling"])
         self.assertIn("capture.py validation make build check test-unit test-integration", steps["Build, lint, and test"])
-        conditions = {name: next(line[12:] for line in steps[name].splitlines() if line.startswith("        if: "))
-                      for name in ("Build, lint, and test", "Prepare signed release")}
+        for name in ("Build, lint, and test", "Prepare signed release"):
+            self.assertNotIn("        if:", steps[name])
         # Evaluate the actual simple boolean predicates, not a job scheduler.
         def evaluate(expression, values):
             for name, value in values.items():
                 expression = expression.replace(name, repr(value))
             return eval(expression.replace("&&", " and ").replace("false", "False"), {"__builtins__": {}})
-        for recovery in (False, True):
-            values = {"inputs.publish-existing": recovery}
-            with self.subTest(recovery=recovery):
-                self.assertEqual(evaluate(conditions["Build, lint, and test"], values), not recovery)
-                self.assertEqual(evaluate(conditions["Prepare signed release"], values), not recovery)
-                for result in ("success", "failure", "cancelled", "skipped"):
-                    for ref in ("refs/heads/main", "refs/heads/other"):
-                        self.assertEqual(evaluate(predicate, {**values, "github.ref": ref,
-                                                              "needs.validation.result": result}),
-                                         result == "success" and ref == "refs/heads/main")
+        for result in ("success", "failure", "cancelled", "skipped"):
+            for ref in ("refs/heads/main", "refs/heads/other"):
+                self.assertEqual(evaluate(predicate, {"github.ref": ref, "needs.validation.result": result}),
+                                 result == "success" and ref == "refs/heads/main")
         self.assertIn("    if: github.ref == 'refs/heads/main'\n", validation)
         target = validation.split("      - name: Validate pipeline and release target\n", 1)[1].split("      - name:", 1)[0]
         self.assertNotIn("        if:", target)
-        self.assertIn("capture.py target bash -euo pipefail", target)
-        self.assertIn("pipeline.py check-recovery", target)
-        self.assertIn("pipeline.py check\n", target)
+        self.assertIn("capture.py target python3 scripts/release/pipeline.py check\n", target)
         self.assertLess(validation.index("name: Validate pipeline and release target"),
                         validation.index("name: Test release tooling"))
 
