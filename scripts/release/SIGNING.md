@@ -13,8 +13,9 @@ gh workflow run release.yml --ref main -f release-version=v1.0.7 -F dry-run=true
 
 After a successful rehearsal, dispatch the intended version with `dry-run=false`.
 Each dispatch first runs validation on a separate runner with read-only repository
-access, no release environment, and no signing or publication credentials. Only
-successful validation makes the protected release job eligible for approval;
+access, no release environment, and no signing or publication credentials. It
+checks the live approval configuration and release target before running tests.
+Only successful validation makes the protected release job eligible for approval;
 failed, cancelled, or skipped validation prevents that job and its approval request.
 This ordering also applies to dry runs and recovery.
 A member of `scylladb/drivers` other than the triggering operator must approve
@@ -26,8 +27,19 @@ The workflow accepts new versions from `main`; historical retagging is unsupport
 
 The repository's `release` deployment environment requires the `drivers` team
 (ID `8797733`), prevents self-review, disables administrator bypass, and permits
-only the `main` branch. `pipeline.py` checks these settings before preparation
-and again before publication. Repository access and environment approval authorize
+only the `main` branch. `pipeline.py` checks these settings before requesting approval,
+again before preparation, and again before publication. Validation has Actions read
+permission to inspect the remote configuration. It reports every mismatched setting
+and fails closed when the environment or branch policies cannot be read.
+Check the live configuration independently, without a version or signing secrets:
+
+```sh
+python3 scripts/release/pipeline.py check-environment
+```
+
+This uses the current `gh` authentication and reads the configuration of
+`scylladb/alternator-client-golang`; it does not change any settings.
+Repository access and environment approval authorize
 operators. Actor names do not select the signing key. Workflow context checks
 route Make calls through this pipeline; environment variables alone cannot prove
 that GitHub granted deployment approval.
@@ -64,9 +76,15 @@ instead of switching toolchains automatically. Runner images, pinned Actions,
 release helpers, and installed tools remain trusted. Filtered `go mod tidy` and
 `go mod edit` remain part of trusted manifest preparation.
 
-The release job validates environment protections, version syntax, the dispatched source
-commit, the current remote `main` tip, and absence of all four remote version tags
-and an existing GitHub release before importing signing credentials.
+Before approval, validation checks environment protections, version syntax, the
+dispatched source commit, the current remote `main` tip, and absence of all four
+remote version tags and an existing GitHub release. Recovery instead verifies the supplied baseline,
+prepared signatures, matching remote branch and tag objects, and release metadata.
+The protected release job repeats these checks before importing signing credentials
+because configuration and remote state can change while approval is pending.
+Signing-key and passphrase validation and signed history preparation require the
+approved job's environment secrets. Verification of the newly prepared history
+follows preparation in that job using only the public key.
 
 The workflow records the original commit as `RELEASE_BASE_COMMIT` before
 preparation and retains it across steps. Dependency tidying strips signing inputs
@@ -111,8 +129,8 @@ descendants even when they create separate sessions, then reaps them before exit
 them completely before printing or writing logs. Redaction covers raw credentials,
 armored key lines, base64, URL encoding, JSON escapes, and shell quoting. Raw output
 is never spooled to disk. Overflow or cancellation discards incomplete output.
-Git tracing is rejected. Validation uploads separate tool-test and project-test
-logs; release uploads target checks, preparation, verification, publication/recovery,
+Git tracing is rejected. Validation uploads separate target-check, tool-test and
+project-test logs; release uploads target checks, preparation, verification, publication/recovery,
 and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
 failure preserves an existing nonzero command status.
 

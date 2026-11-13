@@ -32,18 +32,40 @@ def api(path, paginate=False):
 
 
 def check_environment(environment, policies):
+    problems = []
     reviewers = [rule for rule in environment.get("protection_rules", [])
                  if rule.get("type") == "required_reviewers"]
-    if (environment.get("can_admins_bypass") is not False
-            or len(reviewers) != 1 or reviewers[0].get("prevent_self_review") is not True
-            or [(row.get("type"), row.get("reviewer", {}).get("id"))
-                for row in reviewers[0].get("reviewers", [])] != [("Team", APPROVAL_TEAM)]
-            or environment.get("deployment_branch_policy") != {
-                "protected_branches": False, "custom_branch_policies": True}
-            or policies.get("total_count") != 1
+    if environment.get("can_admins_bypass") is not False:
+        problems.append("Disable administrator bypass (can_admins_bypass=false).")
+    if len(reviewers) != 1:
+        problems.append("Configure exactly one required-reviewers rule.")
+    else:
+        if reviewers[0].get("prevent_self_review") is not True:
+            problems.append("Enable Prevent self-review (prevent_self_review=true).")
+        if [(row.get("type"), row.get("reviewer", {}).get("id"))
+                for row in reviewers[0].get("reviewers", [])] != [("Team", APPROVAL_TEAM)]:
+            problems.append(f"Set required reviewers to only scylladb/drivers (Team ID {APPROVAL_TEAM}).")
+    if environment.get("deployment_branch_policy") != {
+            "protected_branches": False, "custom_branch_policies": True}:
+        problems.append("Use selected deployment branches and tags (custom_branch_policies=true, protected_branches=false).")
+    if (policies.get("total_count") != 1
             or [(row.get("name"), row.get("type")) for row in policies.get("branch_policies", [])]
                 != [("main", "branch")]):
-        raise signing.SigningError("Release environment must require drivers approval, prevent self-review and admin bypass, and permit only main.")
+        problems.append("Allow only the main branch in deployment branch policies, with no tag rules.")
+    if problems:
+        raise signing.SigningError("Release environment approval configuration is invalid:\n"
+                                   + "\n".join("- " + problem for problem in problems)
+                                   + f"\nSettings: https://github.com/{REPOSITORY}/settings/environments")
+
+
+def check_remote_environment():
+    try:
+        environment = api("environments/release")
+        policies = api("environments/release/deployment-branch-policies")
+    except signing.SigningError:
+        raise signing.SigningError("Unable to read the remote release environment or deployment branch policies. "
+                                   "Confirm the environment exists and the token has Actions read access.") from None
+    check_environment(environment, policies)
 
 
 def check_context():
@@ -51,7 +73,7 @@ def check_context():
     signing.run(["make", "release-check-version", "version=" + release_version])
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise signing.SigningError("Release pipeline must run in its own repository.")
-    check_environment(api("environments/release"), api("environments/release/deployment-branch-policies"))
+    check_remote_environment()
     return release_version
 
 
@@ -141,7 +163,10 @@ def summary():
 
 def main():
     try:
-        if sys.argv[1:] == ["check"]:
+        if sys.argv[1:] == ["check-environment"]:
+            check_remote_environment()
+            print("Remote release approval configuration is valid.")
+        elif sys.argv[1:] == ["check"]:
             check_publication()
             if signing.run(["git", "rev-parse", "HEAD"]).strip() != os.environ["GITHUB_SHA"]:
                 raise signing.SigningError("Checkout must match the dispatched main commit.")
@@ -154,7 +179,7 @@ def main():
         elif sys.argv[1:] == ["summary"]:
             summary()
         else:
-            raise signing.SigningError("Expected check, check-publication, check-recovery, publish-release, or summary.")
+            raise signing.SigningError("Expected check-environment, check, check-publication, check-recovery, publish-release, or summary.")
         return 0
     except signing.SigningError as error:
         print(str(error), file=sys.stderr)

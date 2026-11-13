@@ -1,7 +1,7 @@
 """Check release deployment policy, publication guards, and credential-safe logs."""
 
 import base64
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import os
@@ -65,6 +65,49 @@ class PipelineTests(unittest.TestCase):
                          {"total_count": 2, "branch_policies": branch_policies()["branch_policies"]}]:
             with self.subTest(policies=policies), self.assertRaises(signing.SigningError):
                 pipeline.check_environment(protected_environment(), policies)
+
+    def test_environment_reports_all_settings_that_need_correction(self):
+        environment = protected_environment()
+        environment["protection_rules"][0].update(
+            prevent_self_review=False, reviewers=[{"type": "User", "reviewer": {"id": 40304587}}])
+        with self.assertRaises(signing.SigningError) as failure:
+            pipeline.check_environment(environment, branch_policies())
+        message = str(failure.exception)
+        self.assertIn("Enable Prevent self-review", message)
+        self.assertIn("only scylladb/drivers (Team ID 8797733)", message)
+        self.assertNotIn("Disable administrator bypass", message)
+        self.assertNotIn("Allow only the main branch", message)
+        self.assertIn("https://github.com/" + pipeline.REPOSITORY + "/settings/environments", message)
+
+    def test_remote_environment_command_needs_no_version_or_signing_credentials(self):
+        for state in ("valid", "invalid", "environment-unavailable", "policies-unavailable"):
+            environment = protected_environment()
+            if state == "invalid":
+                environment["can_admins_bypass"] = True
+            def api(path):
+                if path == "environments/release":
+                    if state == "environment-unavailable":
+                        raise signing.SigningError("API failed")
+                    return environment
+                self.assertEqual(path, "environments/release/deployment-branch-policies")
+                if state == "policies-unavailable":
+                    raise signing.SigningError("API failed")
+                return branch_policies()
+            output, errors = StringIO(), StringIO()
+            with self.subTest(state=state), patch.dict(os.environ, {}, clear=True), \
+                    patch("sys.argv", ["pipeline.py", "check-environment"]), \
+                    patch.object(pipeline, "api", side_effect=api), patch.object(signing, "run") as run, \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(pipeline.main(), 0 if state == "valid" else 1)
+                run.assert_not_called()
+            if state == "valid":
+                self.assertIn("Remote release approval configuration is valid", output.getvalue())
+                self.assertEqual(errors.getvalue(), "")
+            elif state == "invalid":
+                self.assertIn("Disable administrator bypass", errors.getvalue())
+            else:
+                self.assertIn("Unable to read the remote release environment", errors.getvalue())
+                self.assertIn("Actions read access", errors.getvalue())
 
     def test_publication_rejects_stale_main_existing_tags_and_releases(self):
         baseline = "a" * 40
@@ -232,10 +275,14 @@ class PipelineTests(unittest.TestCase):
         release = text.split("\n  release:\n", 1)[1]
         validation_header = validation.split("    steps:\n", 1)[0]
         release_header = release.split("    steps:\n", 1)[0]
-        self.assertIn("    permissions:\n      contents: read\n", validation_header)
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n", validation_header)
         self.assertNotIn("write", validation_header)
-        for forbidden in ("environment:", "secrets.", "GH_TOKEN", "needs:"):
+        for forbidden in ("environment:", "secrets.", "needs:"):
             self.assertNotIn(forbidden, validation)
+        validation_steps = {block.split("\n", 1)[0]: block.split("\n", 1)[1]
+                            for block in validation.split("      - name: ")[1:]}
+        for name, block in validation_steps.items():
+            self.assertEqual("GH_TOKEN:" in block, name == "Validate pipeline and release target", name)
         self.assertIn("    environment: release\n", release_header)
         self.assertIn("    permissions:\n      contents: write\n      actions: read\n", release_header)
         self.assertIn("      GOTOOLCHAIN: local\n", release_header)
@@ -302,6 +349,13 @@ class PipelineTests(unittest.TestCase):
                                                               "needs.validation.result": result}),
                                          result == "success" and ref == "refs/heads/main")
         self.assertIn("    if: github.ref == 'refs/heads/main'\n", validation)
+        target = validation.split("      - name: Validate pipeline and release target\n", 1)[1].split("      - name:", 1)[0]
+        self.assertNotIn("        if:", target)
+        self.assertIn("capture.py target bash -euo pipefail", target)
+        self.assertIn("pipeline.py check-recovery", target)
+        self.assertIn("pipeline.py check\n", target)
+        self.assertLess(validation.index("name: Validate pipeline and release target"),
+                        validation.index("name: Test release tooling"))
 
 
 class CaptureTests(unittest.TestCase):

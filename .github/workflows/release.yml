@@ -33,8 +33,12 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
     env:
       PYTHONDONTWRITEBYTECODE: '1'
+      GOTOOLCHAIN: local
+      RELEASE_VERSION: ${{ inputs.release-version }}
+      RELEASE_PUBLISH_EXISTING: ${{ inputs.publish-existing }}
     steps:
       - name: Checkout validation source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,6 +55,20 @@ jobs:
         with:
           go-version-file: go.work
           cache-dependency-path: '**/go.sum'
+
+      - name: Validate pipeline and release target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RECOVERY_BASE: ${{ inputs.release-base }}
+        run: |
+          python3 scripts/release/capture.py target bash -euo pipefail -c '
+            if [ "$RELEASE_PUBLISH_EXISTING" = true ]; then
+              export RELEASE_BASE_COMMIT="$RELEASE_RECOVERY_BASE"
+              python3 scripts/release/pipeline.py check-recovery
+            else
+              python3 scripts/release/pipeline.py check
+            fi
+          '
 
       - name: Test release tooling
         run: python3 scripts/release/capture.py tool-tests make test-release-signing

@@ -828,13 +828,14 @@ class SigningTests(unittest.TestCase):
     def test_pipeline_prepares_verifies_and_publishes_without_local_inputs(self):
         from test_pipeline import protected_environment, branch_policies
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        validation_job = workflow.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release_job = workflow.split("\n  release:\n", 1)[1]
         header = release_job.split("    steps:\n", 1)[0]
         # Read only this job's inputs; validation supplies no environment or tools.
         job_env = dict(line.strip().split(": ", 1) for line in header.split("    env:\n", 1)[1].splitlines())
-        steps = {block.split("\n", 1)[0]: block.split("\n", 1)[1]
-                 for block in release_job.split("      - name: ")[1:]}
-        def shell_step(name):
+        def shell_step(name, job=release_job):
+            steps = {block.split("\n", 1)[0]: block.split("\n", 1)[1]
+                     for block in job.split("      - name: ")[1:]}
             script = steps[name].split("        run: ", 1)[1]
             if not script.startswith("|\n"):
                 return script.splitlines()[0]
@@ -870,7 +871,10 @@ class SigningTests(unittest.TestCase):
             gh.write_text("#!/usr/bin/env python3\nimport json, os, pathlib, sys\n"
                           "args=sys.argv[1:]\nif args[0]=='api':\n"
                           "    path=args[1]\n"
-                          "    if path.endswith('/environments/release'): print(" + repr(json.dumps(protected_environment())) + ")\n"
+                          "    if path.endswith('/environments/release'):\n"
+                          "        environment=json.loads(" + repr(json.dumps(protected_environment())) + ")\n"
+                          "        if os.environ.get('INVALID_APPROVAL'): environment['protection_rules'][0]['prevent_self_review']=False\n"
+                          "        print(json.dumps(environment))\n"
                           "    elif path.endswith('/deployment-branch-policies'): print(" + repr(json.dumps(branch_policies())) + ")\n"
                           "    elif '/releases?' in path: print('[[]]')\n"
                           "    else: sys.exit(9)\n"
@@ -897,6 +901,26 @@ class SigningTests(unittest.TestCase):
             git.chmod(0o700)
             config_before = Path(".git/config").read_bytes()
             global_before = Path(os.environ["GIT_CONFIG_GLOBAL"]).read_bytes()
+            # Run the actual pre-approval shell without signing inputs or a saved
+            # baseline. It must derive the baseline from the dispatch instead.
+            validation_env = {key: value for key, value in os.environ.items()
+                              if not key.startswith("RELEASE_GPG_") and key != "RELEASE_BASE_COMMIT"}
+            validation_env["RELEASE_LOG_DIR"] = str(directory / "validation-logs")
+            with patch.dict(os.environ, validation_env, clear=True):
+                signing.run(["bash", "-euo", "pipefail", "-c",
+                             shell_step("Validate pipeline and release target", validation_job)])
+            # A policy failure blocks preflight. A change after a passing preflight
+            # also blocks the protected job before it can prepare signed history.
+            for index, job in enumerate((validation_job, release_job)):
+                with patch.dict(os.environ, {"INVALID_APPROVAL": "1",
+                                             "RELEASE_LOG_DIR": str(directory / f"invalid-approval-{index}")}):
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c",
+                                             shell_step("Validate pipeline and release target", job)],
+                                            capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Enable Prevent self-review", result.stderr)
+                self.assertEqual(signing.run(["git", "rev-parse", "HEAD"]).strip(), baseline)
+                self.assertEqual(signing.run(["git", "ls-remote", "--tags", "origin"]), "")
             for name in ["Validate pipeline and release target", "Prepare signed release"]:
                 signing.run(["bash", "-euo", "pipefail", "-c", shell_step(name)])
             self.assertEqual(signing.run(["git", "ls-remote", "origin", "refs/heads/main"]).split()[0], baseline)
@@ -940,16 +964,21 @@ class SigningTests(unittest.TestCase):
                 # Change only the remote tag object, preserving its commit target.
                 signing.run(["git", "--git-dir", str(remote), "update-ref", ref, different_object])
                 mismatched = signing.run(["git", "ls-remote", "origin"])
-                result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell_step("Publish verified release")],
-                                        capture_output=True, text=True, timeout=60)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Recovery requires the complete original branch and tag objects remotely", result.stderr)
+                for job, name in ((validation_job, "Validate pipeline and release target"),
+                                  (release_job, "Publish verified release")):
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", shell_step(name, job)],
+                                            capture_output=True, text=True, timeout=60)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Recovery requires the complete original branch and tag objects remotely", result.stderr)
                 self.assertFalse(published.exists())
                 self.assertEqual(signing.run(["git", "ls-remote", "origin"]), mismatched)
             finally:
                 signing.run(["git", "--git-dir", str(remote), "update-ref", ref, original_object])
             self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
             shutil.rmtree(logs)  # Retry uses another fresh runner.
+            with patch.dict(os.environ, {"RELEASE_LOG_DIR": str(directory / "recovery-validation-logs")}):
+                signing.run(["bash", "-euo", "pipefail", "-c",
+                             shell_step("Validate pipeline and release target", validation_job)])
             signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Validate pipeline and release target")])
             signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Publish verified release")])
             self.assertTrue(published.exists())
