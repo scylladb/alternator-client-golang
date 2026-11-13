@@ -52,16 +52,19 @@ read-only repository access, no release environment, and no signing or publicati
 credentials. Validation checks the live approval configuration and release target
 before running tests. Only successful validation makes the protected release job
 eligible for approval; failed, cancelled, or skipped validation prevents that job
-and its approval request. A member of `scylladb/drivers` other than the triggering
-operator must approve each deployment. The operator may differ from the publisher signing identity,
+and its approval request. The sole maintainer, `dkropachev`, approves deployments
+and may approve their own runs. The operator may differ from the publisher signing identity,
 including on reruns. No local keys, commits, or tags are required from operators.
 The workflow accepts new versions from `main`; historical retagging is unsupported.
 
 ## Environment and credentials
 
-The repository's `release` deployment environment requires the `drivers` team
-(ID `8797733`), prevents self-review, disables administrator bypass, and permits
-only the `main` branch. `pipeline.py` checks these settings before requesting approval,
+The repository's `release` deployment environment lists only `dkropachev` as a
+required reviewer and allows self-review. The required-reviewer and prevent-self-review
+checks are commented out until other people start working on the repository;
+restore the `drivers` team (ID `8797733`) and prevent self-review at that point.
+The environment disables administrator bypass and permits only the `main` branch.
+`pipeline.py` checks these remaining settings before requesting approval,
 again before preparation, and again before publication. Validation has Actions read
 permission to inspect the remote configuration. It reports every mismatched setting
 and fails closed when the environment or branch policies cannot be read.

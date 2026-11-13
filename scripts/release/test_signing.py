@@ -879,7 +879,7 @@ class SigningTests(unittest.TestCase):
                           "    path=args[1]\n"
                           "    if path.endswith('/environments/release'):\n"
                           "        environment=json.loads(" + repr(json.dumps(protected_environment())) + ")\n"
-                          "        if os.environ.get('INVALID_APPROVAL'): environment['protection_rules'][0]['prevent_self_review']=False\n"
+                          "        if os.environ.get('INVALID_APPROVAL'): environment['can_admins_bypass']=True\n"
                           "        print(json.dumps(environment))\n"
                           "    elif path.endswith('/deployment-branch-policies'): print(" + repr(json.dumps(branch_policies())) + ")\n"
                           "    elif '/releases?' in path: print('[[]]')\n"
@@ -924,7 +924,7 @@ class SigningTests(unittest.TestCase):
                                              shell_step("Validate pipeline and release target", job)],
                                             capture_output=True, text=True, timeout=60)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Enable Prevent self-review", result.stderr)
+                self.assertIn("Disable administrator bypass", result.stderr)
                 self.assertEqual(signing.run(["git", "rev-parse", "HEAD"]).strip(), baseline)
                 self.assertEqual(signing.run(["git", "ls-remote", "--tags", "origin"]), "")
             for name in ["Validate pipeline and release target", "Prepare signed release"]:
