@@ -974,6 +974,25 @@ class SigningTests(unittest.TestCase):
                     self.assertIn("A release tag already exists remotely", result.stderr)
             self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
 
+            # The existing publication helper can complete GitHub release
+            # creation after a successful push, without another workflow mode.
+            published.unlink()
+            ref = "refs/tags/shared/v1.0.7"
+            original_object = signing.run(["git", "rev-parse", ref]).strip()
+            different_object = signing.run(["git", "rev-parse", "refs/tags/sdkv1/v1.0.7"]).strip()
+            try:
+                signing.run(["git", "--git-dir", str(remote), "update-ref", ref, different_object])
+                result = subprocess.run([sys.executable, "scripts/release/pipeline.py", "publish-release"],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Published tag objects must match", result.stderr)
+                self.assertFalse(published.exists())
+            finally:
+                signing.run(["git", "--git-dir", str(remote), "update-ref", ref, original_object])
+            signing.run([sys.executable, "scripts/release/pipeline.py", "publish-release"])
+            self.assertTrue(published.exists())
+            self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
+
     def test_dry_run_prepares_manifests_without_credentials_or_signing(self):
         workflow = (ROOT / ".github/workflows/release-dry-run.yml").read_text()
         steps = {block.split("\n", 1)[0]: block.split("\n", 1)[1]

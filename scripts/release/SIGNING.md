@@ -180,6 +180,20 @@ any version tag already exists. The `v1.0.0`–`v1.0.6` tags are lightweight and
 unsigned, so they fail the new signature verification gate. These existing tags
 remain unchanged; historical retagging is unsupported.
 
+If the refs were pushed but GitHub release creation failed, check out the prepared
+development commit recorded in the failed run's summary. Use the original full
+baseline SHA and selected version from that summary with the publication helper:
+
+```sh
+RELEASE_BASE_COMMIT=ORIGINAL_FULL_BASELINE_SHA RELEASE_VERSION=v1.0.7 \
+  python3 scripts/release/pipeline.py publish-release
+```
+
+This requires GitHub write access through `gh`. It verifies the signed prepared
+history and all four remote tag objects before creating the missing GitHub release.
+It creates no commits or tags and does not push refs. A matching existing release
+keeps its notes and assets. Do not derive the baseline from a release tag's parent.
+
 All accepted versions create ordinary GitHub releases (`prerelease: false`),
 including suffix versions such as `v1.0.7-rc.1`. Publication preserves matching
 ordinary releases and their notes/assets. A release manually marked as a GitHub
