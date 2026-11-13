@@ -17,7 +17,7 @@ classification configuration, release-note documentation,
 Production Go code, module/workspace manifests and checksums, Makefiles, release
 tooling, release validation/publication workflows, unknown paths, licensing and
 mixed PRs stay visible. In particular, `.github/workflows/release.yml`,
-`.github/workflows/release-signing.yml` and `.github/release.yml` do not qualify.
+`.github/workflows/release-dry-run.yml` and `.github/release.yml` do not qualify.
 
 Labeling runs on open, push, reopen, edit and close. Per-PR concurrency serializes
 automatic and manual runs. `sync-labels: true` removes the exclusion label when

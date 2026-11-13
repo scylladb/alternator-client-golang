@@ -459,7 +459,9 @@ secrets or deployment approval. It creates no commits, tags, or release.
 The release workflow validates on a separate runner before requesting approval
 from a member of `scylladb/drivers` other than the triggering operator. Its
 protected job signs and publishes from a fresh runner without validation artifacts
-or caches. Recovery has a [separate workflow](.github/workflows/release-recovery.yml).
+or caches. To recover GitHub release creation after a successful push, use the same
+Release workflow with `publish-existing` enabled and the original `release-version`
+and `release-base` inputs.
 See [release signing](scripts/release/SIGNING.md) for dispatch and recovery instructions.
 
 Generated notes filter support-only PRs through `omit-from-release-notes`. See

@@ -91,24 +91,23 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("      release-version:\n", workflow)
             self.assertIn("        required: false\n", workflow)
             self.assertIn("        default: ''\n", workflow)
-        self.assertIn("uses: ./.github/workflows/release-pipeline.yml", live)
-        self.assertIn("      release-version: ${{ inputs.release-version }}", live)
+        self.assertNotIn("    uses: ./.github/workflows/", live)
+        self.assertIn("      RELEASE_VERSION: ${{ inputs.release-version }}", live)
         self.assertIn("      RELEASE_VERSION: ${{ inputs.release-version }}", dry)
         self.assertIn("  contents: write", live)
         self.assertIn("  contents: read", dry)
         for forbidden in ("secrets.", "environment:", "GH_TOKEN", "GITHUB_TOKEN", "contents: write",
-                          "release-pipeline.yml", "publish-release", "create-release-commits"):
+                          "uses: ./.github/workflows/", "publish-release", "create-release-commits"):
             self.assertNotIn(forbidden, dry)
         self.assertIn("pipeline.py check-preview", dry)
         self.assertIn("pipeline.py preview", dry)
         self.assertIn("make build check test-unit test-integration", dry)
-        recovery = (ROOT / ".github/workflows/release-recovery.yml").read_text()
-        self.assertIn("      publish-existing: true", recovery)
-        shared = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
-        self.assertIn("  workflow_call:\n", shared)
-        self.assertNotIn("  workflow_dispatch:", shared)
-        self.assertNotIn("dry-run", shared)
-        for workflow in (shared, dry):
+        self.assertIn("      publish-existing:\n        required: false\n        type: boolean\n        default: false", live)
+        self.assertIn("      release-base:\n        required: false\n        type: string\n        default: ''", live)
+        self.assertNotIn("  workflow_call:", live)
+        self.assertEqual({path.name for path in (ROOT / ".github/workflows").glob("release*.yml")},
+                         {"release.yml", "release-dry-run.yml"})
+        for workflow in (live, dry):
             self.assertIn("  group: repository-release\n  cancel-in-progress: false", workflow)
 
     def test_version_validation_precedes_make_evaluation_and_api_access(self):
@@ -333,7 +332,7 @@ class PipelineTests(unittest.TestCase):
                     self.assertIn("Inspect remote refs and releases", text)
 
     def test_workflow_clean_checkout_check_fails_closed(self):
-        workflow = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
         step = workflow.split("      - name: Verify prepared history with public key only\n", 1)[1]
         script = step.split("      - name:", 1)[0].split("        run: |\n", 1)[1]
         script = "\n".join(line[10:] for line in script.splitlines())
@@ -351,7 +350,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_release_workflow_scopes_signing_secrets_and_requires_validation(self):
-        text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
+        text = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertNotIn("  push:", text)
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
@@ -402,7 +401,7 @@ class PipelineTests(unittest.TestCase):
                         list(steps).index("Publish verified release"))
 
     def test_workflow_validation_success_precedes_approval_in_all_modes(self):
-        text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
+        text = (ROOT / ".github/workflows/release.yml").read_text()
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
         header = release.split("    steps:\n", 1)[0]
