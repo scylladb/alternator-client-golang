@@ -448,14 +448,18 @@ Use [sdkv2/helper_test.go](sdkv2/helper_test.go) for current examples. [sdkv1/he
 
 ## Releases
 
-Prepare and publish releases through the [Release workflow](.github/workflows/release.yml)
-on `main`. Validation runs first on a separate runner with read-only access and no
-release credentials. Only successful validation permits the signing and publication
-job to request approval from a member of `scylladb/drivers` other than the triggering
-operator, including for dry runs and recovery. The release job uses a fresh runner
-without validation artifacts or caches. Only non-dry runs publish. Start with a
-pipeline dry run. See
-[release signing](scripts/release/SIGNING.md) for dispatch and recovery instructions.
+Start with the [Release dry run workflow](.github/workflows/release-dry-run.yml), then
+publish through the [Release workflow](.github/workflows/release.yml) on `main`.
+Both take no inputs and calculate the next patch from the highest stable root
+version tag (for example, `v1.0.6` becomes `v1.0.7`). The independent dry run uses
+read-only access, runs the tests, and prepares unsigned manifests without release
+secrets or deployment approval. It creates no commits, tags, or release.
+
+The release workflow validates on a separate runner before requesting approval
+from a member of `scylladb/drivers` other than the triggering operator. Its
+protected job signs and publishes from a fresh runner without validation artifacts
+or caches. Recovery has a [separate workflow](.github/workflows/release-recovery.yml).
+See [release signing](scripts/release/SIGNING.md) for dispatch and recovery instructions.
 
 Generated notes filter support-only PRs through `omit-from-release-notes`. See
 [release notes](.github/RELEASE_NOTES.md) for classification and merged-PR backfill.

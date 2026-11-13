@@ -34,6 +34,72 @@ def branch_policies():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_next_version_uses_numeric_stable_root_tags(self):
+        for tags, expected in [
+                ("v1.0.6\nshared/v1.0.99\nsdkv1/v1.2.0\nsdkv2/v1.3.0\nv1.1.0-rc.1\n", "v1.0.7"),
+                ("v1.0.9\nv1.0.10\nv01.5.0\nv1.0.11+build\n", "v1.0.11"),
+                ("v0.99.99\nv1.9.99\nv1.10.0\n", "v1.10.1"),
+                ("v0.1.0\nv0.1.99\n", "v0.1.100")]:
+            with self.subTest(tags=tags), patch.object(signing, "run", return_value=tags):
+                self.assertEqual(pipeline.next_version(), expected)
+        for tags in ("", "shared/v1.0.6\nv1.0.7-rc.1\nv01.0.6\n"):
+            with self.subTest(tags=tags), patch.object(signing, "run", return_value=tags), \
+                    self.assertRaisesRegex(signing.SigningError, "no stable root version"):
+                pipeline.next_version()
+
+    def test_selected_version_is_exported_and_reported_before_approval(self):
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temp:
+                env_file, summary = Path(temp) / "env", Path(temp) / "summary"
+                env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
+                       "RELEASE_VERSION": "v1.0.7" if recovery else "",
+                       "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(summary)}
+                with patch.dict(os.environ, env, clear=True), \
+                        patch.object(signing, "run", return_value="v1.0.99\n") as run, \
+                        redirect_stdout(StringIO()):
+                    pipeline.select_version()
+                expected = "v1.0.7" if recovery else "v1.0.100"
+                self.assertEqual(env_file.read_text(), f"RELEASE_VERSION={expected}\n")
+                self.assertIn(f"Selected release version: `{expected}`", summary.read_text())
+                self.assertEqual(run.call_count, 0 if recovery else 1)
+
+    def test_invalid_selected_versions_are_not_exported(self):
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temp:
+                env_file = Path(temp) / "env"
+                env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
+                       "RELEASE_VERSION": "v1.0.7\nINJECTED=true",
+                       "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(Path(temp) / "summary")}
+                with patch.dict(os.environ, env, clear=True), \
+                        patch.object(signing, "run", return_value="v2.0.0\n"), \
+                        self.assertRaises(signing.SigningError):
+                    pipeline.select_version()
+                self.assertFalse(env_file.exists())
+
+    def test_dry_run_is_independent_of_credentialed_release_workflows(self):
+        live = (ROOT / ".github/workflows/release.yml").read_text()
+        dry = (ROOT / ".github/workflows/release-dry-run.yml").read_text()
+        for workflow in (live, dry):
+            self.assertIn("  workflow_dispatch:\n", workflow)
+            self.assertNotIn("    inputs:", workflow)
+        self.assertIn("uses: ./.github/workflows/release-pipeline.yml", live)
+        self.assertIn("  contents: write", live)
+        self.assertIn("  contents: read", dry)
+        for forbidden in ("secrets.", "environment:", "GH_TOKEN", "GITHUB_TOKEN", "contents: write",
+                          "release-pipeline.yml", "publish-release", "create-release-commits"):
+            self.assertNotIn(forbidden, dry)
+        self.assertIn("pipeline.py check-preview", dry)
+        self.assertIn("pipeline.py preview", dry)
+        self.assertIn("make build check test-unit test-integration", dry)
+        recovery = (ROOT / ".github/workflows/release-recovery.yml").read_text()
+        self.assertIn("      publish-existing: true", recovery)
+        shared = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
+        self.assertIn("  workflow_call:\n", shared)
+        self.assertNotIn("  workflow_dispatch:", shared)
+        self.assertNotIn("dry-run", shared)
+        for workflow in (shared, dry):
+            self.assertIn("  group: repository-release\n  cancel-in-progress: false", workflow)
+
     def test_version_validation_precedes_make_evaluation_and_api_access(self):
         for value in ["$(shell touch injected)", "v1.0.7\nv1.0.8", "v01.0.7", "v1.0.7-01",
                       "v1.0.7; touch injected", "v2.0.0", "v1.0.7+build"]:
@@ -43,6 +109,13 @@ class PipelineTests(unittest.TestCase):
                     pipeline.check_publication()
                 finally:
                     run.assert_not_called()
+
+    def test_preview_rejects_signing_credentials_before_running_commands(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "v1.0.7", "RELEASE_GPG_PASSPHRASE": "secret"}), \
+                patch.object(signing, "run") as run, \
+                self.assertRaisesRegex(signing.SigningError, "without signing credentials"):
+            pipeline.preview()
+        run.assert_not_called()
 
     def test_environment_requires_exact_team_and_ref_protections(self):
         pipeline.check_environment(protected_environment(), branch_policies())
@@ -227,16 +300,14 @@ class PipelineTests(unittest.TestCase):
                     self.assertEqual(len(mutations), int(state == "new"))
 
     def test_summary_reports_publication_outcome(self):
-        for dry_run, outcome, expected in [
-                ("true", "skipped", "Rehearsal verified; no refs or release published"),
-                ("true", None, "Rehearsal verified; no refs or release published"),
-                ("false", "success", "Release published"),
-                ("false", "skipped", "publication skipped"),
-                *(("false", outcome, "publication incomplete or outcome unavailable")
+        for outcome, expected in [
+                ("success", "Release published"),
+                ("skipped", "publication skipped"),
+                *((outcome, "publication incomplete or outcome unavailable")
                   for outcome in ("failure", "cancelled", "", None))]:
-            with self.subTest(dry_run=dry_run, outcome=outcome), tempfile.TemporaryDirectory() as temp:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp:
                 summary = Path(temp) / "summary"
-                env = {"RELEASE_VERSION": "v1.0.7", "RELEASE_DRY_RUN": dry_run,
+                env = {"RELEASE_VERSION": "v1.0.7",
                        "GITHUB_STEP_SUMMARY": str(summary)}
                 if outcome is not None:
                     env["RELEASE_PUBLICATION_OUTCOME"] = outcome
@@ -251,7 +322,7 @@ class PipelineTests(unittest.TestCase):
                     self.assertIn("Inspect remote refs and releases", text)
 
     def test_workflow_clean_checkout_check_fails_closed(self):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        workflow = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         step = workflow.split("      - name: Verify prepared history with public key only\n", 1)[1]
         script = step.split("      - name:", 1)[0].split("        run: |\n", 1)[1]
         script = "\n".join(line[10:] for line in script.splitlines())
@@ -268,8 +339,8 @@ class PipelineTests(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, expected, result.stderr)
 
-    def test_workflow_scopes_signing_secrets_and_limits_publication_to_non_dry_runs(self):
-        text = (ROOT / ".github/workflows/release.yml").read_text()
+    def test_release_workflow_scopes_signing_secrets_and_requires_validation(self):
+        text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         self.assertNotIn("  push:", text)
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
@@ -291,6 +362,9 @@ class PipelineTests(unittest.TestCase):
             checkout = block.split("        uses: actions/checkout@", 1)[1].split("      - name:", 1)[0]
             self.assertIn("          ref: ${{ github.sha }}\n", checkout)
             self.assertIn("          persist-credentials: false\n", checkout)
+            self.assertIn("pipeline.py select-version", block)
+            self.assertLess(block.index("name: Select release version"),
+                            block.index("name: Validate pipeline and release target"))
         for forbidden in ("needs.validation.outputs", "download-artifact", "actions/cache", "cache-dependency-path",
                           "make test-release-signing", "make build", "test-unit", "test-integration"):
             self.assertNotIn(forbidden, release)
@@ -304,7 +378,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual("GH_TOKEN:" in block,
                              name in ("Validate pipeline and release target", "Publish verified release"), name)
         self.assertIn("persist-credentials: false", steps["Checkout release source"])
-        self.assertIn("if: inputs.dry-run == false", steps["Publish verified release"])
+        self.assertNotIn("        if:", steps["Publish verified release"])
         self.assertIn("if: always()", steps["Upload sanitized release logs"])
         self.assertIn("if: always()", validation.split("- name: Upload sanitized validation logs", 1)[1])
         for name, label in [("Validate pipeline and release target", "target"),
@@ -317,7 +391,7 @@ class PipelineTests(unittest.TestCase):
                         list(steps).index("Publish verified release"))
 
     def test_workflow_validation_success_precedes_approval_in_all_modes(self):
-        text = (ROOT / ".github/workflows/release.yml").read_text()
+        text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
         header = release.split("    steps:\n", 1)[0]
@@ -331,18 +405,17 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("        if:", steps["Test release tooling"])
         self.assertIn("capture.py validation make build check test-unit test-integration", steps["Build, lint, and test"])
         conditions = {name: next(line[12:] for line in steps[name].splitlines() if line.startswith("        if: "))
-                      for name in ("Build, lint, and test", "Prepare signed release", "Publish verified release")}
+                      for name in ("Build, lint, and test", "Prepare signed release")}
         # Evaluate the actual simple boolean predicates, not a job scheduler.
         def evaluate(expression, values):
             for name, value in values.items():
                 expression = expression.replace(name, repr(value))
             return eval(expression.replace("&&", " and ").replace("false", "False"), {"__builtins__": {}})
-        for dry_run, recovery in ((False, False), (True, False), (False, True), (True, True)):
-            values = {"inputs.dry-run": dry_run, "inputs.publish-existing": recovery}
-            with self.subTest(dry_run=dry_run, recovery=recovery):
+        for recovery in (False, True):
+            values = {"inputs.publish-existing": recovery}
+            with self.subTest(recovery=recovery):
                 self.assertEqual(evaluate(conditions["Build, lint, and test"], values), not recovery)
                 self.assertEqual(evaluate(conditions["Prepare signed release"], values), not recovery)
-                self.assertEqual(evaluate(conditions["Publish verified release"], values), not dry_run)
                 for result in ("success", "failure", "cancelled", "skipped"):
                     for ref in ("refs/heads/main", "refs/heads/other"):
                         self.assertEqual(evaluate(predicate, {**values, "github.ref": ref,

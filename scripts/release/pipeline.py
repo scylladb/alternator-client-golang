@@ -24,6 +24,28 @@ def version():
     return value
 
 
+def next_version():
+    """Increment the highest stable root tag, ignoring module and prerelease tags."""
+    tags = signing.run(["git", "tag", "--list"]).splitlines()
+    versions = [tuple(map(int, match.groups())) for tag in tags
+                if (match := re.fullmatch(r"v(" + NUMBER + r")\.(" + NUMBER + r")\.(" + NUMBER + r")", tag))]
+    if not versions:
+        raise signing.SigningError("Cannot select the next patch: no stable root version tag exists.")
+    major, minor, patch = max(versions)
+    return f"v{major}.{minor}.{patch + 1}"
+
+
+def select_version():
+    if os.environ.get("RELEASE_PUBLISH_EXISTING") != "true":
+        os.environ["RELEASE_VERSION"] = next_version()
+    release_version = version()
+    with Path(os.environ["GITHUB_ENV"]).open("a") as output:
+        output.write(f"RELEASE_VERSION={release_version}\n")
+    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+        output.write(f"Selected release version: `{release_version}`\n\n")
+    print(f"Selected release version: {release_version}")
+
+
 def api(path, paginate=False):
     command = ["gh", "api", "repos/" + REPOSITORY + "/" + path]
     if paginate:
@@ -113,8 +135,7 @@ def publish_release():
                  "--generate-notes", "--title", release_version])
 
 
-def check_publication():
-    release_version = check_context()
+def check_unpublished_refs(release_version):
     remote = signing.run(["git", "ls-remote", "--exit-code", "origin", "refs/heads/main"]).split()
     baseline = signing.release_baseline(os.environ.get("RELEASE_BASE_COMMIT") or os.environ.get("GITHUB_SHA"))
     if remote != [baseline, "refs/heads/main"]:
@@ -122,7 +143,48 @@ def check_publication():
     tags = ["refs/tags/" + prefix + release_version for prefix in ("", "shared/", "sdkv1/", "sdkv2/")]
     if signing.run(["git", "ls-remote", "--tags", "origin", *tags]).strip():
         raise signing.SigningError("A release tag already exists remotely; inspect publication state before retrying.")
+
+
+def check_publication():
+    release_version = check_context()
+    check_unpublished_refs(release_version)
     check_release_absent(release_version)
+
+
+def check_preview():
+    release_version = version()
+    if any(name.startswith("RELEASE_GPG_") for name in os.environ):
+        raise signing.SigningError("Release preview must run without signing credentials.")
+    if (os.environ.get("GITHUB_REPOSITORY") != REPOSITORY
+            or os.environ.get("GITHUB_REF") != "refs/heads/main"):
+        raise signing.SigningError("Release preview must run from the repository's main branch.")
+    if signing.run(["git", "rev-parse", "HEAD"]).strip() != os.environ["GITHUB_SHA"]:
+        raise signing.SigningError("Checkout must match the dispatched main commit.")
+    if signing.run(["git", "status", "--porcelain"]).strip():
+        raise signing.SigningError("Release preview requires a clean checkout.")
+    check_unpublished_refs(release_version)
+
+
+def preview():
+    """Prepare manifests without loading a key or creating commits or tags."""
+    check_preview()
+    release_version = version()
+    refs_command = ["git", "for-each-ref", "--format=%(refname) %(objectname)"]
+    original_refs = signing.run(refs_command)
+    signing.run(["make", "update-go-mod"])
+    for module in ("sdkv1", "sdkv2"):
+        signing.run(["go", "-C", module, "mod", "edit",
+                     "-require=github.com/scylladb/alternator-client-golang/shared@" + release_version,
+                     "-dropreplace=github.com/scylladb/alternator-client-golang/shared"])
+    signing.run(["git", "diff", "--check"])
+    if (signing.run(refs_command) != original_refs
+            or signing.run(["git", "rev-parse", "HEAD"]).strip() != os.environ["GITHUB_SHA"]):
+        raise signing.SigningError("Release preview must not change commits or refs.")
+    changes = signing.run(["git", "diff", "--stat"])
+    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+        output.write(f"Unsigned release preview prepared: `{release_version}`\n\n")
+        output.write("No signing credentials used; no commits, tags, pushes, or GitHub release created.\n\n")
+        output.write("```text\n" + changes + "```\n")
 
 
 def check_recovery():
@@ -148,8 +210,6 @@ def summary():
     outcome = os.environ.get("RELEASE_PUBLICATION_OUTCOME")
     if outcome == "success":
         mode = "Release published"
-    elif outcome in (None, "", "skipped") and os.environ["RELEASE_DRY_RUN"] == "true":
-        mode = "Rehearsal verified; no refs or release published"
     elif outcome == "skipped":
         mode = "Prepared history verified; publication skipped"
     else:
@@ -166,6 +226,12 @@ def main():
         if sys.argv[1:] == ["check-environment"]:
             check_remote_environment()
             print("Remote release approval configuration is valid.")
+        elif sys.argv[1:] == ["select-version"]:
+            select_version()
+        elif sys.argv[1:] == ["check-preview"]:
+            check_preview()
+        elif sys.argv[1:] == ["preview"]:
+            preview()
         elif sys.argv[1:] == ["check"]:
             check_publication()
             if signing.run(["git", "rev-parse", "HEAD"]).strip() != os.environ["GITHUB_SHA"]:
@@ -179,7 +245,7 @@ def main():
         elif sys.argv[1:] == ["summary"]:
             summary()
         else:
-            raise signing.SigningError("Expected check-environment, check, check-publication, check-recovery, publish-release, or summary.")
+            raise signing.SigningError("Expected select-version, check-preview, preview, check-environment, check, check-publication, check-recovery, publish-release, or summary.")
         return 0
     except signing.SigningError as error:
         print(str(error), file=sys.stderr)

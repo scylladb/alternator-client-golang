@@ -1,25 +1,48 @@
 # Release pipeline
 
-All release preparation, signing, verification, Git publication, and GitHub release
-creation run through the **Release** Actions workflow on `main`. Release Make
-entrypoints reject local use. Verification commands and disposable test fixtures
-remain usable without publication access.
+The **Release** and **Recover release** workflows on `main` use a shared protected
+pipeline for signing, verification, Git publication, and GitHub release creation.
+The **Release dry run** workflow is independent and prepares an unsigned manifest
+preview without release credentials or deployment approval. Release Make entrypoints
+reject local use and reject the dry-run workflow. Verification commands and
+disposable test fixtures remain usable without publication access.
 
 Start a rehearsal from the Actions UI, or dispatch:
 
 ```sh
-gh workflow run release.yml --ref main -f release-version=v1.0.7 -F dry-run=true
+gh workflow run release-dry-run.yml --ref main
 ```
 
-After a successful rehearsal, dispatch the intended version with `dry-run=false`.
-Each dispatch first runs validation on a separate runner with read-only repository
-access, no release environment, and no signing or publication credentials. It
-checks the live approval configuration and release target before running tests.
-Only successful validation makes the protected release job eligible for approval;
-failed, cancelled, or skipped validation prevents that job and its approval request.
-This ordering also applies to dry runs and recovery.
-A member of `scylladb/drivers` other than the triggering operator must approve
-each deployment. The operator may differ from the publisher signing identity,
+After a successful rehearsal, publish with:
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+Neither workflow takes inputs. Both automatically increment the patch component
+of the highest stable root version tag fetched from the repository: `v1.0.6`
+becomes `v1.0.7`. Versions are compared numerically; module-prefixed tags,
+prerelease tags, and build-metadata tags do not affect selection. A missing stable
+root tag or an unsupported next major version blocks the run. The same version
+is used for all four release tags. Each job independently calculates and records
+its selected version in the run summary before checking the release target.
+Dry runs do not reserve a version: a later release uses the next patch available
+when it runs. All three workflows share the repository release concurrency group.
+
+Dry runs use only the default read-only checkout token. They do not select the
+`release` environment, reference signing secrets, supply a publishing token, or
+invoke the protected release pipeline. They check the source and remote refs, run
+the tests, tidy dependencies, and edit the release manifests. The summary reports
+an unsigned preview; no commits, tags, pushes, or GitHub release are created.
+Signing-key access and signature verification belong to the actual release.
+
+Release and recovery dispatches first run validation on a separate runner with
+read-only repository access, no release environment, and no signing or publication
+credentials. Validation checks the live approval configuration and release target
+before running tests. Only successful validation makes the protected release job
+eligible for approval; failed, cancelled, or skipped validation prevents that job
+and its approval request. A member of `scylladb/drivers` other than the triggering
+operator must approve each deployment. The operator may differ from the publisher signing identity,
 including on reruns. No local keys, commits, or tags are required from operators.
 The workflow accepts new versions from `main`; historical retagging is unsupported.
 
@@ -41,7 +64,7 @@ This uses the current `gh` authentication and reads the configuration of
 `scylladb/alternator-client-golang`; it does not change any settings.
 Repository access and environment approval authorize
 operators. Actor names do not select the signing key. Workflow context checks
-route Make calls through this pipeline; environment variables alone cannot prove
+route Make calls through these workflows; environment variables alone cannot prove
 that GitHub granted deployment approval.
 
 `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` are environment secrets. Only the preparation
@@ -56,7 +79,7 @@ registered on `scylladb-publisher`:
 * Expiration: `2028-10-19T15:45:32+00:00`
 
 Repository-level signing-secret copies must be removed after this workflow lands
-and completes its first approved live rehearsal. Keeping copies during that
+and completes its first approved signed release. Keeping copies during that
 transition avoids breaking the previously installed release path. GitHub cannot
 return existing secret values; provisioning requires the original secure export
 and passphrase. Upload credentials through stdin, never shell arguments or logs.
@@ -101,9 +124,11 @@ pushes `main` and all four tags atomically without force. GitHub release creatio
 runs explicitly in the same job, so it does not depend on a second workflow being
 triggered by a token-authenticated push.
 
-A pipeline dry run executes real preparation and signature verification, including
-all normal tests. It skips Git pushes and GitHub release creation. `make -n` is
-only a command preview used by tests; it is not the pipeline rehearsal.
+A pipeline dry run executes all normal tests and prepares the release manifests
+without signing credentials. It verifies that HEAD and all local refs remain
+unchanged and reports the manifest diff. It neither tests the production signing
+key nor creates or verifies release signatures. `make -n` remains a command
+preview used by tooling tests.
 
 ## Signing sessions and logs
 
@@ -129,9 +154,9 @@ descendants even when they create separate sessions, then reaps them before exit
 them completely before printing or writing logs. Redaction covers raw credentials,
 armored key lines, base64, URL encoding, JSON escapes, and shell quoting. Raw output
 is never spooled to disk. Overflow or cancellation discards incomplete output.
-Git tracing is rejected. Validation uploads separate target-check, tool-test and
-project-test logs; release uploads target checks, preparation, verification, publication/recovery,
-and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
+Git tracing is rejected. Validation uploads separate version-selection, target-check,
+tool-test and project-test logs; release uploads version selection, target checks,
+preparation, verification, publication/recovery, and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
 failure preserves an existing nonzero command status.
 
 ## Recovery and rotation
@@ -145,14 +170,14 @@ any version tag already exists. The `v1.0.0`–`v1.0.6` tags are lightweight and
 unsigned, so they fail the new signature verification gate. These existing tags
 remain unchanged; historical retagging is unsupported.
 
-When the atomic push succeeded but GitHub release creation failed, use the same
-pipeline's `publish-existing` option. Supply the original full baseline from the
-failed run's summary, keep `main` at the prepared development commit, and use the
-same version. Rehearse recovery with `dry-run=true`, then publish with `false`:
+When the atomic push succeeded but GitHub release creation failed, use the
+**Recover release** workflow. Supply the original full baseline and selected
+version from the failed run's summary and keep `main` at the prepared development
+commit. Recovery preserves that version instead of calculating a new patch:
 
 ```sh
-gh workflow run release.yml --ref main -f release-version=v1.0.7 \
-  -F publish-existing=true -f release-base=ORIGINAL_FULL_BASELINE_SHA -F dry-run=false
+gh workflow run release-recovery.yml --ref main -f release-version=v1.0.7 \
+  -f release-base=ORIGINAL_FULL_BASELINE_SHA
 ```
 
 Recovery imports no signing credentials and creates no commits or tags. It verifies
@@ -174,8 +199,8 @@ scheduled.
 
 During rotation, pause releases, validate a new protected signing subkey, register
 and distribute its public certificate, review both pinned fingerprints and the
-certificate together, update the environment secret pair, and run another approved
-pipeline rehearsal. Retain old public certificates for historical verification.
+certificate together, update the environment secret pair, and verify the next
+approved signed release. Retain old public certificates for historical verification.
 Use revocation when a key is compromised, rather than for routine rotation.
 
 ## Verification coverage
@@ -189,6 +214,6 @@ editing and builds. Workflow shell commands are exercised against a local remote
 and a controlled GitHub API substitute. PR CI runs these tests.
 
 These checks do not establish that live GitHub approval enforcement or the first
-approved signing rehearsal succeeded. After merging, observe validation completing
-before the approval request and run an approved rehearsal in Actions. No real
-release is published by the test suite.
+approved signed release succeeded. After merging, run the credential-free dry run
+in Actions. For an actual release, observe validation completing before the
+approval request. No real release is published by the test suite.

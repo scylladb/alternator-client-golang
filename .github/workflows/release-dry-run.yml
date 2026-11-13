@@ -1,0 +1,59 @@
+name: Release dry run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-release
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout preview source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure preview logs
+        run: echo "RELEASE_LOG_DIR=$RUNNER_TEMP/release-logs" >> "$GITHUB_ENV"
+
+      - name: Select release version
+        run: python3 scripts/release/capture.py version python3 scripts/release/pipeline.py select-version
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: '**/go.sum'
+
+      - name: Validate preview target
+        run: python3 scripts/release/capture.py target python3 scripts/release/pipeline.py check-preview
+
+      - name: Test release tooling
+        run: python3 scripts/release/capture.py tool-tests make test-release-signing
+
+      - name: Build, lint, and test
+        run: python3 scripts/release/capture.py validation make build check test-unit test-integration
+
+      - name: Prepare unsigned release preview
+        run: python3 scripts/release/capture.py prepare python3 scripts/release/pipeline.py preview
+
+      - name: Upload sanitized preview logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preview-logs
+          path: ${{ runner.temp }}/release-logs/
+          if-no-files-found: ignore

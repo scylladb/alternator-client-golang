@@ -87,6 +87,8 @@ test('canonical Go policy keeps support-only changes eligible and shipped/build 
   for (const name of ['sdkv2/helper.go', 'shared/rt/scope.go', 'shared/go.mod', 'shared/go.sum',
     'sdkv1/go.mod', 'sdkv2/go.sum', 'go.work', 'go.work.sum', 'Makefile',
     'scripts/release/pipeline.py', '.github/workflows/release.yml',
+    '.github/workflows/release-dry-run.yml', '.github/workflows/release-pipeline.yml',
+    '.github/workflows/release-recovery.yml',
     '.github/workflows/release-signing.yml', '.github/release.yml',
     '.github/unknown.yml', '.github/scripts/publish.cjs', 'LICENSE', 'unknown.txt']) {
     const current = await guard.snapshot(fixture({files: [...files, file(name)]}).github, repo, 172);
