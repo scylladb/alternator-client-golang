@@ -36,7 +36,7 @@ def next_version():
 
 
 def select_version():
-    if os.environ.get("RELEASE_PUBLISH_EXISTING") != "true":
+    if not os.environ.get("RELEASE_VERSION") and os.environ.get("RELEASE_PUBLISH_EXISTING") != "true":
         os.environ["RELEASE_VERSION"] = next_version()
     release_version = version()
     with Path(os.environ["GITHUB_ENV"]).open("a") as output:

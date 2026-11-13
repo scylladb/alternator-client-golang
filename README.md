@@ -450,8 +450,9 @@ Use [sdkv2/helper_test.go](sdkv2/helper_test.go) for current examples. [sdkv1/he
 
 Start with the [Release dry run workflow](.github/workflows/release-dry-run.yml), then
 publish through the [Release workflow](.github/workflows/release.yml) on `main`.
-Both take no inputs and calculate the next patch from the highest stable root
-version tag (for example, `v1.0.6` becomes `v1.0.7`). The independent dry run uses
+Both accept an optional `release-version` input. Leave it empty to calculate the
+next patch from the highest stable root version tag (for example, `v1.0.6` becomes
+`v1.0.7`), or enter an exact version such as `v1.1.0`. The independent dry run uses
 read-only access, runs the tests, and prepares unsigned manifests without release
 secrets or deployment approval. It creates no commits, tags, or release.
 

@@ -6,7 +6,7 @@ on:
       release-version:
         type: string
         default: ''
-        description: 'Recovery only: version from the original run'
+        description: 'Version override, or empty for the next patch; recovery requires the original version'
       publish-existing:
         type: boolean
         default: false

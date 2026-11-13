@@ -19,15 +19,26 @@ After a successful rehearsal, publish with:
 gh workflow run release.yml --ref main
 ```
 
-Neither workflow takes inputs. Both automatically increment the patch component
-of the highest stable root version tag fetched from the repository: `v1.0.6`
-becomes `v1.0.7`. Versions are compared numerically; module-prefixed tags,
-prerelease tags, and build-metadata tags do not affect selection. A missing stable
-root tag or an unsupported next major version blocks the run. The same version
+Both workflows accept an optional `release-version` input. Leave it empty to
+automatically increment the patch component of the highest stable root version
+tag fetched from the repository: `v1.0.6` becomes `v1.0.7`. To choose an exact
+version, pass the same value to the dry run and release:
+
+```sh
+gh workflow run release-dry-run.yml --ref main -f release-version=v1.1.0
+gh workflow run release.yml --ref main -f release-version=v1.1.0
+```
+
+Explicit versions use the existing Go version validation and do not require a
+stable root tag. Automatic selection compares versions numerically and ignores
+module-prefixed, prerelease, and build-metadata tags. A missing stable root tag or
+an unsupported major version blocks automatic selection. The same version
 is used for all four release tags. Each job independently calculates and records
 its selected version in the run summary before checking the release target.
-Dry runs do not reserve a version: a later release uses the next patch available
-when it runs. All three workflows share the repository release concurrency group.
+Dry runs do not reserve a version: when the input is empty, a later release uses
+the next patch available when it runs. Supply an explicit version to preview and
+publish that exact version. All three workflows share the repository release
+concurrency group.
 
 Dry runs use only the default read-only checkout token. They do not select the
 `release` environment, reference signing secrets, supply a publishing token, or
