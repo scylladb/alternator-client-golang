@@ -1,0 +1,14 @@
+name: Release dry run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-pipeline.yml
+    with:
+      dry-run: true

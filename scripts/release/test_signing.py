@@ -827,7 +827,7 @@ class SigningTests(unittest.TestCase):
 
     def test_pipeline_prepares_verifies_and_publishes_without_local_inputs(self):
         from test_pipeline import protected_environment, branch_policies
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        workflow = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         validation_job = workflow.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release_job = workflow.split("\n  release:\n", 1)[1]
         header = release_job.split("    steps:\n", 1)[0]
@@ -847,19 +847,24 @@ class SigningTests(unittest.TestCase):
             return "\n".join(commands)
         with self.make_repository() as directory:
             baseline = os.environ["RELEASE_BASE_COMMIT"]
-            inputs = {"${{ inputs.release-version }}": "v1.0.7", "${{ inputs.publish-existing }}": "false"}
+            inputs = {"${{ inputs.release-version }}": "", "${{ inputs.publish-existing }}": "false"}
             os.environ.update({name: inputs.get(value, value.strip("'")) for name, value in job_env.items()})
             self.assertEqual(os.environ["GOTOOLCHAIN"], "local")
             os.environ.update(GITHUB_SHA=baseline, RELEASE_DRY_RUN="true",
                               GITHUB_STEP_SUMMARY=str(directory / "summary"),
                               GITHUB_ACTOR="approved-maintainer", GITHUB_TRIGGERING_ACTOR="other-maintainer",
                               CHECK_RELEASE_JOB_ENV="1")
+            signing.run(["git", "tag", "v1.0.6"])
             signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Configure release logs")])
             # Actions exposes public GITHUB_ENV values to subsequent steps.
             name, value = Path(os.environ["GITHUB_ENV"]).read_text().strip().split("=", 1)
             os.environ[name] = value
             logs = directory / "release-logs"
             self.assertEqual(Path(os.environ["RELEASE_LOG_DIR"]), logs)
+            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
+            name, value = Path(os.environ["GITHUB_ENV"]).read_text().splitlines()[-1].split("=", 1)
+            os.environ[name] = value
+            self.assertEqual(os.environ["RELEASE_VERSION"], "v1.0.7")
             os.environ.pop("GH_TOKEN", None)
             remote = directory / "remote.git"
             signing.run(["git", "init", "--bare", "--quiet", str(remote)])
@@ -921,6 +926,8 @@ class SigningTests(unittest.TestCase):
                 self.assertIn("Enable Prevent self-review", result.stderr)
                 self.assertEqual(signing.run(["git", "rev-parse", "HEAD"]).strip(), baseline)
                 self.assertEqual(signing.run(["git", "ls-remote", "--tags", "origin"]), "")
+            os.environ["GITHUB_WORKFLOW_REF"] = (
+                "scylladb/alternator-client-golang/.github/workflows/release-dry-run.yml@refs/heads/main")
             for name in ["Validate pipeline and release target", "Prepare signed release"]:
                 signing.run(["bash", "-euo", "pipefail", "-c", shell_step(name)])
             self.assertEqual(signing.run(["git", "ls-remote", "origin", "refs/heads/main"]).split()[0], baseline)
@@ -933,6 +940,11 @@ class SigningTests(unittest.TestCase):
             signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Verify prepared history with public key only")])
             signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Record release result")])
             self.assertIn("Rehearsal verified", (directory / "summary").read_text())
+            blocked = subprocess.run(["make", "push-release-commits"], capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("Only the Release workflow may push", blocked.stderr)
+            os.environ["GITHUB_WORKFLOW_REF"] = (
+                "scylladb/alternator-client-golang/.github/workflows/release.yml@refs/heads/main")
             with patch.dict(os.environ, {"GH_TOKEN": "fixture-publication-token"}):
                 signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Publish verified release")])
             self.assertTrue(authenticated.exists())
@@ -945,7 +957,7 @@ class SigningTests(unittest.TestCase):
             self.assertFalse(list(directory.glob("release-signing-*")))
             self.assertEqual(set(path.name for path in logs.iterdir()),
                              {name + "-" + stream + ".log" for name in
-                              ("target", "prepare", "verify", "summary", "publish")
+                              ("version", "target", "prepare", "verify", "summary", "publish")
                               for stream in ("stdout", "stderr")})
             # Recover release-note creation in a fresh main dispatch, without
             # preparing again, receiving keys, or changing any published refs.
@@ -953,7 +965,12 @@ class SigningTests(unittest.TestCase):
             shutil.rmtree(logs)  # Recovery starts on a fresh runner.
             published.unlink()
             os.environ.update(RELEASE_PUBLISH_EXISTING="true", RELEASE_RECOVERY_BASE=baseline,
-                              GITHUB_SHA=signing.run(["git", "rev-parse", "HEAD"]).strip())
+                              GITHUB_SHA=signing.run(["git", "rev-parse", "HEAD"]).strip(),
+                              GITHUB_WORKFLOW_REF=("scylladb/alternator-client-golang/.github/workflows/"
+                                                   "release-recovery.yml@refs/heads/main"))
+            # Recovery retains the original version even though its tag now exists.
+            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
+            self.assertEqual(Path(os.environ["GITHUB_ENV"]).read_text().splitlines()[-1], "RELEASE_VERSION=v1.0.7")
             ref = "refs/tags/shared/v1.0.7"
             original_object = signing.run(["git", "rev-parse", ref]).strip()
             different_object = signing.run(["git", "rev-parse", "refs/tags/sdkv1/v1.0.7"]).strip()

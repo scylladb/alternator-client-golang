@@ -1,23 +1,41 @@
 # Release pipeline
 
-All release preparation, signing, verification, Git publication, and GitHub release
-creation run through the **Release** Actions workflow on `main`. Release Make
+Release preparation, signing, verification, Git publication, and GitHub release
+creation use a shared pipeline called by the **Release**, **Release dry run**, and
+**Recover release** Actions workflows on `main`. Release Make
 entrypoints reject local use. Verification commands and disposable test fixtures
 remain usable without publication access.
 
 Start a rehearsal from the Actions UI, or dispatch:
 
 ```sh
-gh workflow run release.yml --ref main -f release-version=v1.0.7 -F dry-run=true
+gh workflow run release-dry-run.yml --ref main
 ```
 
-After a successful rehearsal, dispatch the intended version with `dry-run=false`.
+After a successful rehearsal, publish with:
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+Neither workflow takes inputs. Both automatically increment the patch component
+of the highest stable root version tag fetched from the repository: `v1.0.6`
+becomes `v1.0.7`. Versions are compared numerically; module-prefixed tags,
+prerelease tags, and build-metadata tags do not affect selection. A missing stable
+root tag or an unsupported next major version blocks the run. The same version
+is used for all four release tags. Each job independently calculates and records
+its selected version in the run summary before checking the release target.
+Dry runs do not reserve a version: a later release uses the next patch available
+when it runs. All three workflows share the repository release concurrency group.
+
 Each dispatch first runs validation on a separate runner with read-only repository
 access, no release environment, and no signing or publication credentials. It
 checks the live approval configuration and release target before running tests.
 Only successful validation makes the protected release job eligible for approval;
 failed, cancelled, or skipped validation prevents that job and its approval request.
-This ordering also applies to dry runs and recovery.
+This ordering also applies to dry runs and recovery. The dry-run workflow grants
+only read access to repository contents; publication steps are skipped and Make
+also rejects pushes from that workflow.
 A member of `scylladb/drivers` other than the triggering operator must approve
 each deployment. The operator may differ from the publisher signing identity,
 including on reruns. No local keys, commits, or tags are required from operators.
@@ -41,7 +59,7 @@ This uses the current `gh` authentication and reads the configuration of
 `scylladb/alternator-client-golang`; it does not change any settings.
 Repository access and environment approval authorize
 operators. Actor names do not select the signing key. Workflow context checks
-route Make calls through this pipeline; environment variables alone cannot prove
+route Make calls through these workflows; environment variables alone cannot prove
 that GitHub granted deployment approval.
 
 `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` are environment secrets. Only the preparation
@@ -129,9 +147,9 @@ descendants even when they create separate sessions, then reaps them before exit
 them completely before printing or writing logs. Redaction covers raw credentials,
 armored key lines, base64, URL encoding, JSON escapes, and shell quoting. Raw output
 is never spooled to disk. Overflow or cancellation discards incomplete output.
-Git tracing is rejected. Validation uploads separate target-check, tool-test and
-project-test logs; release uploads target checks, preparation, verification, publication/recovery,
-and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
+Git tracing is rejected. Validation uploads separate version-selection, target-check,
+tool-test and project-test logs; release uploads version selection, target checks,
+preparation, verification, publication/recovery, and summary logs. Both artifacts upload on failure. A log-write or incomplete-output
 failure preserves an existing nonzero command status.
 
 ## Recovery and rotation
@@ -145,14 +163,14 @@ any version tag already exists. The `v1.0.0`–`v1.0.6` tags are lightweight and
 unsigned, so they fail the new signature verification gate. These existing tags
 remain unchanged; historical retagging is unsupported.
 
-When the atomic push succeeded but GitHub release creation failed, use the same
-pipeline's `publish-existing` option. Supply the original full baseline from the
-failed run's summary, keep `main` at the prepared development commit, and use the
-same version. Rehearse recovery with `dry-run=true`, then publish with `false`:
+When the atomic push succeeded but GitHub release creation failed, use the
+**Recover release** workflow. Supply the original full baseline and selected
+version from the failed run's summary and keep `main` at the prepared development
+commit. Recovery preserves that version instead of calculating a new patch:
 
 ```sh
-gh workflow run release.yml --ref main -f release-version=v1.0.7 \
-  -F publish-existing=true -f release-base=ORIGINAL_FULL_BASELINE_SHA -F dry-run=false
+gh workflow run release-recovery.yml --ref main -f release-version=v1.0.7 \
+  -f release-base=ORIGINAL_FULL_BASELINE_SHA
 ```
 
 Recovery imports no signing credentials and creates no commits or tags. It verifies

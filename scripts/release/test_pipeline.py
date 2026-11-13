@@ -34,6 +34,66 @@ def branch_policies():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_next_version_uses_numeric_stable_root_tags(self):
+        for tags, expected in [
+                ("v1.0.6\nshared/v1.0.99\nsdkv1/v1.2.0\nsdkv2/v1.3.0\nv1.1.0-rc.1\n", "v1.0.7"),
+                ("v1.0.9\nv1.0.10\nv01.5.0\nv1.0.11+build\n", "v1.0.11"),
+                ("v0.99.99\nv1.9.99\nv1.10.0\n", "v1.10.1"),
+                ("v0.1.0\nv0.1.99\n", "v0.1.100")]:
+            with self.subTest(tags=tags), patch.object(signing, "run", return_value=tags):
+                self.assertEqual(pipeline.next_version(), expected)
+        for tags in ("", "shared/v1.0.6\nv1.0.7-rc.1\nv01.0.6\n"):
+            with self.subTest(tags=tags), patch.object(signing, "run", return_value=tags), \
+                    self.assertRaisesRegex(signing.SigningError, "no stable root version"):
+                pipeline.next_version()
+
+    def test_selected_version_is_exported_and_reported_before_approval(self):
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temp:
+                env_file, summary = Path(temp) / "env", Path(temp) / "summary"
+                env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
+                       "RELEASE_VERSION": "v1.0.7" if recovery else "",
+                       "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(summary)}
+                with patch.dict(os.environ, env, clear=True), \
+                        patch.object(signing, "run", return_value="v1.0.99\n") as run, \
+                        redirect_stdout(StringIO()):
+                    pipeline.select_version()
+                expected = "v1.0.7" if recovery else "v1.0.100"
+                self.assertEqual(env_file.read_text(), f"RELEASE_VERSION={expected}\n")
+                self.assertIn(f"Selected release version: `{expected}`", summary.read_text())
+                self.assertEqual(run.call_count, 0 if recovery else 1)
+
+    def test_invalid_selected_versions_are_not_exported(self):
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temp:
+                env_file = Path(temp) / "env"
+                env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
+                       "RELEASE_VERSION": "v1.0.7\nINJECTED=true",
+                       "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(Path(temp) / "summary")}
+                with patch.dict(os.environ, env, clear=True), \
+                        patch.object(signing, "run", return_value="v2.0.0\n"), \
+                        self.assertRaises(signing.SigningError):
+                    pipeline.select_version()
+                self.assertFalse(env_file.exists())
+
+    def test_dispatch_workflows_fix_modes_and_dry_run_permissions(self):
+        for name, dry_run in (("release.yml", False), ("release-dry-run.yml", True)):
+            with self.subTest(workflow=name):
+                workflow = (ROOT / ".github/workflows" / name).read_text()
+                self.assertIn("  workflow_dispatch:\n", workflow)
+                self.assertNotIn("    inputs:", workflow)
+                self.assertIn("uses: ./.github/workflows/release-pipeline.yml", workflow)
+                self.assertIn("      dry-run: " + str(dry_run).lower(), workflow)
+                self.assertIn("  contents: " + ("read" if dry_run else "write"), workflow)
+                self.assertNotIn("secrets:", workflow)
+        recovery = (ROOT / ".github/workflows/release-recovery.yml").read_text()
+        self.assertIn("      publish-existing: true", recovery)
+        self.assertIn("      dry-run: false", recovery)
+        shared = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
+        self.assertIn("  workflow_call:\n", shared)
+        self.assertNotIn("  workflow_dispatch:", shared)
+        self.assertIn("  group: repository-release\n  cancel-in-progress: false", shared)
+
     def test_version_validation_precedes_make_evaluation_and_api_access(self):
         for value in ["$(shell touch injected)", "v1.0.7\nv1.0.8", "v01.0.7", "v1.0.7-01",
                       "v1.0.7; touch injected", "v2.0.0", "v1.0.7+build"]:
@@ -251,7 +311,7 @@ class PipelineTests(unittest.TestCase):
                     self.assertIn("Inspect remote refs and releases", text)
 
     def test_workflow_clean_checkout_check_fails_closed(self):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        workflow = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         step = workflow.split("      - name: Verify prepared history with public key only\n", 1)[1]
         script = step.split("      - name:", 1)[0].split("        run: |\n", 1)[1]
         script = "\n".join(line[10:] for line in script.splitlines())
@@ -269,7 +329,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_workflow_scopes_signing_secrets_and_limits_publication_to_non_dry_runs(self):
-        text = (ROOT / ".github/workflows/release.yml").read_text()
+        text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         self.assertNotIn("  push:", text)
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
@@ -284,13 +344,16 @@ class PipelineTests(unittest.TestCase):
         for name, block in validation_steps.items():
             self.assertEqual("GH_TOKEN:" in block, name == "Validate pipeline and release target", name)
         self.assertIn("    environment: release\n", release_header)
-        self.assertIn("    permissions:\n      contents: write\n      actions: read\n", release_header)
+        self.assertNotIn("    permissions:", release_header)
         self.assertIn("      GOTOOLCHAIN: local\n", release_header)
         for block in (validation, release):
             self.assertIn("    runs-on: ubuntu-latest\n", block)
             checkout = block.split("        uses: actions/checkout@", 1)[1].split("      - name:", 1)[0]
             self.assertIn("          ref: ${{ github.sha }}\n", checkout)
             self.assertIn("          persist-credentials: false\n", checkout)
+            self.assertIn("pipeline.py select-version", block)
+            self.assertLess(block.index("name: Select release version"),
+                            block.index("name: Validate pipeline and release target"))
         for forbidden in ("needs.validation.outputs", "download-artifact", "actions/cache", "cache-dependency-path",
                           "make test-release-signing", "make build", "test-unit", "test-integration"):
             self.assertNotIn(forbidden, release)
@@ -317,7 +380,7 @@ class PipelineTests(unittest.TestCase):
                         list(steps).index("Publish verified release"))
 
     def test_workflow_validation_success_precedes_approval_in_all_modes(self):
-        text = (ROOT / ".github/workflows/release.yml").read_text()
+        text = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
         validation = text.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release = text.split("\n  release:\n", 1)[1]
         header = release.split("    steps:\n", 1)[0]

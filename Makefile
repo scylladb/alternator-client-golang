@@ -171,16 +171,21 @@ export RELEASE_VERSION = $(version)
 RELEASE_DRY_RUN = $(findstring n,$(filter-out -%,$(firstword $(MAKEFLAGS))))
 
 .PHONY: release-check-user
-# Release mutations run only in the protected, manually dispatched main pipeline.
+# Release mutations run only in the protected, manually dispatched main workflows.
 release-check-user:
 	+@set -eu; \
 	if [ "$${GITHUB_ACTIONS:-}" != true ] || \
 	   [ "$${GITHUB_EVENT_NAME:-}" != workflow_dispatch ] || \
-	   [ "$${GITHUB_REF:-}" != refs/heads/main ] || \
-	   [ "$${GITHUB_WORKFLOW_REF:-}" != "$${GITHUB_REPOSITORY:-}/.github/workflows/release.yml@refs/heads/main" ]; then \
+	   [ "$${GITHUB_REF:-}" != refs/heads/main ]; then \
 		echo "Release preparation and publication require the Release pipeline dispatched from main." >&2; \
 		exit 1; \
-	fi
+	fi; \
+	case "$${GITHUB_WORKFLOW_REF:-}" in \
+	  "$${GITHUB_REPOSITORY:-}/.github/workflows/release.yml@refs/heads/main"|\
+	  "$${GITHUB_REPOSITORY:-}/.github/workflows/release-dry-run.yml@refs/heads/main"|\
+	  "$${GITHUB_REPOSITORY:-}/.github/workflows/release-recovery.yml@refs/heads/main") ;; \
+	  *) echo "Release preparation and publication require the Release pipeline dispatched from main." >&2; exit 1;; \
+	esac
 
 .PHONY: release-check-version
 release-check-version: release-check-user
@@ -259,6 +264,10 @@ _create-release-tags: release-check-version
 
 .PHONY: push-release-commits
 push-release-commits: release-check-user
+	@set -eu; \
+	if [ "$${GITHUB_WORKFLOW_REF:-}" != "$${GITHUB_REPOSITORY:-}/.github/workflows/release.yml@refs/heads/main" ]; then \
+		echo "Only the Release workflow may push release commits." >&2; exit 1; \
+	fi
 	@set -eu; \
 	LAST1=$$(git log -1 --pretty=%s); \
 	LAST2=$$(git log -2 --pretty=%s | tail -n 1); \

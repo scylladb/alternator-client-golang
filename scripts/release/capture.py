@@ -16,7 +16,7 @@ from urllib.parse import quote
 import signing
 
 MAX_STREAM_BYTES = 8 * 1024 * 1024
-LOG_NAMES = {"tool-tests", "validation", "target", "prepare", "verify", "publish", "summary"}
+LOG_NAMES = {"version", "tool-tests", "validation", "target", "prepare", "verify", "publish", "summary"}
 
 
 class CaptureError(signing.SigningError):

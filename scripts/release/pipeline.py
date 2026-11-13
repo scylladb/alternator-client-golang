@@ -24,6 +24,28 @@ def version():
     return value
 
 
+def next_version():
+    """Increment the highest stable root tag, ignoring module and prerelease tags."""
+    tags = signing.run(["git", "tag", "--list"]).splitlines()
+    versions = [tuple(map(int, match.groups())) for tag in tags
+                if (match := re.fullmatch(r"v(" + NUMBER + r")\.(" + NUMBER + r")\.(" + NUMBER + r")", tag))]
+    if not versions:
+        raise signing.SigningError("Cannot select the next patch: no stable root version tag exists.")
+    major, minor, patch = max(versions)
+    return f"v{major}.{minor}.{patch + 1}"
+
+
+def select_version():
+    if os.environ.get("RELEASE_PUBLISH_EXISTING") != "true":
+        os.environ["RELEASE_VERSION"] = next_version()
+    release_version = version()
+    with Path(os.environ["GITHUB_ENV"]).open("a") as output:
+        output.write(f"RELEASE_VERSION={release_version}\n")
+    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+        output.write(f"Selected release version: `{release_version}`\n\n")
+    print(f"Selected release version: {release_version}")
+
+
 def api(path, paginate=False):
     command = ["gh", "api", "repos/" + REPOSITORY + "/" + path]
     if paginate:
@@ -166,6 +188,8 @@ def main():
         if sys.argv[1:] == ["check-environment"]:
             check_remote_environment()
             print("Remote release approval configuration is valid.")
+        elif sys.argv[1:] == ["select-version"]:
+            select_version()
         elif sys.argv[1:] == ["check"]:
             check_publication()
             if signing.run(["git", "rev-parse", "HEAD"]).strip() != os.environ["GITHUB_SHA"]:
@@ -179,7 +203,7 @@ def main():
         elif sys.argv[1:] == ["summary"]:
             summary()
         else:
-            raise signing.SigningError("Expected check-environment, check, check-publication, check-recovery, publish-release, or summary.")
+            raise signing.SigningError("Expected select-version, check-environment, check, check-publication, check-recovery, publish-release, or summary.")
         return 0
     except signing.SigningError as error:
         print(str(error), file=sys.stderr)
