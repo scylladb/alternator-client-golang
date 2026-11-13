@@ -10,7 +10,7 @@ require (
 	github.com/aws/smithy-go v1.28.9
 	github.com/google/go-cmp v0.7.0
 	github.com/klauspost/compress v1.20.4
-	github.com/scylladb/alternator-client-golang/shared v1.0.6
+	github.com/scylladb/alternator-client-golang/shared v1.0.7
 )
 
 require (
@@ -22,5 +22,3 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 )
-
-replace github.com/scylladb/alternator-client-golang/shared => ../shared
