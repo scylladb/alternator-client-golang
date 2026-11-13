@@ -2,6 +2,12 @@ name: Release dry run
 
 on:
   workflow_dispatch:
+    inputs:
+      release-version:
+        description: 'Version to preview, e.g. v1.1.0; leave empty for the next patch'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -18,6 +24,7 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       GOTOOLCHAIN: local
+      RELEASE_VERSION: ${{ inputs.release-version }}
     steps:
       - name: Checkout preview source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

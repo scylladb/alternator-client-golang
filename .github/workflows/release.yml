@@ -2,6 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release-version:
+        description: 'Version to release, e.g. v1.1.0; leave empty for the next patch'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -10,3 +16,5 @@ permissions:
 jobs:
   release:
     uses: ./.github/workflows/release-pipeline.yml
+    with:
+      release-version: ${{ inputs.release-version }}

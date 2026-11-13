@@ -1018,7 +1018,7 @@ class SigningTests(unittest.TestCase):
                 executable.chmod(0o700)
             env = {name: value for name, value in os.environ.items()
                    if not name.startswith("RELEASE_GPG_") and name not in ("GH_TOKEN", "GITHUB_TOKEN", "GNUPGHOME")}
-            env.update(GITHUB_SHA=baseline, RELEASE_PUBLISH_EXISTING="false",
+            env.update(GITHUB_SHA=baseline, RELEASE_PUBLISH_EXISTING="false", RELEASE_VERSION="v1.2.0",
                        RELEASE_LOG_DIR=str(directory / "preview-logs"),
                        GITHUB_STEP_SUMMARY=str(directory / "preview-summary"),
                        GITHUB_WORKFLOW_REF=("scylladb/alternator-client-golang/.github/workflows/"
@@ -1042,7 +1042,7 @@ class SigningTests(unittest.TestCase):
             for module in ("sdkv1", "sdkv2"):
                 self.assertEqual(Path(module, "go.mod").read_text(), "release\n")
             summary = (directory / "preview-summary").read_text()
-            self.assertIn("Unsigned release preview prepared: `v1.0.7`", summary)
+            self.assertIn("Unsigned release preview prepared: `v1.2.0`", summary)
             self.assertNotIn("signatures verified", summary)
             self.assertFalse(list(directory.glob("release-signing-*")))
 

@@ -48,20 +48,26 @@ class PipelineTests(unittest.TestCase):
                 pipeline.next_version()
 
     def test_selected_version_is_exported_and_reported_before_approval(self):
-        for recovery in (False, True):
-            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temp:
+        for recovery, requested in ((False, ""), (False, "v1.2.0"), (False, "v1.2.0-rc.1"), (True, "v1.0.7")):
+            with self.subTest(recovery=recovery, requested=requested), tempfile.TemporaryDirectory() as temp:
                 env_file, summary = Path(temp) / "env", Path(temp) / "summary"
                 env = {"RELEASE_PUBLISH_EXISTING": str(recovery).lower(),
-                       "RELEASE_VERSION": "v1.0.7" if recovery else "",
+                       "RELEASE_VERSION": requested,
                        "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(summary)}
                 with patch.dict(os.environ, env, clear=True), \
                         patch.object(signing, "run", return_value="v1.0.99\n") as run, \
                         redirect_stdout(StringIO()):
                     pipeline.select_version()
-                expected = "v1.0.7" if recovery else "v1.0.100"
+                expected = requested or "v1.0.100"
                 self.assertEqual(env_file.read_text(), f"RELEASE_VERSION={expected}\n")
                 self.assertIn(f"Selected release version: `{expected}`", summary.read_text())
-                self.assertEqual(run.call_count, 0 if recovery else 1)
+                self.assertEqual(run.call_count, 0 if requested else 1)
+
+    def test_recovery_requires_an_explicit_version_without_calculating_a_patch(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "", "RELEASE_PUBLISH_EXISTING": "true"}), \
+                patch.object(signing, "run") as run, self.assertRaises(signing.SigningError):
+            pipeline.select_version()
+        run.assert_not_called()
 
     def test_invalid_selected_versions_are_not_exported(self):
         for recovery in (False, True):
@@ -71,18 +77,23 @@ class PipelineTests(unittest.TestCase):
                        "RELEASE_VERSION": "v1.0.7\nINJECTED=true",
                        "GITHUB_ENV": str(env_file), "GITHUB_STEP_SUMMARY": str(Path(temp) / "summary")}
                 with patch.dict(os.environ, env, clear=True), \
-                        patch.object(signing, "run", return_value="v2.0.0\n"), \
+                        patch.object(signing, "run") as run, \
                         self.assertRaises(signing.SigningError):
                     pipeline.select_version()
                 self.assertFalse(env_file.exists())
+                run.assert_not_called()
 
     def test_dry_run_is_independent_of_credentialed_release_workflows(self):
         live = (ROOT / ".github/workflows/release.yml").read_text()
         dry = (ROOT / ".github/workflows/release-dry-run.yml").read_text()
         for workflow in (live, dry):
             self.assertIn("  workflow_dispatch:\n", workflow)
-            self.assertNotIn("    inputs:", workflow)
+            self.assertIn("      release-version:\n", workflow)
+            self.assertIn("        required: false\n", workflow)
+            self.assertIn("        default: ''\n", workflow)
         self.assertIn("uses: ./.github/workflows/release-pipeline.yml", live)
+        self.assertIn("      release-version: ${{ inputs.release-version }}", live)
+        self.assertIn("      RELEASE_VERSION: ${{ inputs.release-version }}", dry)
         self.assertIn("  contents: write", live)
         self.assertIn("  contents: read", dry)
         for forbidden in ("secrets.", "environment:", "GH_TOKEN", "GITHUB_TOKEN", "contents: write",
