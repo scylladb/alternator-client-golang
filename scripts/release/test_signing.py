@@ -828,7 +828,7 @@ class SigningTests(unittest.TestCase):
 
     def test_pipeline_prepares_verifies_and_publishes_without_local_inputs(self):
         from test_pipeline import protected_environment, branch_policies
-        workflow = (ROOT / ".github/workflows/release-pipeline.yml").read_text()
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
         validation_job = workflow.split("\n  validation:\n", 1)[1].split("\n  release:\n", 1)[0]
         release_job = workflow.split("\n  release:\n", 1)[1]
         header = release_job.split("    steps:\n", 1)[0]
@@ -966,7 +966,7 @@ class SigningTests(unittest.TestCase):
             os.environ.update(RELEASE_PUBLISH_EXISTING="true", RELEASE_RECOVERY_BASE=baseline,
                               GITHUB_SHA=signing.run(["git", "rev-parse", "HEAD"]).strip(),
                               GITHUB_WORKFLOW_REF=("scylladb/alternator-client-golang/.github/workflows/"
-                                                   "release-recovery.yml@refs/heads/main"))
+                                                   "release.yml@refs/heads/main"))
             # Recovery retains the original version even though its tag now exists.
             signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
             self.assertEqual(Path(os.environ["GITHUB_ENV"]).read_text().splitlines()[-1], "RELEASE_VERSION=v1.0.7")

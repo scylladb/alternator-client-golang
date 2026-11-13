@@ -1,7 +1,7 @@
 # Release pipeline
 
-The **Release** and **Recover release** workflows on `main` use a shared protected
-pipeline for signing, verification, Git publication, and GitHub release creation.
+The **Release** workflow on `main` handles signing, verification, Git publication,
+GitHub release creation, and recovery after a failed GitHub release creation.
 The **Release dry run** workflow is independent and prepares an unsigned manifest
 preview without release credentials or deployment approval. Release Make entrypoints
 reject local use and reject the dry-run workflow. Verification commands and
@@ -37,12 +37,12 @@ is used for all four release tags. Each job independently calculates and records
 its selected version in the run summary before checking the release target.
 Dry runs do not reserve a version: when the input is empty, a later release uses
 the next patch available when it runs. Supply an explicit version to preview and
-publish that exact version. All three workflows share the repository release
+publish that exact version. Both workflows share the repository release
 concurrency group.
 
 Dry runs use only the default read-only checkout token. They do not select the
 `release` environment, reference signing secrets, supply a publishing token, or
-invoke the protected release pipeline. They check the source and remote refs, run
+invoke the protected release job. They check the source and remote refs, run
 the tests, tidy dependencies, and edit the release manifests. The summary reports
 an unsigned preview; no commits, tags, pushes, or GitHub release are created.
 Signing-key access and signature verification belong to the actual release.
@@ -182,12 +182,13 @@ unsigned, so they fail the new signature verification gate. These existing tags
 remain unchanged; historical retagging is unsupported.
 
 When the atomic push succeeded but GitHub release creation failed, use the
-**Recover release** workflow. Supply the original full baseline and selected
-version from the failed run's summary and keep `main` at the prepared development
-commit. Recovery preserves that version instead of calculating a new patch:
+**Release** workflow with `publish-existing` enabled. Supply the original full
+baseline as `release-base` and selected version as `release-version` from the failed
+run's summary and keep `main` at the prepared development commit. Recovery preserves
+that version instead of calculating a new patch:
 
 ```sh
-gh workflow run release-recovery.yml --ref main -f release-version=v1.0.7 \
+gh workflow run release.yml --ref main -f publish-existing=true -f release-version=v1.0.7 \
   -f release-base=ORIGINAL_FULL_BASELINE_SHA
 ```
 
@@ -222,7 +223,8 @@ local-entrypoint rejection, isolated standalone artifact signing, cancellation,
 secret redaction, and log-write failures. Most Go commands use controlled
 substitutes; a separate disposable-module smoke test runs actual Go manifest
 editing and builds. Workflow shell commands are exercised against a local remote
-and a controlled GitHub API substitute. PR CI runs these tests.
+and a controlled GitHub API substitute. The **Run tests** workflow runs these
+checks in its release-tooling job on pull requests and pushes to `main`.
 
 These checks do not establish that live GitHub approval enforcement or the first
 approved signed release succeeded. After merging, run the credential-free dry run
