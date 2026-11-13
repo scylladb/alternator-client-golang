@@ -55,18 +55,20 @@ def api(path, paginate=False):
 
 def check_environment(environment, policies):
     problems = []
-    reviewers = [rule for rule in environment.get("protection_rules", [])
-                 if rule.get("type") == "required_reviewers"]
     if environment.get("can_admins_bypass") is not False:
         problems.append("Disable administrator bypass (can_admins_bypass=false).")
-    if len(reviewers) != 1:
-        problems.append("Configure exactly one required-reviewers rule.")
-    else:
-        if reviewers[0].get("prevent_self_review") is not True:
-            problems.append("Enable Prevent self-review (prevent_self_review=true).")
-        if [(row.get("type"), row.get("reviewer", {}).get("id"))
-                for row in reviewers[0].get("reviewers", [])] != [("Team", APPROVAL_TEAM)]:
-            problems.append(f"Set required reviewers to only scylladb/drivers (Team ID {APPROVAL_TEAM}).")
+    # Restore required-reviewer and prevent-self-review checks when other people
+    # start working on this repository. For now, the sole maintainer may self-review.
+    # reviewers = [rule for rule in environment.get("protection_rules", [])
+    #              if rule.get("type") == "required_reviewers"]
+    # if len(reviewers) != 1:
+    #     problems.append("Configure exactly one required-reviewers rule.")
+    # else:
+    #     if reviewers[0].get("prevent_self_review") is not True:
+    #         problems.append("Enable Prevent self-review (prevent_self_review=true).")
+    #     if [(row.get("type"), row.get("reviewer", {}).get("id"))
+    #             for row in reviewers[0].get("reviewers", [])] != [("Team", APPROVAL_TEAM)]:
+    #         problems.append(f"Set required reviewers to only scylladb/drivers (Team ID {APPROVAL_TEAM}).")
     if environment.get("deployment_branch_policy") != {
             "protected_branches": False, "custom_branch_policies": True}:
         problems.append("Use selected deployment branches and tags (custom_branch_policies=true, protected_branches=false).")

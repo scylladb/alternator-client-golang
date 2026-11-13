@@ -121,20 +121,13 @@ class PipelineTests(unittest.TestCase):
             pipeline.preview()
         run.assert_not_called()
 
-    def test_environment_requires_exact_team_and_ref_protections(self):
+    def test_environment_requires_admin_and_ref_protections(self):
         pipeline.check_environment(protected_environment(), branch_policies())
-        for field, value in [("can_admins_bypass", True), ("protection_rules", []),
+        for field, value in [("can_admins_bypass", True),
                              ("deployment_branch_policy", None)]:
             env = protected_environment()
             env[field] = value
             with self.subTest(field=field), self.assertRaises(signing.SigningError):
-                pipeline.check_environment(env, branch_policies())
-        for field, value in [("prevent_self_review", False), ("reviewers", []),
-                             ("reviewers", [{"type": "User", "reviewer": {"id": pipeline.APPROVAL_TEAM}}]),
-                             ("reviewers", [{"type": "Team", "reviewer": {"id": 123}}])]:
-            env = protected_environment()
-            env["protection_rules"][0][field] = value
-            with self.subTest(field=field, value=value), self.assertRaises(signing.SigningError):
                 pipeline.check_environment(env, branch_policies())
         for policies in [{"total_count": 0, "branch_policies": []},
                          {"total_count": 1, "branch_policies": [{"name": "*", "type": "branch"}]},
@@ -143,17 +136,22 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(policies=policies), self.assertRaises(signing.SigningError):
                 pipeline.check_environment(protected_environment(), policies)
 
-    def test_environment_reports_all_settings_that_need_correction(self):
+    def test_environment_allows_sole_maintainer_self_review(self):
         environment = protected_environment()
         environment["protection_rules"][0].update(
             prevent_self_review=False, reviewers=[{"type": "User", "reviewer": {"id": 40304587}}])
+        pipeline.check_environment(environment, branch_policies())
+        environment["protection_rules"] = []
+        pipeline.check_environment(environment, branch_policies())
+
+    def test_environment_reports_all_settings_that_need_correction(self):
+        environment = protected_environment()
+        environment["can_admins_bypass"] = True
         with self.assertRaises(signing.SigningError) as failure:
-            pipeline.check_environment(environment, branch_policies())
+            pipeline.check_environment(environment, {"total_count": 0, "branch_policies": []})
         message = str(failure.exception)
-        self.assertIn("Enable Prevent self-review", message)
-        self.assertIn("only scylladb/drivers (Team ID 8797733)", message)
-        self.assertNotIn("Disable administrator bypass", message)
-        self.assertNotIn("Allow only the main branch", message)
+        self.assertIn("Disable administrator bypass", message)
+        self.assertIn("Allow only the main branch", message)
         self.assertIn("https://github.com/" + pipeline.REPOSITORY + "/settings/environments", message)
 
     def test_remote_environment_command_needs_no_version_or_signing_credentials(self):
