@@ -548,7 +548,7 @@ class SigningTests(unittest.TestCase):
             go.chmod(0o700)
             os.environ.update(PATH=str(tools) + os.pathsep + os.environ["PATH"],
                               PYTHONDONTWRITEBYTECODE="1",
-                              GITHUB_ACTIONS="true", GITHUB_TRIGGERING_ACTOR="approved-maintainer",
+                              GITHUB_ACTIONS="true", GITHUB_RUN_ID="12345", GITHUB_TRIGGERING_ACTOR="approved-maintainer",
                               GITHUB_REF="refs/heads/main", GITHUB_EVENT_NAME="workflow_dispatch",
                               GITHUB_REPOSITORY="scylladb/alternator-client-golang",
                               GITHUB_WORKFLOW_REF="scylladb/alternator-client-golang/.github/workflows/release.yml@refs/heads/main")
@@ -862,15 +862,14 @@ class SigningTests(unittest.TestCase):
             os.environ[name] = value
             logs = directory / "release-logs"
             self.assertEqual(Path(os.environ["RELEASE_LOG_DIR"]), logs)
-            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
-            name, value = Path(os.environ["GITHUB_ENV"]).read_text().splitlines()[-1].split("=", 1)
-            os.environ[name] = value
-            self.assertEqual(os.environ["RELEASE_VERSION"], "v1.0.7")
             os.environ.pop("GH_TOKEN", None)
             remote = directory / "remote.git"
             signing.run(["git", "init", "--bare", "--quiet", str(remote)])
             signing.run(["git", "remote", "add", "origin", str(remote)])
             signing.run(["git", "push", "origin", "HEAD:refs/heads/main"])
+            signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
+            os.environ.update(line.split("=", 1) for line in Path(os.environ["GITHUB_ENV"]).read_text().splitlines())
+            self.assertEqual(os.environ["RELEASE_VERSION"], "v1.0.7")
             published = directory / "published"
             gh = directory / "bin/gh"
             authenticated = directory / "authenticated"
@@ -882,9 +881,13 @@ class SigningTests(unittest.TestCase):
                           "        if os.environ.get('INVALID_APPROVAL'): environment['can_admins_bypass']=True\n"
                           "        print(json.dumps(environment))\n"
                           "    elif path.endswith('/deployment-branch-policies'): print(" + repr(json.dumps(branch_policies())) + ")\n"
-                          "    elif '/releases?' in path: print('[[]]')\n"
+                          "    elif '/releases?' in path:\n"
+                          "        release={'tag_name':'v1.0.7','name':'v1.0.7','draft':False,'prerelease':False}\n"
+                          "        print(json.dumps([[release]] if pathlib.Path(" + repr(str(published)) + ").exists() else [[]]))\n"
                           "    else: sys.exit(9)\n"
-                          "elif args[:2]==['release','create']: pathlib.Path(" + repr(str(published)) + ").write_text(' '.join(args))\n"
+                          "elif args[:2]==['release','create']:\n"
+                          "    if os.environ.get('FAIL_RELEASE_CREATE'): sys.exit(17)\n"
+                          "    pathlib.Path(" + repr(str(published)) + ").write_text(' '.join(args))\n"
                           "elif args==['auth','git-credential','get']:\n"
                           "    assert os.environ['GH_TOKEN']=='fixture-publication-token'\n"
                           "    assert 'host=github.com' in sys.stdin.read()\n"
@@ -944,12 +947,68 @@ class SigningTests(unittest.TestCase):
                 blocked = subprocess.run(["make", "push-release-commits"], capture_output=True, text=True, timeout=60)
             self.assertNotEqual(blocked.returncode, 0)
             self.assertIn("require the Release pipeline dispatched from main", blocked.stderr)
-            with patch.dict(os.environ, {"GH_TOKEN": "fixture-publication-token"}):
-                signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Publish verified release")])
+            # Fail after the atomic push, leaving refs published without notes.
+            with patch.dict(os.environ, {"GH_TOKEN": "fixture-publication-token", "FAIL_RELEASE_CREATE": "1"}):
+                failed = subprocess.run(["bash", "-euo", "pipefail", "-c", shell_step("Publish verified release")],
+                                        capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(published.exists())
             self.assertTrue(authenticated.exists())
+            development = signing.run(["git", "rev-parse", "HEAD"]).strip()
+            before_retry = signing.run(["git", "ls-remote", "origin"])
+
+            def rerun(attempt):
+                # A restarted job has a fresh checkout of the original dispatch,
+                # no local prepared state, and no signing inputs.
+                checkout = directory / f"attempt-{attempt}"
+                signing.run(["git", "clone", "--quiet", "--branch", "main", str(remote), str(checkout)])
+                original = Path.cwd()
+                try:
+                    os.chdir(checkout)
+                    signing.run(["git", "checkout", "--detach", baseline])
+                    env = {**os.environ, "RELEASE_VERSION": "", "RELEASE_RESUME_COMMIT": "",
+                           "GITHUB_ENV": str(directory / f"env-{attempt}"),
+                           "GITHUB_STEP_SUMMARY": str(directory / f"summary-{attempt}"),
+                           "RELEASE_LOG_DIR": str(directory / f"logs-{attempt}")}
+                    env.pop("RELEASE_BASE_COMMIT", None)
+                    with patch.dict(os.environ, env, clear=True):
+                        self.assertFalse(any(key.startswith("RELEASE_GPG_") for key in os.environ))
+                        signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Select release version")])
+                        os.environ.update(line.split("=", 1) for line in Path(os.environ["GITHUB_ENV"]).read_text().splitlines())
+                        self.assertEqual(os.environ["RELEASE_VERSION"], "v1.0.7")
+                        self.assertEqual(os.environ["RELEASE_RESUME_COMMIT"], development)
+                        # Re-run all jobs must also pass the read-only validation
+                        # gate while leaving its checkout at the dispatch SHA.
+                        with patch.dict(os.environ, {"RELEASE_LOG_DIR": str(directory / f"validation-{attempt}")}):
+                            signing.run(["bash", "-euo", "pipefail", "-c",
+                                         shell_step("Validate pipeline and release target", validation_job)])
+                        self.assertEqual(signing.run(["git", "rev-parse", "HEAD"]).strip(), baseline)
+                        signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Validate pipeline and release target")])
+                        os.environ.update(line.split("=", 1) for line in Path(os.environ["GITHUB_ENV"]).read_text().splitlines())
+                        self.assertEqual(os.environ["RELEASE_BASE_COMMIT"], baseline)
+                        self.assertEqual(signing.run(["git", "rev-parse", "HEAD"]).strip(), development)
+                        # The workflow skips preparation. Run the exact remaining
+                        # shells with no token: a second push would fail the Git
+                        # credential wrapper's assertion.
+                        for name in ("Verify prepared history with public key only", "Publish verified release"):
+                            signing.run(["bash", "-euo", "pipefail", "-c", shell_step(name)])
+                        os.environ["RELEASE_PUBLICATION_OUTCOME"] = "success"
+                        signing.run(["bash", "-euo", "pipefail", "-c", shell_step("Record release result")])
+                        self.assertIn("Release published", Path(os.environ["GITHUB_STEP_SUMMARY"]).read_text())
+                finally:
+                    os.chdir(original)
+
+            rerun(2)
+            self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before_retry)
+            # Lost responses or failure uploading logs after publication must
+            # also be recoverable without overwriting operator-edited notes.
+            published.write_text("operator-edited notes and assets")
+            rerun(3)
+            self.assertEqual(published.read_text(), "operator-edited notes and assets")
+            self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before_retry)
             self.assertEqual(Path(".git/config").read_bytes(), config_before)
             self.assertEqual(Path(os.environ["GIT_CONFIG_GLOBAL"]).read_bytes(), global_before)
-            self.assertIn("release create v1.0.7 --verify-tag", published.read_text())
+            self.assertTrue(published.exists())
             refs = signing.run(["git", "ls-remote", "--tags", "origin"])
             for prefix in ["", "shared/", "sdkv1/", "sdkv2/"]:
                 self.assertIn("refs/tags/" + prefix + "v1.0.7", refs)
@@ -964,6 +1023,7 @@ class SigningTests(unittest.TestCase):
             repeat_env = {key: value for key, value in os.environ.items()
                           if key != "RELEASE_BASE_COMMIT" and not key.startswith("RELEASE_GPG_")}
             repeat_env["GITHUB_SHA"] = signing.run(["git", "rev-parse", "HEAD"]).strip()
+            repeat_env["GITHUB_RUN_ID"] = "67890"
             with patch.dict(os.environ, repeat_env, clear=True):
                 for index, job in enumerate((validation_job, release_job)):
                     os.environ["RELEASE_LOG_DIR"] = str(directory / f"repeat-dispatch-{index}")
@@ -992,6 +1052,79 @@ class SigningTests(unittest.TestCase):
             signing.run([sys.executable, "scripts/release/pipeline.py", "publish-release"])
             self.assertTrue(published.exists())
             self.assertEqual(signing.run(["git", "ls-remote", "origin"]), before)
+
+            # Later work on main does not prevent recovering the original run.
+            signing.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Later work"])
+            with patch.dict(os.environ, {"GH_TOKEN": "fixture-publication-token"}):
+                signing.run(["git", "-c", "credential.helper=", "-c",
+                             "credential.helper=!gh auth git-credential", "push", "origin", "HEAD:refs/heads/main"])
+            advanced = signing.run(["git", "ls-remote", "origin"])
+            rerun(4)
+            self.assertEqual(signing.run(["git", "ls-remote", "origin"]), advanced)
+
+    def test_rerun_rejects_conflicting_or_unsigned_publication_checkpoints(self):
+        import pipeline
+        with self.make_repository() as directory:
+            baseline = os.environ["RELEASE_BASE_COMMIT"]
+            remote = directory / "remote.git"
+            signing.run(["git", "init", "--bare", "--quiet", str(remote)])
+            signing.run(["git", "remote", "add", "origin", str(remote)])
+            signing.run(["make", "create-release-commits", "version=v1.0.7"])
+            development = signing.run(["git", "rev-parse", "HEAD"]).strip()
+            signing.run(["git", "push", "--atomic", "origin", "HEAD:refs/heads/main", "--tags"])
+            os.environ.update(GITHUB_SHA=baseline, RELEASE_VERSION="v1.0.7", RELEASE_RESUME_COMMIT=development)
+            with patch.object(pipeline, "existing_release", return_value=None):
+                pipeline.verify_resume()
+                for env, message in [({"GITHUB_RUN_ID": "99999"}, "does not match this release run"),
+                                     ({"RELEASE_VERSION": "v1.0.8"}, "does not match this release run"),
+                                     ({"GITHUB_SHA": signing.run(["git", "rev-parse", baseline + "~1"]).strip()},
+                                      "does not follow the dispatched baseline")]:
+                    with self.subTest(env=env), patch.dict(os.environ, env), \
+                            self.assertRaisesRegex(signing.SigningError, message):
+                        pipeline.verify_resume()
+
+                tag = "refs/tags/shared/v1.0.7"
+                original_object = signing.run(["git", "rev-parse", tag]).strip()
+                other_object = signing.run(["git", "rev-parse", "refs/tags/sdkv1/v1.0.7"]).strip()
+                try:
+                    signing.run(["git", "--git-dir", str(remote), "update-ref", tag, other_object])
+                    with self.assertRaisesRegex(signing.SigningError, "Published tag objects must match"):
+                        pipeline.verify_resume()
+                finally:
+                    signing.run(["git", "--git-dir", str(remote), "update-ref", tag, original_object])
+
+                try:
+                    signing.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", baseline])
+                    with self.assertRaises(signing.SigningError):
+                        pipeline.verify_resume()
+                    # A fresh job must also reject the orphaned tagged release,
+                    # rather than treating the rewound main as an unpublished run.
+                    checkout = directory / "rewound"
+                    signing.run(["git", "clone", "--quiet", "--branch", "main", str(remote), str(checkout)])
+                    original = Path.cwd()
+                    try:
+                        os.chdir(checkout)
+                        with self.assertRaisesRegex(signing.SigningError, "Incomplete or multiple publication checkpoints"):
+                            pipeline.select_version()
+                    finally:
+                        os.chdir(original)
+                finally:
+                    signing.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", development])
+
+                unsigned = signing.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                        "-c", "commit.gpgsign=false", "commit-tree", "HEAD^{tree}", "-p", "HEAD~1",
+                                        "-m", "New iteration", "-m", "Release-Run: " + os.environ["GITHUB_RUN_ID"]]).strip()
+                try:
+                    signing.run(["git", "update-ref", "refs/remotes/origin/main", unsigned])
+                    with patch.dict(os.environ, {"RELEASE_RESUME_COMMIT": unsigned}), self.assertRaises(signing.SigningError):
+                        pipeline.verify_resume()
+                finally:
+                    signing.run(["git", "update-ref", "refs/remotes/origin/main", development])
+
+            with patch.object(pipeline, "existing_release", side_effect=signing.SigningError("Conflicting GitHub release")), \
+                    self.assertRaisesRegex(signing.SigningError, "Conflicting GitHub release"):
+                pipeline.verify_resume()
 
     def test_dry_run_prepares_manifests_without_credentials_or_signing(self):
         workflow = (ROOT / ".github/workflows/release-dry-run.yml").read_text()
@@ -1023,8 +1156,7 @@ class SigningTests(unittest.TestCase):
                                             capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     if name == "Select release version":
-                        key, value = Path(os.environ["GITHUB_ENV"]).read_text().strip().split("=", 1)
-                        os.environ[key] = value
+                        os.environ.update(line.split("=", 1) for line in Path(os.environ["GITHUB_ENV"]).read_text().splitlines())
                 blocked = subprocess.run(["make", "create-release-commits", "version=v1.0.7"],
                                          capture_output=True, text=True, timeout=60)
                 self.assertNotEqual(blocked.returncode, 0)
