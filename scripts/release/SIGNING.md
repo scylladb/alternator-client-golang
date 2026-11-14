@@ -35,6 +35,8 @@ module-prefixed, prerelease, and build-metadata tags. A missing stable root tag 
 an unsupported major version blocks automatic selection. The same version
 is used for all four release tags. Each job independently calculates and records
 its selected version in the run summary before checking the release target.
+On a release rerun, a published signed checkpoint restores that run's original
+version instead of selecting the next patch.
 Dry runs do not reserve a version: when the input is empty, a later release uses
 the next patch available when it runs. Supply an explicit version to preview and
 publish that exact version. Both workflows share the repository release
@@ -128,6 +130,8 @@ and session configuration. Preparation updates and signs module manifests and
 checksums, creates a signed release commit and four signed annotated tags
 (`vX.Y.Z`, `shared/vX.Y.Z`, `sdkv1/vX.Y.Z`, `sdkv2/vX.Y.Z`), then signs the next
 development commit with local module replacements restored.
+Both signed commits record the GitHub Actions run ID in a
+`Release-Run` trailer so reruns can identify their own published history.
 
 A public-only step verifies every commit in `RELEASE_BASE_COMMIT..HEAD`, every tag
 signature and signed name, and their common release-commit target. The tagged
@@ -174,8 +178,23 @@ failure preserves an existing nonzero command status.
 
 ## Recovery and rotation
 
-After any failed publication, stop before retrying. Inspect the failed run's
-original baseline, prepared commit IDs, and remote branch and tag object IDs.
+For runs dispatched with this workflow version, use **Re-run failed jobs** after
+a release failure. **Re-run all jobs** is supported too. Before a successful push,
+the job prepares the release again, provided `main` still matches the dispatch.
+After a successful push, it finds the signed release and development commits for
+the same Actions run ID, restores the original version, and verifies both commits
+against the original dispatched baseline and all four remote tag objects. The
+development commit must remain in remote `main`, even if later commits or
+releases have advanced it. The protected job then skips signing and pushing,
+creates the missing GitHub release, or preserves an existing matching release
+and its notes/assets. The normal environment approval and policy checks still
+apply. Log artifact names include the attempt number to avoid rerun collisions.
+
+Conflicting history, tag objects, versions or release metadata fail visibly.
+Starting a new dispatch with an existing version does not resume another run.
+Runs dispatched before this update retain their original workflow and require
+manual recovery. If automatic recovery fails, inspect the failed run's original
+baseline, prepared commit IDs, and remote branch and tag object IDs.
 Atomic pushing prevents publishing only some of the five refs. A failure after
 that push can still leave published refs without a GitHub release. Never delete,
 force-push, or replace published tags. Do not prepare the same version again when

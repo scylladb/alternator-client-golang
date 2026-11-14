@@ -58,9 +58,38 @@ class PipelineTests(unittest.TestCase):
                         redirect_stdout(StringIO()):
                     pipeline.select_version()
                 expected = requested or "v1.0.100"
-                self.assertEqual(env_file.read_text(), f"RELEASE_VERSION={expected}\n")
+                self.assertEqual(env_file.read_text(), f"RELEASE_VERSION={expected}\nRELEASE_RESUME_COMMIT=\n")
                 self.assertIn(f"Selected release version: `{expected}`", summary.read_text())
                 self.assertEqual(run.call_count, 0 if requested else 1)
+
+    def test_rerun_restores_original_version_instead_of_next_patch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / "env"
+            env = {"RELEASE_VERSION": "", "GITHUB_ENV": str(env_file),
+                   "GITHUB_STEP_SUMMARY": str(Path(temp) / "summary")}
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(pipeline, "published_run", return_value=("a" * 40, "v1.0.7")), \
+                    patch.object(pipeline, "next_version") as next_version, redirect_stdout(StringIO()):
+                pipeline.select_version()
+                next_version.assert_not_called()
+            self.assertIn("RELEASE_VERSION=v1.0.7\n", env_file.read_text())
+            self.assertIn("RELEASE_RESUME_COMMIT=" + "a" * 40, env_file.read_text())
+
+    def test_rerun_rejects_requested_version_conflict(self):
+        with patch.dict(os.environ, {"RELEASE_VERSION": "v1.0.8"}, clear=True), \
+                patch.object(pipeline, "published_run", return_value=("a" * 40, "v1.0.7")), \
+                self.assertRaisesRegex(signing.SigningError, "Requested version conflicts"):
+            pipeline.select_version()
+
+    def test_checkpoint_discovery_requires_exact_run_marker(self):
+        env = {"GITHUB_RUN_ID": "123", "GITHUB_WORKFLOW_REF": pipeline.REPOSITORY
+               + "/.github/workflows/release.yml@refs/heads/main"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(signing, "run", side_effect=["a" * 40, "New iteration\n\nRelease-Run: 1234\n"]):
+                self.assertIsNone(pipeline.published_run())
+            with patch.object(signing, "run", side_effect=["a" * 40, "Release-Run: 123\n", "Release v1.0.7"]), \
+                    self.assertRaisesRegex(signing.SigningError, "Incomplete or multiple publication checkpoints"):
+                pipeline.published_run()
 
     def test_invalid_selected_versions_are_not_exported(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -362,8 +391,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("capture.py tool-tests make test-release-signing", steps["Test release tooling"])
         self.assertNotIn("        if:", steps["Test release tooling"])
         self.assertIn("capture.py validation make build check test-unit test-integration", steps["Build, lint, and test"])
-        for name in ("Build, lint, and test", "Prepare signed release"):
-            self.assertNotIn("        if:", steps[name])
+        self.assertNotIn("        if:", steps["Build, lint, and test"])
+        self.assertIn("if: env.RELEASE_RESUME_COMMIT == ''", steps["Prepare signed release"])
         # Evaluate the actual simple boolean predicates, not a job scheduler.
         def evaluate(expression, values):
             for name, value in values.items():

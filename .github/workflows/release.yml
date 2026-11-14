@@ -63,7 +63,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: validation-logs
+          name: validation-logs-${{ github.run_attempt }}
           path: ${{ runner.temp }}/release-logs/
           if-no-files-found: ignore
 
@@ -108,18 +108,22 @@ jobs:
           # shellcheck disable=SC2016
           python3 scripts/release/capture.py target bash -euo pipefail -c '
             python3 scripts/release/pipeline.py check
-            baseline=$(git rev-parse HEAD)
-            echo "RELEASE_BASE_COMMIT=$baseline" >> "$GITHUB_ENV"
+            echo "RELEASE_BASE_COMMIT=$GITHUB_SHA" >> "$GITHUB_ENV"
+            if [ -n "${RELEASE_RESUME_COMMIT:-}" ]; then
+              git checkout --detach "$RELEASE_RESUME_COMMIT"
+            fi
           '
 
       - name: Prepare signed release
         id: prepare
+        if: env.RELEASE_RESUME_COMMIT == ''
         env:
           RELEASE_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           RELEASE_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: python3 scripts/release/capture.py prepare make create-release-commits version="$RELEASE_VERSION"
 
       - name: Verify prepared history with public key only
+        id: verify
         run: |
           # Variables in the script are expanded by the child Bash process.
           # shellcheck disable=SC2016
@@ -138,12 +142,14 @@ jobs:
           # shellcheck disable=SC2016
           python3 scripts/release/capture.py publish bash -euo pipefail -c '
             python3 scripts/release/pipeline.py check-publication
-            make push-release-commits
+            if [ -z "${RELEASE_RESUME_COMMIT:-}" ]; then
+              make push-release-commits
+            fi
             python3 scripts/release/pipeline.py publish-release
           '
 
       - name: Record release result
-        if: always() && steps.prepare.outcome == 'success'
+        if: always() && (steps.prepare.outcome == 'success' || steps.verify.outcome == 'success')
         env:
           RELEASE_PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
         run: python3 scripts/release/capture.py summary python3 scripts/release/pipeline.py summary
@@ -152,6 +158,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-logs
+          name: release-logs-${{ github.run_attempt }}
           path: ${{ runner.temp }}/release-logs/
           if-no-files-found: ignore

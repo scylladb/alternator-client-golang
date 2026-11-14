@@ -231,7 +231,7 @@ _create-release-commits: release-check-version
 		if [ -f "$$module/go.sum" ]; then git add "$$module/go.sum"; fi; \
 	done; \
 	if [ -f go.work.sum ]; then git add go.work.sum; fi; \
-	git commit -S -m "Release $$VERSION"; \
+	git commit -S -m "Release $$VERSION" -m "Release-Run: $$GITHUB_RUN_ID"; \
 	python3 scripts/release/signing.py verify-commit HEAD
 	+$(MAKE) _create-release-tags
 	@set -eu; \
@@ -239,7 +239,7 @@ _create-release-commits: release-check-version
 		( cd $$module && go mod edit -replace=github.com/scylladb/alternator-client-golang/shared=../shared ); \
 	done; \
 	git add sdkv1/go.mod sdkv2/go.mod; \
-	git commit -S -m "New iteration"; \
+	git commit -S -m "New iteration" -m "Release-Run: $$GITHUB_RUN_ID"; \
 	python3 scripts/release/signing.py verify-release "$$RELEASE_VERSION"
 
 .PHONY: create-release-tags _create-release-tags

@@ -434,10 +434,10 @@ def release_baseline(baseline=None):
     return baseline
 
 
-def verify_release(tag, baseline=None):
+def verify_release(tag, baseline=None, head="HEAD"):
     baseline = release_baseline(baseline)
-    run(["git", "merge-base", "--is-ancestor", baseline, "HEAD"])
-    commits = run(["git", "rev-list", baseline + "..HEAD"]).splitlines()
+    run(["git", "merge-base", "--is-ancestor", baseline, head])
+    commits = run(["git", "rev-list", baseline + ".." + head]).splitlines()
     if not commits:
         raise SigningError("No release commits were created.")
     for commit in commits:
@@ -445,10 +445,10 @@ def verify_release(tag, baseline=None):
     target = run(["git", "rev-parse", "refs/tags/" + tag + "^{commit}"]).strip()
     if target not in commits:
         raise SigningError(f"Release tag {tag} does not point to a newly prepared commit.")
-    if target != run(["git", "rev-parse", "HEAD~1"]).strip():
+    if target != run(["git", "rev-parse", head + "~1"]).strip():
         raise SigningError(f"Release tag {tag} points to an unexpected prepared commit.")
     if (run(["git", "show", "-s", "--format=%s", target]).strip() != "Release " + tag
-            or run(["git", "show", "-s", "--format=%s", "HEAD"]).strip() != "New iteration"):
+            or run(["git", "show", "-s", "--format=%s", head]).strip() != "New iteration"):
         raise SigningError("Expected a tagged release commit followed by the development commit.")
     for name in (tag, "shared/" + tag, "sdkv1/" + tag, "sdkv2/" + tag):
         verify_tag(name, target)

@@ -36,14 +36,70 @@ def next_version():
 
 
 def select_version():
-    if not os.environ.get("RELEASE_VERSION"):
+    resumed = published_run()
+    if resumed:
+        _, release_version = resumed
+        if os.environ.get("RELEASE_VERSION") not in (None, "", release_version):
+            raise signing.SigningError("Requested version conflicts with this run's published release.")
+        os.environ["RELEASE_VERSION"] = release_version
+    elif not os.environ.get("RELEASE_VERSION"):
         os.environ["RELEASE_VERSION"] = next_version()
     release_version = version()
     with Path(os.environ["GITHUB_ENV"]).open("a") as output:
         output.write(f"RELEASE_VERSION={release_version}\n")
+        output.write(f"RELEASE_RESUME_COMMIT={resumed[0] if resumed else ''}\n")
     with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
         output.write(f"Selected release version: `{release_version}`\n\n")
     print(f"Selected release version: {release_version}")
+
+
+def run_marker():
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if not re.fullmatch(r"[1-9][0-9]*", run_id):
+        raise signing.SigningError("Expected the original GitHub Actions run ID for release recovery.")
+    return "Release-Run: " + run_id
+
+
+def published_run():
+    """Find this dispatch's signed checkpoint, never another run's version."""
+    if os.environ.get("GITHUB_WORKFLOW_REF") != REPOSITORY + "/.github/workflows/release.yml@refs/heads/main":
+        return None
+    marker = run_marker()
+    # Include tags so a checkpoint whose development commit was removed from
+    # main fails closed instead of selecting another patch for the same run.
+    commits = signing.run(["git", "log", "--all", "--format=%H",
+                           "--fixed-strings", "--grep=" + marker]).splitlines()
+    matches = [commit for commit in commits
+               if marker in signing.run(["git", "show", "-s", "--format=%B", commit]).splitlines()]
+    if not matches:
+        return None
+    subjects = {commit: signing.run(["git", "show", "-s", "--format=%s", commit]).strip()
+                for commit in matches}
+    releases = [commit for commit, subject in subjects.items() if subject.startswith("Release ")]
+    developments = [commit for commit, subject in subjects.items() if subject == "New iteration"]
+    if len(matches) != 2 or len(releases) != 1 or len(developments) != 1:
+        raise signing.SigningError("Incomplete or multiple publication checkpoints exist for this release run.")
+    commit = developments[0]
+    if signing.run(["git", "rev-parse", commit + "~1"]).strip() != releases[0]:
+        raise signing.SigningError("Publication checkpoint commits do not follow each other.")
+    return commit, subjects[releases[0]].removeprefix("Release ")
+
+
+def verify_resume():
+    """Verify a checkpoint against the original dispatch and current remote state."""
+    commit = os.environ["RELEASE_RESUME_COMMIT"]
+    baseline = signing.release_baseline(os.environ["GITHUB_SHA"])
+    if published_run() != (commit, version()):
+        raise signing.SigningError("Publication checkpoint does not match this release run and version.")
+    if signing.run(["git", "rev-parse", commit + "~2"]).strip() != baseline:
+        raise signing.SigningError("Publication checkpoint does not follow the dispatched baseline.")
+    signing.verify_release(version(), baseline=baseline, head=commit)
+    verify_remote_tags(version())
+    # Main may have advanced since publication or checkout. It must still contain
+    # the original development commit; recovery never rewinds or pushes main.
+    signing.run(["git", "fetch", "--no-tags", "origin", "refs/heads/main"])
+    signing.run(["git", "merge-base", "--is-ancestor", commit, "FETCH_HEAD"])
+    existing_release(version())
 
 
 def api(path, paginate=False):
@@ -122,6 +178,15 @@ def existing_release(release_version):
 def publish_release():
     release_version = version()
     signing.verify_release(release_version)
+    verify_remote_tags(release_version)
+    if existing_release(release_version):
+        print("GitHub release already published; preserving its notes and assets.")
+        return
+    signing.run(["gh", "release", "create", release_version, "--verify-tag",
+                 "--generate-notes", "--title", release_version])
+
+
+def verify_remote_tags(release_version):
     expected = {}
     for prefix in ("", "shared/", "sdkv1/", "sdkv2/"):
         ref = "refs/tags/" + prefix + release_version
@@ -130,11 +195,6 @@ def publish_release():
     actual = {ref: value for value, ref in (row.split() for row in rows)}
     if actual != expected:
         raise signing.SigningError("Published tag objects must match the verified signed release before creating GitHub notes.")
-    if existing_release(release_version):
-        print("GitHub release already published; preserving its notes and assets.")
-        return
-    signing.run(["gh", "release", "create", release_version, "--verify-tag",
-                 "--generate-notes", "--title", release_version])
 
 
 def check_unpublished_refs(release_version):
@@ -149,6 +209,9 @@ def check_unpublished_refs(release_version):
 
 def check_publication():
     release_version = check_context()
+    if os.environ.get("RELEASE_RESUME_COMMIT"):
+        verify_resume()
+        return
     check_unpublished_refs(release_version)
     check_release_absent(release_version)
 
