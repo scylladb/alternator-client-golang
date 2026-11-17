@@ -347,6 +347,14 @@ func (e *NodeHealthStore) RemoveNode(node url.URL) {
 	e.quarantinedNodes.Store(&quarantined)
 }
 
+// SnapshotNodes returns both health buckets from the same point in time.
+// Mutations hold mu, so a node cannot move between buckets during capture.
+func (e *NodeHealthStore) SnapshotNodes() (active, quarantined []url.URL) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.GetActiveNodes(), e.GetQuarantinedNodes()
+}
+
 // GetAllNodes returns the active and quarantined node sets and triggers async release if configured.
 func (e *NodeHealthStore) GetAllNodes() (active, quarantined []url.URL) {
 	e.mu.RLock()

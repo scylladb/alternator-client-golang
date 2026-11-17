@@ -459,3 +459,56 @@ func TestLazyQueryPlanCrossLanguageVectors(t *testing.T) {
 		})
 	}
 }
+
+func TestAffinityQueryPlansCaptureBothNodeLists(t *testing.T) {
+	for _, preferred := range []bool{false, true} {
+		for _, empty := range []bool{false, true} {
+			t.Run(fmt.Sprintf("preferred=%v/empty=%v", preferred, empty), func(t *testing.T) {
+				source := &fakeNodesSource{
+					activeNodes:      []url.URL{{Host: "active"}},
+					quarantinedNodes: []url.URL{{Host: "q5"}, {Host: "q3"}, {Host: "q1"}, {Host: "q4"}, {Host: "q2"}},
+				}
+				if empty {
+					source.activeNodes, source.quarantinedNodes = nil, nil
+				}
+				var plan *LazyQueryPlan
+				if preferred {
+					plan = NewLazyQueryPlanWithPreferredNodes(source, source.activeNodes, 42)
+				} else {
+					plan = NewLazyQueryPlanWithSortedSeed(source, 42)
+				}
+				// Refresh before the first attempt, and again before quarantine is needed.
+				if !empty {
+					source.activeNodes[0].Host = "new-active"
+				}
+				source.activeNodes = []url.URL{{Host: "new-active"}}
+				if !empty {
+					if node := plan.Next(); node.Host != "active" {
+						t.Fatalf("active snapshot changed: %v", node)
+					}
+				}
+				for i := range source.quarantinedNodes {
+					source.quarantinedNodes[i].Host = "new-quarantined"
+				}
+				source.quarantinedNodes = []url.URL{{Host: "new-quarantined"}}
+				if !empty {
+					want := []string{"q3", "q1", "q4", "q2", "q5"}
+					if preferred {
+						want = []string{"q1", "q2", "q3", "q4", "q5"}
+					}
+					for i, host := range want {
+						if node := plan.Next(); node.Host != host {
+							t.Fatalf("quarantine snapshot/order changed at %d: got %v, want %s", i, node, host)
+						}
+					}
+				}
+				if node := plan.Next(); node.Host != "" {
+					t.Fatalf("plan gained nodes: %v", node)
+				}
+				if source.activeCalls != 1 || source.quarantinedCalls != 1 {
+					t.Fatal("captured plan reread its source")
+				}
+			})
+		}
+	}
+}
